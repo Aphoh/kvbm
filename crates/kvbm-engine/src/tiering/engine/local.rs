@@ -52,6 +52,7 @@ use anyhow::Result;
 use dashmap::DashMap;
 use kvbm_common::LogicalResourceId;
 
+use kvbm_protocols::cache_manifest::CacheIdentity;
 use kvbm_protocols::connector::{
     AcceptId, ActionFailure, ActionId, ActionStatus, BundleOffloadPlan, BundleOnboardPlan,
     EngineWorkerSink, EvictionFence, EvictionOutcome, FenceToken, FindBlocksHandle,
@@ -63,7 +64,7 @@ use kvbm_protocols::connector::{BlockId, RequestId, SequenceHash};
 use kvbm_logical::BlockEvictionObserver;
 use kvbm_logical::blocks::ImmutableBlock;
 
-use super::bundle::BundleIndex;
+use super::bundle::{BundleIndex, BundleLease};
 use super::driver::{ActionRecord, FenceBarrier};
 use super::inflight::{InflightKey, InflightOnboards};
 use super::offload::{
@@ -100,6 +101,13 @@ pub(super) struct SearchState {
     pub(super) buffer: Vec<SequenceHash>,
 }
 
+/// Manifest-scoped pinned match retained by the existing opaque search handle.
+pub(super) struct BundleSearchState {
+    pub(super) request_id: RequestId,
+    pub(super) identity: CacheIdentity,
+    pub(super) lease: BundleLease<Vec<ImmutableBlock<G2>>>,
+}
+
 /// The local, in-process [`LeaderEngine`].
 pub(crate) struct LocalConnectorEngine {
     pub(super) leader: Arc<InstanceLeader>,
@@ -112,6 +120,7 @@ pub(crate) struct LocalConnectorEngine {
     /// into every `FindMatchesOptions` the engine issues.
     pub(super) search_remote: bool,
     pub(super) searches: DashMap<SearchId, SearchState>,
+    pub(super) bundle_searches: DashMap<SearchId, BundleSearchState>,
     pub(super) actions: DashMap<ActionId, ActionRecord>,
     /// `request_id → in-flight onboard/offload action ids` (read by `evict`).
     pub(super) by_request: DashMap<RequestId, Vec<ActionId>>,
@@ -416,6 +425,7 @@ impl LocalConnectorEngine {
                 resource_policies,
                 search_remote,
                 searches: DashMap::new(),
+                bundle_searches: DashMap::new(),
                 actions: DashMap::new(),
                 by_request: DashMap::new(),
                 offload_submit,
@@ -945,6 +955,8 @@ impl LeaderEngine for LocalConnectorEngine {
             if let Some(cd) = &self.cd {
                 cd.cleanup_guarded(&search_state.request_id, "declined", Some(*id));
             }
+        } else {
+            self.bundle_searches.remove(id);
         }
     }
 

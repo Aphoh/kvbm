@@ -74,6 +74,7 @@ kvbm-protocols = { workspace = true, features = ["client"] }
 kvbm-consolidator = { workspace = true }
 tmq = { workspace = true }
 portpicker = "0.1"
+proptest = "1.5"
 
 [features]
 default = ["s3", "testing"]

@@ -9,6 +9,7 @@ mod barrier;
     reason = "phase K1 defines capsule copy descriptors before the vLLM integration wires them in K4"
 )]
 mod capsule;
+mod find;
 mod offload;
 mod onboard;
 
@@ -19,6 +20,7 @@ mod test_support;
 
 pub(super) use offload::{BundleOffload, OffloadTransition};
 
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use kvbm_common::{LogicalResourceId, SequenceHash};
@@ -37,9 +39,8 @@ struct CommittedBundle<P> {
 
 /// All-resource lease returned by one bundle lookup.
 pub(super) struct BundleLease<P> {
-    #[allow(dead_code, reason = "phase K3 consumes the matched bundle key")]
     key: BundleKey,
-    #[allow(dead_code, reason = "phase K3 exposes the matched bundle generation")]
+    #[allow(dead_code, reason = "phase K4 consumes the matched bundle generation")]
     generation: u64,
     resources: BTreeMap<LogicalResourceId, P>,
 }
@@ -133,15 +134,21 @@ impl<P: Clone> BundleIndex<P> {
 
     /// Return the greatest complete candidate boundary and clone every
     /// resource pin atomically into the resulting lease.
-    #[allow(dead_code, reason = "phase K3 wires bundle-wide prefix discovery")]
-    pub(super) fn find_longest(
+    pub(super) fn find_longest<I>(
         &self,
         identity: &CacheIdentity,
-        candidates: &[(SequenceHash, u64)],
-    ) -> Option<BundleLease<P>> {
+        candidates: I,
+    ) -> Option<BundleLease<P>>
+    where
+        I: IntoIterator,
+        I::Item: Borrow<(SequenceHash, u64)>,
+    {
         candidates
-            .iter()
-            .filter_map(|&(hash, tokens)| BundleKey::new(identity, hash, tokens).ok())
+            .into_iter()
+            .filter_map(|candidate| {
+                let &(hash, tokens) = candidate.borrow();
+                BundleKey::new(identity, hash, tokens).ok()
+            })
             .filter_map(|key| self.committed.get(&key).map(|bundle| (key, bundle)))
             .max_by_key(|(key, _)| key.boundary_tokens())
             .map(|(key, bundle)| BundleLease {
@@ -153,7 +160,6 @@ impl<P: Clone> BundleIndex<P> {
 }
 
 impl<P> BundleLease<P> {
-    #[cfg(test)]
     pub(super) const fn key(&self) -> &BundleKey {
         &self.key
     }

@@ -34,14 +34,20 @@
 //!    synchronous zero `Resolved` without touching a live search; on the
 //!    pure-local path it carries `release_parked` so the connector drops its
 //!    pin (gated connector-side on the in-flight onboard).
-//! 3. **Refresh arm** — `live` is a Search-kind handle: the deferral guard
+//! 3. **Bundle arm** — a manifest-scoped request queries only atomically
+//!    committed bundle boundaries. A fresh hit parks one all-resource lease
+//!    behind the existing opaque search handle; an identical re-poll reuses
+//!    that lease even if index eviction has removed cross-request visibility.
+//!    A changed window reconciles to one new common boundary, while a changed
+//!    manifest/resource set is a lifecycle desync.
+//! 4. **Refresh arm** — `live` is a legacy Search-kind handle: the deferral guard
 //!    runs first — a window overlapping ANOTHER lifecycle's in-flight onboard
 //!    resolves `Deferred` while the live search keeps running untouched.
 //!    Otherwise reconcile in place (never a second mint; a pure re-poll skips
 //!    the merge via the set-equality heuristic — see
 //!    `LocalConnectorEngine::local_refresh`). A zero-refine or `Lost`
 //!    resolves zero with `release_parked`; `Pending` maps to `Searching`.
-//! 4. **Fresh arm** — the deferral guard again: a fresh window overlapping an
+//! 5. **Fresh arm** — the deferral guard again: a fresh legacy window overlapping an
 //!    in-flight onboard resolves `Deferred` with no side effect. Otherwise the
 //!    local search runs; a latch mints the one Search-kind handle.
 //!
@@ -179,6 +185,23 @@ impl LocalConnectorEngine {
             .overlaps(derived.slice(req))
         {
             return Ok(FindBlocksOutcome::Deferred);
+        }
+
+        let bundle_identity = req.cache.identity();
+        if let Some(handle) = live {
+            let search_id = handle
+                .search_id()
+                .expect("prefill-kind live handles were routed above");
+            if self.bundle_searches.contains_key(&search_id) {
+                let identity = bundle_identity.ok_or(LeaderEngineError::FindBlocksDesync)?;
+                return self.refresh_bundle_find(req, identity, search_id, &derived);
+            }
+        }
+        if let Some(identity) = bundle_identity {
+            if live.is_some() {
+                return Err(LeaderEngineError::FindBlocksDesync);
+            }
+            return self.start_bundle_find(req, identity, &derived);
         }
         let window = derived.view(req);
 
