@@ -106,6 +106,8 @@ pub(super) struct BundleSearchState {
     pub(super) request_id: RequestId,
     pub(super) identity: CacheIdentity,
     pub(super) lease: BundleLease<Vec<ImmutableBlock<G2>>>,
+    pub(super) computed_tokens: usize,
+    pub(super) matched_tokens: usize,
 }
 
 /// The local, in-process [`LeaderEngine`].
@@ -1019,6 +1021,15 @@ impl LeaderEngine for LocalConnectorEngine {
         plan: BundleOnboardPlan,
     ) -> Result<OnboardHandle, LeaderEngineError> {
         self.start_bundle_onboard(req, plan)
+    }
+
+    fn onboard_bundle(
+        self: Arc<Self>,
+        handle: &FindBlocksHandle,
+        destinations: Vec<kvbm_protocols::connector::ResourceDestination>,
+        num_external_tokens: usize,
+    ) -> Result<OnboardHandle, LeaderEngineError> {
+        self.start_searched_bundle_onboard(handle, destinations, num_external_tokens)
     }
 
     fn release_prefill_session(&self, request_id: &RequestId, accept_id: AcceptId) {

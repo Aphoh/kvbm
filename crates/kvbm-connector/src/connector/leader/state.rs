@@ -21,8 +21,8 @@ use std::sync::Arc;
 
 use kvbm_common::{BlockId, SequenceHash};
 use kvbm_protocols::connector::{
-    CacheScope, EvictionFence, FindBlocksOutcome, FindBlocksRequest,
-    FinishedStatus as EngineFinishedStatus, LeaderEngine, OnboardHandle,
+    EvictionFence, FindBlocksOutcome, FindBlocksRequest, FinishedStatus as EngineFinishedStatus,
+    LeaderEngine, OnboardHandle, ResourceDestination,
 };
 use prometheus::IntCounter;
 
@@ -34,6 +34,10 @@ use crate::common::{
 use super::super::metadata::ConnectorMetadata;
 use super::Error;
 use super::slot::RequestSlot;
+
+mod bundle;
+
+use bundle::{extend_resource_lists, sync_full_resource_lists};
 
 /// Result of the per-step scheduler-output walk.
 pub(crate) struct WalkOutcome {
@@ -175,7 +179,7 @@ impl LeaderState {
         };
         let request = FindBlocksRequest {
             request_id: request_id.to_string(),
-            cache: CacheScope::LegacyPrimary,
+            cache: slot.cache.clone(),
             sequence_hashes: slot.sequence_hashes(),
             num_computed_tokens,
             total_tokens: slot.total_tokens(),
@@ -282,6 +286,50 @@ impl LeaderState {
         };
         let onboard = Arc::clone(&self.engine)
             .onboard_blocks(proposal, &slot.block_ids, num_external_tokens)
+            .map_err(|source| Error::OnboardRejected {
+                request_id: request_id.to_string(),
+                source,
+            })?;
+        slot.onboard = Some(onboard);
+        Ok(())
+    }
+
+    /// Manifest-aware USAA core. Records every resource allocation and, for a
+    /// committed hit, consumes the parked bundle lease in one atomic onboard.
+    pub(crate) fn allocate_resources(
+        &mut self,
+        request_id: &str,
+        destinations: Vec<ResourceDestination>,
+        num_external_tokens: usize,
+    ) -> Result<(), Error> {
+        let slot = self
+            .slots
+            .get_mut(request_id)
+            .ok_or_else(|| Error::SlotNotFound(request_id.to_string()))?;
+        let mut resource_block_ids = std::collections::BTreeMap::new();
+        for destination in &destinations {
+            if resource_block_ids
+                .insert(destination.resource, destination.block_ids.clone())
+                .is_some()
+            {
+                return Err(Error::DuplicateResourceAllocation {
+                    request_id: request_id.to_string(),
+                    resource: destination.resource,
+                });
+            }
+        }
+        slot.set_resource_block_ids(resource_block_ids);
+        if num_external_tokens == 0 {
+            return Ok(());
+        }
+        if slot.onboard.is_some() {
+            return Err(Error::OnboardAlreadyInFlight(request_id.to_string()));
+        }
+        let Some(proposal) = slot.proposal.as_ref() else {
+            return Err(Error::ExternalLoadWithoutSearch(request_id.to_string()));
+        };
+        let onboard = Arc::clone(&self.engine)
+            .onboard_bundle(proposal, destinations, num_external_tokens)
             .map_err(|source| Error::OnboardRejected {
                 request_id: request_id.to_string(),
                 source,
@@ -469,6 +517,7 @@ impl LeaderState {
         slot.onboard = None;
         slot.offloads.clear();
         slot.block_ids.clear();
+        slot.resource_block_ids.clear();
         slot.evaluated_tokens = 0;
 
         Ok(EngineFinishedStatus::Finished)
@@ -544,6 +593,7 @@ impl LeaderState {
                 continue;
             };
             sync_full_block_list(slot, &new_req.block_ids);
+            sync_full_resource_lists(slot, &output.group_resources, &new_req.block_ids_by_group);
             let scheduled = output
                 .num_scheduled_tokens
                 .get(&new_req.req_id)
@@ -555,7 +605,11 @@ impl LeaderState {
         }
 
         for cached in &output.scheduled_cached_reqs {
-            let target = self.compute_cached_target(cached, &output.num_scheduled_tokens);
+            let target = self.compute_cached_target(
+                cached,
+                &output.num_scheduled_tokens,
+                &output.group_resources,
+            );
             let req_id = cached.req_id.clone();
             scheduled_offloads |= self.offload_step(&req_id, target);
         }
@@ -573,6 +627,7 @@ impl LeaderState {
         &mut self,
         cached: &CachedRequestData,
         num_scheduled_tokens: &HashMap<String, usize>,
+        group_resources: &[kvbm_common::LogicalResourceId],
     ) -> usize {
         let scheduled = num_scheduled_tokens
             .get(&cached.req_id)
@@ -605,11 +660,13 @@ impl LeaderState {
             }
             // For a resumed request, new_block_ids is the full fresh list.
             sync_full_block_list(slot, &cached.new_block_ids);
+            sync_full_resource_lists(slot, group_resources, &cached.new_block_ids_by_group);
             // Cursor was reset to 0 at eviction.
             cached.num_computed_tokens + scheduled
         } else {
             // Plain decode/chunk growth: new_block_ids are purely the delta.
             slot.block_ids.extend_from_slice(&cached.new_block_ids);
+            extend_resource_lists(slot, group_resources, &cached.new_block_ids_by_group);
             slot.evaluated_tokens + scheduled
         }
     }
@@ -631,6 +688,17 @@ impl LeaderState {
     /// call is sync and cheap; borrows are structured to avoid holding the slot
     /// reference across the engine call.
     fn offload_step(&mut self, request_id: &str, desired_tokens: usize) -> bool {
+        let identity = self
+            .slots
+            .get(request_id)
+            .and_then(|slot| slot.cache.identity().cloned());
+        if let Some(identity) = identity {
+            return self.offload_bundle_step(request_id, desired_tokens, identity);
+        }
+        self.offload_legacy_step(request_id, desired_tokens)
+    }
+
+    fn offload_legacy_step(&mut self, request_id: &str, desired_tokens: usize) -> bool {
         // Phase 1: read what we need and compute pairs under one get_mut.
         let maybe_pairs = {
             let Some(slot) = self.slots.get_mut(request_id) else {
@@ -763,12 +831,13 @@ impl LeaderState {
 /// prefix must agree with the new list (debug-checked); the tail is appended.
 fn sync_full_block_list(slot: &mut RequestSlot, ids: &[BlockId]) {
     if ids.len() > slot.block_ids.len() {
-        debug_assert_eq!(
-            ids[..slot.block_ids.len()],
-            slot.block_ids[..],
-            "block id prefix mismatch when syncing slot {} — engine and vLLM disagree",
-            slot.request_id,
-        );
+        if ids[..slot.block_ids.len()] != slot.block_ids[..] {
+            tracing::warn!(
+                request_id = %slot.request_id,
+                "block id prefix mismatch while syncing scheduler allocation"
+            );
+            return;
+        }
         slot.block_ids
             .extend_from_slice(&ids[slot.block_ids.len()..]);
     }

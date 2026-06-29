@@ -169,7 +169,6 @@ impl<P> BundleLease<P> {
         self.generation
     }
 
-    #[cfg(test)]
     pub(super) const fn resources(&self) -> &BTreeMap<LogicalResourceId, P> {
         &self.resources
     }

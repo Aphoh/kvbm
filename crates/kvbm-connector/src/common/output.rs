@@ -5,6 +5,7 @@
 
 use super::metadata::KvConnectorMetadata;
 use kvbm_common::BlockId;
+use kvbm_common::LogicalResourceId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -13,7 +14,11 @@ use std::collections::HashMap;
 pub struct NewRequestData {
     pub req_id: String,
     pub prompt_token_ids: Vec<u32>,
+    /// Compatibility view of the first KV-cache group.
     pub block_ids: Vec<BlockId>,
+    /// Complete outer vLLM KV-cache group tuple, in vLLM group order.
+    #[serde(default)]
+    pub block_ids_by_group: Vec<Vec<BlockId>>,
     pub num_computed_tokens: usize,
 }
 
@@ -32,7 +37,11 @@ pub struct CachedRequestData {
     /// All token IDs for the request (present only if resumed from preemption).
     pub all_token_ids: Option<Vec<u32>>,
     /// New block IDs allocated in this scheduling step.
+    /// Compatibility view of the first KV-cache group.
     pub new_block_ids: Vec<BlockId>,
+    /// Complete outer vLLM KV-cache group tuple, in vLLM group order.
+    #[serde(default)]
+    pub new_block_ids_by_group: Vec<Vec<BlockId>>,
     /// Number of computed tokens for this request.
     pub num_computed_tokens: usize,
     /// Number of output tokens generated for this request.
@@ -61,6 +70,9 @@ pub struct SchedulerOutput {
     /// this same step's worker envelope.
     #[serde(default)]
     pub preempted_req_ids: Vec<String>,
+    /// Manifest logical resource for each outer vLLM KV-cache group.
+    #[serde(default)]
+    pub group_resources: Vec<LogicalResourceId>,
     /// Optional connector metadata for workers.
     ///
     /// Present when a connector is attached to the scheduler. Contains forward pass
@@ -86,10 +98,28 @@ impl SchedulerOutput {
         block_ids: Vec<BlockId>,
         num_computed_tokens: usize,
     ) {
+        self.add_new_request_all_groups(
+            req_id,
+            prompt_token_ids,
+            vec![block_ids],
+            num_computed_tokens,
+        );
+    }
+
+    /// Add a new request while preserving every vLLM KV-cache group.
+    pub fn add_new_request_all_groups(
+        &mut self,
+        req_id: String,
+        prompt_token_ids: Vec<u32>,
+        block_ids_by_group: Vec<Vec<BlockId>>,
+        num_computed_tokens: usize,
+    ) {
+        let block_ids = block_ids_by_group.first().cloned().unwrap_or_default();
         self.scheduled_new_reqs.push(NewRequestData {
             req_id,
             prompt_token_ids,
             block_ids,
+            block_ids_by_group,
             num_computed_tokens,
         });
     }
@@ -115,12 +145,37 @@ impl SchedulerOutput {
         num_computed_tokens: usize,
         num_output_tokens: usize,
     ) {
+        self.add_cached_request_all_groups(
+            req_id,
+            resumed,
+            new_token_ids,
+            all_token_ids,
+            vec![new_block_ids],
+            num_computed_tokens,
+            num_output_tokens,
+        );
+    }
+
+    /// Add a cached request while preserving every vLLM KV-cache group.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_cached_request_all_groups(
+        &mut self,
+        req_id: String,
+        resumed: bool,
+        new_token_ids: Vec<u32>,
+        all_token_ids: Option<Vec<u32>>,
+        new_block_ids_by_group: Vec<Vec<BlockId>>,
+        num_computed_tokens: usize,
+        num_output_tokens: usize,
+    ) {
+        let new_block_ids = new_block_ids_by_group.first().cloned().unwrap_or_default();
         self.scheduled_cached_reqs.push(CachedRequestData {
             req_id,
             resumed,
             new_token_ids,
             all_token_ids,
             new_block_ids,
+            new_block_ids_by_group,
             num_computed_tokens,
             num_output_tokens,
         });
@@ -132,6 +187,10 @@ impl SchedulerOutput {
     pub fn set_num_scheduled_tokens(&mut self, num_scheduled_tokens: HashMap<String, usize>) {
         self.num_scheduled_tokens = num_scheduled_tokens;
         self.total_num_scheduled_tokens = self.num_scheduled_tokens.values().sum();
+    }
+
+    pub fn set_group_resources(&mut self, resources: Vec<LogicalResourceId>) {
+        self.group_resources = resources;
     }
 
     /// Get the total number of scheduled tokens.

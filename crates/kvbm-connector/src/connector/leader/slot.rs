@@ -11,12 +11,15 @@
 //! `TransactionState`/`SlotState`, and no match bookkeeping — the engine owns
 //! window derivation, fresh-vs-refresh, and hit state.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use dynamo_tokens::{TokenBlockError, TokenBlockSequence};
-use kvbm_common::{BlockId, SequenceHash};
+use kvbm_common::{BlockId, LogicalResourceId, SequenceHash};
 use kvbm_logical::KvbmSequenceHashProvider as _;
-use kvbm_protocols::connector::{FenceHandle, FindBlocksHandle, OffloadHandle, OnboardHandle};
+use kvbm_protocols::connector::{
+    CacheScope, FenceHandle, FindBlocksHandle, OffloadHandle, OnboardHandle,
+};
 use kvbm_protocols::disagg::{RemotePrefillParams, TransferParams};
 
 use crate::common::Request;
@@ -25,6 +28,8 @@ use crate::common::Request;
 #[derive(Debug)]
 pub struct RequestSlot {
     pub request_id: String,
+    /// Manifest-scoped cache ABI, or the legacy primary-only compatibility mode.
+    pub cache: CacheScope,
     /// Token sequence used to compute per-block sequence hashes. Populated by
     /// `from_request` — every slot is created from a vLLM Request before the
     /// first GNMT poll (the binding layer's `_create_slot` ordering).
@@ -73,6 +78,8 @@ pub struct RequestSlot {
     pub transfer_params: Option<TransferParams>,
     /// G1 block ids vLLM allocated for this request.
     pub block_ids: Vec<BlockId>,
+    /// Complete G1 allocations keyed by manifest logical resource.
+    pub resource_block_ids: BTreeMap<LogicalResourceId, Vec<BlockId>>,
     /// Token-granular save cursor. Counts tokens whose KV has been scheduled
     /// for computation and whose completed blocks have been handed to the
     /// engine's offload pipeline. The offload cursor can never pass
@@ -120,6 +127,10 @@ impl RequestSlot {
         );
         Self {
             request_id: request.request_id,
+            cache: request
+                .metadata
+                .as_ref()
+                .map_or_else(CacheScope::default, |metadata| metadata.cache.clone()),
             sequence,
             lora_name: request.lora_name,
             salt: request.salt,
@@ -130,6 +141,7 @@ impl RequestSlot {
             fence_holders: Vec::new(),
             transfer_params,
             block_ids: Vec::new(),
+            resource_block_ids: BTreeMap::new(),
             evaluated_tokens: 0,
             matched_tokens_reported: false,
             chain: None,
@@ -138,6 +150,13 @@ impl RequestSlot {
 
     pub fn set_block_ids(&mut self, block_ids: Vec<BlockId>) {
         self.block_ids = block_ids;
+    }
+
+    pub(super) fn set_resource_block_ids(
+        &mut self,
+        resources: BTreeMap<LogicalResourceId, Vec<BlockId>>,
+    ) {
+        self.resource_block_ids = resources;
     }
 
     /// Total number of tokens tracked by the sequence (complete blocks + any

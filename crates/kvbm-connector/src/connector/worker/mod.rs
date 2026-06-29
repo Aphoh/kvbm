@@ -25,7 +25,7 @@ use anyhow::{Result, bail};
 use derive_getters::Dissolve;
 use parking_lot::Mutex;
 
-use kvbm_common::{KvBlockLayout, KvDimLayout};
+use kvbm_common::{KvBlockLayout, KvDimLayout, LogicalResourceId};
 use kvbm_engine::{PassOffload, PassOnboard, WorkerPassPlan};
 use kvbm_protocols::connector::WorkerRank;
 use kvbm_protocols::connector::{EngineWorkerSink, FenceToken, WorkerEngineDriver};
@@ -67,6 +67,17 @@ pub trait ConnectorWorkerInterface: Send + Sync {
     fn register_cross_layers_kv_cache(
         &self,
         tensor: Arc<dyn TensorDescriptor>,
+        num_device_blocks: usize,
+        dtype_width_bytes: usize,
+        dim_layout: KvDimLayout,
+        block_layout: KvBlockLayout,
+    ) -> Result<()>;
+
+    fn register_resource_tensors(
+        &self,
+        resource: LogicalResourceId,
+        primary: bool,
+        tensors: Vec<Arc<dyn TensorDescriptor>>,
         num_device_blocks: usize,
         dtype_width_bytes: usize,
         dim_layout: KvDimLayout,
@@ -144,6 +155,14 @@ impl Worker {
             worker.worker_sink(),
         );
         worker
+    }
+
+    /// Bind the manifest digest that every worker reports during initialization.
+    pub fn register_manifest(
+        &self,
+        manifest: kvbm_protocols::cache_manifest::CacheManifestId,
+    ) -> Result<()> {
+        self.gpu.set_manifest(manifest)
     }
 
     /// Test/wiring constructor with explicit action sinks. Defaults to rank 0;
@@ -395,6 +414,39 @@ impl ConnectorWorkerInterface for Worker {
         self.gpu.set_pending(pending)?;
         self.gpu.set_num_layers(num_layers)?;
         Ok(())
+    }
+
+    fn register_resource_tensors(
+        &self,
+        resource: LogicalResourceId,
+        primary: bool,
+        tensors: Vec<Arc<dyn TensorDescriptor>>,
+        num_device_blocks: usize,
+        dtype_width_bytes: usize,
+        dim_layout: KvDimLayout,
+        block_layout: KvBlockLayout,
+    ) -> Result<()> {
+        if self.gpu.is_initialized() {
+            bail!("KV caches already initialized");
+        }
+        let (layout_config, block_dim) = determine_kv_layout(
+            num_device_blocks,
+            dtype_width_bytes,
+            &tensors,
+            &dim_layout,
+            block_layout,
+        )?;
+        let pending = PendingWorkerState::builder()
+            .tensors(tensors)
+            .num_device_blocks(num_device_blocks)
+            .dtype_width_bytes(dtype_width_bytes)
+            .layout_config(layout_config)
+            .mode(PendingLayoutMode::LayerSeparate {
+                block_dim,
+                block_layout,
+            })
+            .build()?;
+        self.gpu.set_pending_resource(resource, primary, pending)
     }
 
     fn bind_connector_metadata(&self, metadata: KvConnectorMetadata) -> Result<()> {

@@ -17,8 +17,8 @@ use kvbm_protocols::cache_manifest::{
     BundleKey, CacheManifest, ModelIdentity, ResourceRequirement, ResourceRole,
 };
 use kvbm_protocols::connector::{
-    BundleOffloadPlan, BundleOnboardPlan, LeaderEngine, LoadOutcome, OffloadMode, ResourceOffload,
-    ResourceOnboard, SaveOutcome,
+    BundleOffloadPlan, CacheScope, FindBlocksOutcome, FindBlocksRequest, LeaderEngine, LoadOutcome,
+    OffloadMode, ResourceDestination, ResourceOffload, SaveOutcome,
 };
 
 use super::super::local::LocalConnectorEngine;
@@ -272,32 +272,63 @@ async fn bundle_offload_publishes_once_and_onboard_requires_its_exact_lease() ->
         "publication installs resource-lineage invalidation before visibility"
     );
 
-    let lease = engine
-        .bundle_index
-        .lock()
-        .unwrap()
-        .lease_exact(&identity, &key)
-        .expect("all three completed children publish one bundle");
-    assert_eq!(lease.resources().len(), 3);
-    let resources = lease
-        .resources()
-        .iter()
-        .enumerate()
-        .map(|(index, (&resource, pins))| ResourceOnboard {
-            resource,
-            source_block_ids: pins.iter().map(|pin| pin.block_id()).collect(),
-            destination_block_ids: vec![100 + index],
-        })
-        .collect();
-    drop(lease);
+    let request = FindBlocksRequest {
+        request_id: "bundle-rq".into(),
+        cache: CacheScope::Manifest(identity),
+        sequence_hashes: Arc::from([hash(1)]),
+        num_computed_tokens: 0,
+        total_tokens: BLOCK_SIZE + 1,
+        transfer_params: None,
+    };
+    let FindBlocksOutcome::Resolved {
+        matched_tokens,
+        minted: Some(search),
+        ..
+    } = engine.clone().find_blocks(&request, None)?
+    else {
+        anyhow::bail!("committed bundle must resolve through manifest search")
+    };
+    assert_eq!(matched_tokens, BLOCK_SIZE);
+    engine.bundle_index.lock().unwrap().invalidate(key);
 
-    let onboard = engine.clone().onboard_resources(
-        &"bundle-rq".into(),
-        BundleOnboardPlan {
-            identity,
-            key,
-            resources,
-        },
+    let duplicate = engine.clone().onboard_bundle(
+        &search,
+        vec![
+            ResourceDestination {
+                resource: RESOURCES[0],
+                block_ids: vec![100],
+            },
+            ResourceDestination {
+                resource: RESOURCES[0],
+                block_ids: vec![999],
+            },
+            ResourceDestination {
+                resource: RESOURCES[1],
+                block_ids: vec![101],
+            },
+            ResourceDestination {
+                resource: RESOURCES[2],
+                block_ids: vec![102],
+            },
+        ],
+        matched_tokens,
+    );
+    assert!(matches!(
+        duplicate,
+        Err(kvbm_protocols::connector::LeaderEngineError::InvalidBundleTransfer { .. })
+    ));
+
+    let onboard = engine.clone().onboard_bundle(
+        &search,
+        RESOURCES
+            .into_iter()
+            .enumerate()
+            .map(|(index, resource)| ResourceDestination {
+                resource,
+                block_ids: vec![100 + index],
+            })
+            .collect(),
+        matched_tokens,
     )?;
     wait_until(|| onboard.is_complete()).await;
     assert_eq!(onboard.outcome(), Some(LoadOutcome::Done));

@@ -9,8 +9,7 @@ use velo::Messenger;
 
 use kvbm_common::BlockId;
 use kvbm_engine::InstanceId;
-use kvbm_engine::worker::{LeaderLayoutConfig, WorkerLayoutResponse};
-use kvbm_physical::layout::LayoutConfig;
+use kvbm_engine::worker::{LeaderLayoutConfig, WorkerCacheConfig, WorkerLayoutResponse};
 
 use super::protocol::{
     FAILED_ONBOARD_HANDLER, FailedOnboardMessage, GET_LAYOUT_CONFIG_HANDLER, INITIALIZE_HANDLER,
@@ -143,10 +142,10 @@ impl ConnectorWorkerClient {
     ///
     /// # Returns
     /// A typed unary result that resolves to the layout configuration
-    pub fn get_layout_config(&self) -> Result<velo::TypedUnaryResult<LayoutConfig>> {
+    pub fn get_layout_config(&self) -> Result<velo::TypedUnaryResult<WorkerCacheConfig>> {
         let awaiter = self
             .messenger
-            .typed_unary::<LayoutConfig>(GET_LAYOUT_CONFIG_HANDLER)?
+            .typed_unary::<WorkerCacheConfig>(GET_LAYOUT_CONFIG_HANDLER)?
             .instance(self.remote)
             .send();
         Ok(awaiter)

@@ -309,7 +309,7 @@ _FC_PHYSICAL_ORDERINGS: tuple[tuple[tuple[KvDim, ...], KvBlockLayout], ...] = (
 # so the caller can format human-readable log lines without re-deriving
 # what went wrong.
 FC_INELIGIBLE_NO_BACKENDS = "no_attention_backends"
-FC_INELIGIBLE_HYBRID_BACKENDS = "hybrid_attention_backends"
+FC_REQUIRES_LAYER_WISE_HETEROGENEOUS_BACKENDS = "heterogeneous_attention_backends"
 FC_INELIGIBLE_BACKEND_NO_MATCH = "backend_no_fc_variant"
 
 
@@ -321,27 +321,17 @@ def select_fc_for_model(
     """Decide whether a *whole model* can register through FC, and which variant.
 
     Returns ``(variant, None)`` when FC is viable and ``(None, reason)`` when
-    LW must be used. The reason is one of the ``FC_INELIGIBLE_*`` string
+    LW must be used. The reason is one of this module's ``FC_*`` string
     constants so callers can format consistent log messages.
 
-    KVBM does NOT currently support hybrid models (multiple distinct
-    attention backends) in either the FC or LW registration paths —
-    ``register_kv_caches`` bails on ``len(self._attn_backends) != 1`` and
-    ``register_cross_layers_kv_cache`` mirrors that check. Returning
-    ``(None, FC_INELIGIBLE_HYBRID_BACKENDS)`` from here keeps the failure
-    site in LW (one authoritative error message) instead of vLLM trying
-    FC, failing to allocate uniform, and falling back into LW's rejection
-    by an indirect route.
-
-    Hybrid kv_cache_groups on a *single* backend are NOT detected here
-    (this helper sees only the dedup'd backend list, not the eventual
-    kv_cache_config); those still surface as the LW
-    ``NotImplementedError``.
+    Multiple attention backends require the per-layer registration path;
+    the manifest adapter then validates and registers each resource with its
+    own shape and layout.
     """
     if not backends:
         return (None, FC_INELIGIBLE_NO_BACKENDS)
     if len(backends) > 1:
-        return (None, FC_INELIGIBLE_HYBRID_BACKENDS)
+        return (None, FC_REQUIRES_LAYER_WISE_HETEROGENEOUS_BACKENDS)
     variant = select_fc_variant(backends[0], cache_dtype_str=cache_dtype_str)
     if variant is None:
         return (None, FC_INELIGIBLE_BACKEND_NO_MATCH)

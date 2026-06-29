@@ -28,6 +28,12 @@ from typing import TYPE_CHECKING, Any, Optional
 import kvbm
 from kvbm.vllm import KvbmVllmConfig
 from kvbm.vllm.consolidator_config import get_consolidator_endpoints
+from kvbm.vllm.manifest import (
+    CacheManifest,
+    ResourceMapping,
+    all_group_block_ids,
+    map_kv_cache_resources,
+)
 
 from ..sched_output import process_scheduler_output
 from .worker import VeloPeerMetadata
@@ -78,6 +84,15 @@ class KvbmConnectorLeader:
         self.kvbm_config = kvbm_config
         self.vllm_kv_cache_config = kv_cache_config
         self.kvbm_override_config = kwargs.get("kvbm_override_config", None)
+        manifest_json = kwargs.get("cache_manifest_json")
+        self.cache_manifest: CacheManifest | None = (
+            CacheManifest.from_json(manifest_json) if manifest_json else None
+        )
+        self.resource_mapping: ResourceMapping | None = (
+            map_kv_cache_resources(self.cache_manifest, kv_cache_config)
+            if self.cache_manifest is not None
+            else None
+        )
         self.inflight_requests = {}
 
         self.iteration = 0
@@ -100,6 +115,8 @@ class KvbmConnectorLeader:
         self.leader = ConnectorLeader(
             self.runtime, self.block_size, consolidator_endpoints
         )
+        if self.cache_manifest is not None:
+            self.leader.register_manifest(self.cache_manifest.to_json())
 
         self.enable_decode_offload = os.getenv("KVBM_DECODE_OFFLOAD", "false") == "true"
         print(
@@ -135,9 +152,17 @@ class KvbmConnectorLeader:
         `num_external_tokens > 0` — queues the corresponding G2→G1 onboard
         request that is emitted via the next connector metadata build.
         """
-        block_ids = [int(block_id) for block_id in blocks.get_block_ids()[0]]
-        self.leader.update_state_after_alloc(
-            request.request_id, block_ids, num_external_tokens
+        groups = all_group_block_ids(blocks)
+        if self.resource_mapping is None:
+            block_ids = list(groups[0]) if groups else []
+            self.leader.update_state_after_alloc(
+                request.request_id, block_ids, num_external_tokens
+            )
+            return
+        self.leader.update_state_after_alloc_all_groups(
+            request.request_id,
+            self.resource_mapping.allocations(groups),
+            num_external_tokens,
         )
 
     def build_connector_meta(self, scheduler_output: "SchedulerOutput") -> bytes:
@@ -157,7 +182,13 @@ class KvbmConnectorLeader:
         if self.enable_decode_offload:
             for req_id, _ in self.inflight_requests.items():
                 self.update_slot(req_id)
-        output = process_scheduler_output(self.iteration, scheduler_output)
+        output = process_scheduler_output(
+            self.iteration,
+            scheduler_output,
+            self.resource_mapping.group_resources
+            if self.resource_mapping is not None
+            else None,
+        )
         result = bytes(self.leader.build_connector_metadata(output))
         return result
 
@@ -185,6 +216,14 @@ class KvbmConnectorLeader:
             del self.inflight_requests[request.request_id]
         delay = self.leader.request_finished(request.request_id)
         return (delay, None)
+
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        _block_ids_by_group: tuple[list[int], ...],
+    ) -> tuple[bool, Optional[dict[str, Any]]]:
+        """Retain every group's blocks behind the bundle terminal handle."""
+        return self.request_finished(request, [])
 
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
         # Convert None to empty sets for Rust binding compatibility

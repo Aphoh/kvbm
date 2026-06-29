@@ -8,8 +8,8 @@ use kvbm_common::{BlockId, LogicalLayoutHandle, LogicalResourceId, SequenceHash}
 use kvbm_logical::ImmutableBlock;
 use kvbm_physical::transfer::TransferCompleteNotification;
 use kvbm_protocols::connector::{
-    ActionFailure, ActionId, ActionStatus, BundleOnboardPlan, LeaderEngine, LeaderEngineError,
-    OnboardHandle, RequestId, ResourceOnboard,
+    ActionFailure, ActionId, ActionStatus, BundleOnboardPlan, FindBlocksHandle, LeaderEngine,
+    LeaderEngineError, OnboardHandle, RequestId, ResourceDestination, ResourceOnboard,
 };
 
 use super::{BundleOnboard, OnboardTransition};
@@ -52,6 +52,46 @@ impl LocalConnectorEngine {
     ) -> Result<OnboardHandle, LeaderEngineError> {
         validate_resource_transfers(self.as_ref(), &plan.resources)?;
         let (source_leases, inflight_hashes) = self.acquire_bundle_sources(&plan)?;
+        self.start_bundle_onboard_with_sources(req, plan, source_leases, inflight_hashes)
+    }
+
+    pub(in crate::tiering::engine) fn start_searched_bundle_onboard(
+        self: Arc<Self>,
+        handle: &FindBlocksHandle,
+        destinations: Vec<ResourceDestination>,
+        num_external_tokens: usize,
+    ) -> Result<OnboardHandle, LeaderEngineError> {
+        let search_id = handle
+            .search_id()
+            .ok_or(LeaderEngineError::SearchNotMatched)?;
+        let state = self
+            .bundle_searches
+            .get(&search_id)
+            .ok_or(LeaderEngineError::SearchNotMatched)?;
+        if state.request_id != *handle.request_id() {
+            return Err(LeaderEngineError::FindBlocksDesync);
+        }
+        if state.matched_tokens != num_external_tokens {
+            return Err(LeaderEngineError::ExternalTokensMismatch {
+                expected: state.matched_tokens,
+                got: num_external_tokens,
+            });
+        }
+        let (plan, source_leases, inflight_hashes) = searched_bundle_plan(&state, destinations)?;
+        validate_resource_transfers(self.as_ref(), &plan.resources)?;
+        let request_id = state.request_id.clone();
+        drop(state);
+        self.bundle_searches.remove(&search_id);
+        self.start_bundle_onboard_with_sources(&request_id, plan, source_leases, inflight_hashes)
+    }
+
+    fn start_bundle_onboard_with_sources(
+        self: Arc<Self>,
+        req: &RequestId,
+        plan: BundleOnboardPlan,
+        source_leases: SourceLeases,
+        inflight_hashes: Vec<SequenceHash>,
+    ) -> Result<OnboardHandle, LeaderEngineError> {
         let mut transaction =
             BundleOnboard::new(plan.identity, plan.key, source_leases).map_err(|error| {
                 LeaderEngineError::InvalidBundleTransfer {
@@ -193,6 +233,80 @@ impl LocalConnectorEngine {
             transfers: dispatched,
             failure: None,
         }
+    }
+}
+
+fn searched_bundle_plan(
+    state: &crate::tiering::engine::local::BundleSearchState,
+    destinations: Vec<ResourceDestination>,
+) -> Result<(BundleOnboardPlan, SourceLeases, Vec<SequenceHash>), LeaderEngineError> {
+    let mut destination_map = BTreeMap::new();
+    for destination in destinations {
+        if destination_map
+            .insert(destination.resource, destination.block_ids)
+            .is_some()
+        {
+            return Err(invalid_bundle(format!(
+                "duplicate destination for {:?}",
+                destination.resource
+            )));
+        }
+    }
+    let mut destinations = destination_map;
+    if destinations.len() != state.identity.resources().len() {
+        return Err(invalid_bundle(
+            "resource destinations do not match the manifest",
+        ));
+    }
+
+    let boundary = usize::try_from(state.lease.key().boundary_tokens())
+        .map_err(|_| invalid_bundle("bundle boundary does not fit usize"))?;
+    let computed = state.computed_tokens;
+    let mut resources = Vec::with_capacity(state.identity.resources().len());
+    let mut source_leases = BTreeMap::new();
+    let mut inflight_hashes = Vec::new();
+    for requirement in state.identity.resources() {
+        let resource = requirement.resource();
+        let native = requirement.native_block_tokens().get() as usize;
+        let first_block = computed / native;
+        let end_block = boundary.div_ceil(native);
+        let destination = destinations
+            .remove(&resource)
+            .ok_or_else(|| invalid_bundle(format!("missing destination for {resource:?}")))?;
+        let source = state
+            .lease
+            .resources()
+            .get(&resource)
+            .ok_or_else(|| invalid_bundle(format!("search lease is missing {resource:?}")))?;
+        if first_block >= end_block || source.len() < end_block || destination.len() < end_block {
+            return Err(invalid_bundle(format!(
+                "resource {resource:?} cannot cover native block range {first_block}..{end_block}"
+            )));
+        }
+        let pins = source[first_block..end_block].to_vec();
+        let source_block_ids = pins.iter().map(ImmutableBlock::block_id).collect();
+        inflight_hashes.extend(pins.iter().map(ImmutableBlock::sequence_hash));
+        resources.push(ResourceOnboard {
+            resource,
+            source_block_ids,
+            destination_block_ids: destination[first_block..end_block].to_vec(),
+        });
+        source_leases.insert(resource, pins);
+    }
+    Ok((
+        BundleOnboardPlan {
+            identity: state.identity.clone(),
+            key: *state.lease.key(),
+            resources,
+        },
+        source_leases,
+        inflight_hashes,
+    ))
+}
+
+fn invalid_bundle(reason: impl Into<String>) -> LeaderEngineError {
+    LeaderEngineError::InvalidBundleTransfer {
+        reason: reason.into(),
     }
 }
 

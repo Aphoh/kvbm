@@ -10,11 +10,14 @@ use pyo3::Bound;
 use pyo3::prelude::*;
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use uuid::Uuid;
 
-use kvbm_connector::common::{ConsolidatorEndpoints, FinishedStatus, Request};
+use kvbm_common::LogicalResourceId;
+use kvbm_connector::common::{ConsolidatorEndpoints, FinishedStatus, Request, RequestMetadata};
 use kvbm_connector::{BlockId, EventSource, InstanceId, WorkerAddress};
+use kvbm_protocols::cache_manifest::{CacheIdentity, CacheScope};
+use kvbm_protocols::connector::ResourceDestination;
 
 // The leader implementation behind the binding is the connector tree.
 use kvbm_connector::connector::Leader as ConnectorLeader;
@@ -40,6 +43,7 @@ pub use scheduler::PySchedulerOutput;
 #[pyclass(name = "ConnectorLeader")]
 pub struct PyConnectorLeader {
     inner: Arc<ConnectorLeader>,
+    manifest: RwLock<Option<CacheIdentity>>,
 }
 
 impl PyConnectorLeader {
@@ -104,6 +108,28 @@ impl<'a> ApiRoute<'a> {
                 leader,
                 request_id,
                 block_ids,
+                num_external_tokens,
+            ),
+        }
+    }
+    fn update_state_after_alloc_all_groups(
+        &self,
+        request_id: &str,
+        allocations: Vec<(u16, Vec<BlockId>)>,
+        num_external_tokens: usize,
+    ) -> anyhow::Result<()> {
+        let destinations = allocations
+            .into_iter()
+            .map(|(resource, block_ids)| ResourceDestination {
+                resource: LogicalResourceId(resource),
+                block_ids,
+            })
+            .collect();
+        match self {
+            ApiRoute::Direct(leader) => ConnectorLeader::update_state_after_alloc_all_groups(
+                leader,
+                request_id,
+                destinations,
                 num_external_tokens,
             ),
         }
@@ -178,7 +204,10 @@ impl PyConnectorLeader {
         let leader = Arc::new(ConnectorLeader::new_with_consolidator(
             runtime, block_size, endpoints,
         ));
-        Ok(Self { inner: leader })
+        Ok(Self {
+            inner: leader,
+            manifest: RwLock::new(None),
+        })
     }
 
     pub fn block_size(&self) -> usize {
@@ -189,10 +218,37 @@ impl PyConnectorLeader {
         self.api().has_slot(request_id)
     }
 
-    pub fn create_slot(&self, request: PyRequest) -> PyResult<()> {
+    pub fn create_slot(&self, mut request: PyRequest) -> PyResult<()> {
+        if let Some(identity) = self
+            .manifest
+            .read()
+            .expect("manifest lock poisoned")
+            .clone()
+        {
+            request
+                .inner
+                .metadata
+                .get_or_insert_with(RequestMetadata::default)
+                .set_cache(CacheScope::Manifest(identity));
+        }
         self.api()
             .create_slot(request.inner.clone())
             .map_err(to_pyerr)
+    }
+
+    /// Validate and install the cache ABI used by subsequently-created slots.
+    pub fn register_manifest(&self, manifest_json: &str) -> PyResult<Vec<u8>> {
+        let manifest =
+            crate::vllm::config::parse_cache_manifest(manifest_json).map_err(|error| {
+                pyo3::exceptions::PyValueError::new_err(format!("invalid cache manifest: {error}"))
+            })?;
+        let identity = manifest.identity();
+        let digest = identity.manifest().as_bytes().to_vec();
+        self.inner
+            .register_manifest(identity.manifest())
+            .map_err(to_pyerr)?;
+        *self.manifest.write().expect("manifest lock poisoned") = Some(identity);
+        Ok(digest)
     }
 
     /// Get the total number of tokens in a slot's sequence.
@@ -252,6 +308,18 @@ impl PyConnectorLeader {
             .map_err(to_pyerr)
     }
 
+    /// Record every manifest resource allocation and atomically commit a hit.
+    pub fn update_state_after_alloc_all_groups(
+        &self,
+        request_id: &str,
+        allocations: Vec<(u16, Vec<BlockId>)>,
+        num_external_tokens: usize,
+    ) -> PyResult<()> {
+        self.api()
+            .update_state_after_alloc_all_groups(request_id, allocations, num_external_tokens)
+            .map_err(to_pyerr)
+    }
+
     /// See [`ConnectorLeader::request_finished`] for more details.
     pub fn request_finished(&self, request_id: &str) -> bool {
         match self.api().request_finished(request_id) {
@@ -259,6 +327,12 @@ impl PyConnectorLeader {
             FinishedStatus::Pending => true,
             FinishedStatus::UntrackedRequest => false,
         }
+    }
+
+    /// Bundle-aware finish gate. All resource blocks share the slot's one
+    /// terminal decision, so this intentionally has the scalar return shape.
+    pub fn request_finished_all_groups(&self, request_id: &str) -> bool {
+        self.request_finished(request_id)
     }
 
     /// See [`ConnectorLeader::update_connector_output`] for more details.

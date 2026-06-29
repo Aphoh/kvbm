@@ -143,6 +143,13 @@ pub struct ResourceOnboard {
     pub destination_block_ids: Vec<BlockId>,
 }
 
+/// One vLLM G1 destination allocation for a manifest logical resource.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceDestination {
+    pub resource: kvbm_common::LogicalResourceId,
+    pub block_ids: Vec<BlockId>,
+}
+
 /// One exact G1-to-G2 save within a logical model resource.
 ///
 /// Within a [`BundleOffloadPlan`], prefix-history resources carry the complete

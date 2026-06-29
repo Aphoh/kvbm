@@ -51,12 +51,13 @@ use anyhow::{Result, anyhow, bail};
 use parking_lot::Mutex;
 use velo::PeerInfo;
 
-use kvbm_common::BlockId;
+use kvbm_common::{BlockId, LogicalResourceId};
 use kvbm_engine::worker::{SerializedLayout, VeloWorkerClient};
 use kvbm_hub::HubClient;
 use kvbm_logical::events::KvbmCacheEventsPublisher;
 use kvbm_protocols::connector::{
-    FinishedStatus as EngineFinishedStatus, LeaderEngineError, WorkerEngineDriver,
+    FinishedStatus as EngineFinishedStatus, LeaderEngineError, ResourceDestination,
+    WorkerEngineDriver,
 };
 
 use crate::common::{
@@ -106,6 +107,11 @@ pub enum Error {
     /// external load per GNMT promise, so this is always a contract anomaly).
     #[error("external load for request id {0}: onboard already in flight")]
     OnboardAlreadyInFlight(String),
+    #[error("request id {request_id} has duplicate allocation for resource {resource:?}")]
+    DuplicateResourceAllocation {
+        request_id: String,
+        resource: LogicalResourceId,
+    },
     /// The token sequence extension was rejected by the underlying
     /// `TokenBlockSequence::extend` (e.g. multimodal runs present, or an
     /// internal commit failure).
@@ -307,6 +313,7 @@ impl FlushGlue {
 /// velo peers; `initialize` drains them to build the engine stack.
 struct Construction {
     runtime: Arc<KvbmRuntime>,
+    manifest: Mutex<Option<kvbm_protocols::cache_manifest::CacheManifestId>>,
     // Consumed by the engine-stack build (`InstanceLeader::with_consolidator`).
     consolidator_endpoints: Option<ConsolidatorEndpoints>,
     workers: Mutex<WorkerAccum>,
@@ -372,6 +379,7 @@ impl Leader {
             engine_installed: OnceLock::new(),
             construction: Some(Construction {
                 runtime,
+                manifest: Mutex::new(None),
                 consolidator_endpoints,
                 workers: Mutex::new(WorkerAccum::default()),
             }),
@@ -412,6 +420,24 @@ impl Leader {
             .set(())
             .map_err(|_| anyhow!("leader engine already installed"))?;
         state.install_engine(engine);
+        Ok(())
+    }
+
+    /// Bind the manifest digest expected from every worker initialization.
+    pub fn register_manifest(
+        &self,
+        manifest: kvbm_protocols::cache_manifest::CacheManifestId,
+    ) -> Result<()> {
+        let construction = self
+            .construction
+            .as_ref()
+            .ok_or_else(|| anyhow!("manifest registration requires deferred construction"))?;
+        let mut installed = construction.manifest.lock();
+        anyhow::ensure!(
+            installed.is_none_or(|current| current == manifest),
+            "leader cache manifest is already registered with a different digest"
+        );
+        *installed = Some(manifest);
         Ok(())
     }
 
@@ -468,6 +494,19 @@ impl Leader {
         self.state
             .lock()
             .allocate(request_id, block_ids, num_external_tokens)?;
+        Ok(())
+    }
+
+    /// Manifest-aware USAA: submit every logical-resource G1 allocation.
+    pub fn update_state_after_alloc_all_groups(
+        self: &Arc<Self>,
+        request_id: &str,
+        destinations: Vec<ResourceDestination>,
+        num_external_tokens: usize,
+    ) -> Result<()> {
+        self.state
+            .lock()
+            .allocate_resources(request_id, destinations, num_external_tokens)?;
         Ok(())
     }
 
@@ -685,16 +724,22 @@ impl Leader {
         } else {
             kvbm_engine::RemoteOps::default()
         };
-        let (engine, driver) = kvbm_engine::build_local_connector_engine(
-            stack.instance_leader,
-            sink,
-            kvbm_engine::ConnectorEngineConfig {
-                block_size,
-                remote,
-                resource_policies: Default::default(),
-            },
-            stack.offload,
-        );
+        let config = kvbm_engine::ConnectorEngineConfig {
+            block_size,
+            remote,
+            resource_policies: Default::default(),
+        };
+        let (engine, driver) = if stack.offloads.is_empty() {
+            kvbm_engine::build_local_connector_engine(stack.instance_leader, sink, config, None)
+        } else {
+            kvbm_engine::build_local_connector_engine_with_resources(
+                stack.instance_leader,
+                sink,
+                config,
+                stack.primary_resource,
+                stack.offloads,
+            )?
+        };
         self.install_engine(engine)?;
         // Arm the forward-pass flush trigger — the driver is the other face of
         // the engine the install just swapped in; the glue only fires for
@@ -758,6 +803,13 @@ pub trait ConnectorLeaderApi: Send + Sync {
         num_external_tokens: usize,
     ) -> Result<()>;
 
+    fn update_state_after_alloc_all_groups(
+        &self,
+        request_id: &str,
+        destinations: Vec<ResourceDestination>,
+        num_external_tokens: usize,
+    ) -> Result<()>;
+
     fn build_connector_meta(&self, output: SchedulerOutput) -> Result<KvConnectorMetadata>;
 
     fn update_connector_output(
@@ -800,6 +852,20 @@ impl ConnectorLeaderApi for Arc<Leader> {
         Leader::update_state_after_alloc(self, request_id, block_ids, num_external_tokens)
     }
 
+    fn update_state_after_alloc_all_groups(
+        &self,
+        request_id: &str,
+        destinations: Vec<ResourceDestination>,
+        num_external_tokens: usize,
+    ) -> Result<()> {
+        Leader::update_state_after_alloc_all_groups(
+            self,
+            request_id,
+            destinations,
+            num_external_tokens,
+        )
+    }
+
     fn build_connector_meta(&self, output: SchedulerOutput) -> Result<KvConnectorMetadata> {
         self.as_ref().build_connector_meta(output)
     }
@@ -824,15 +890,19 @@ mod tests {
     use crate::common::{CachedRequestData, NewRequestData, RequestMetadata, SchedulerOutput};
     use crate::common::{FinishedStatus, Request};
     use crate::connector::engine::noop_leader_engine;
-    use kvbm_common::{BlockId, SequenceHash};
+    use kvbm_common::{BlockId, LogicalResourceId, SequenceHash};
+    use kvbm_protocols::cache_manifest::{
+        CacheManifest, ModelIdentity, ResourceRequirement, ResourceRole,
+    };
     use kvbm_protocols::connector::{ActionId, SearchId};
     use kvbm_protocols::connector::{
-        ActionStatus, EvictionFence, EvictionOutcome, FenceHandle, FenceToken, FindBlocksHandle,
-        FindBlocksOutcome, FindBlocksRequest, LeaderEngine, LeaderEngineError, OffloadHandle,
-        OnboardHandle, RequestId, RequestOffloadDrain,
+        ActionStatus, BundleOffloadPlan, CacheScope, EvictionFence, EvictionOutcome, FenceHandle,
+        FenceToken, FindBlocksHandle, FindBlocksOutcome, FindBlocksRequest, LeaderEngine,
+        LeaderEngineError, OffloadHandle, OnboardHandle, RequestId, RequestOffloadDrain,
+        ResourceDestination,
     };
     use kvbm_protocols::disagg::{RemotePrefillParams, SessionEndpoint, TransferParams};
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, Weak};
 
@@ -841,6 +911,40 @@ mod tests {
 
     fn fresh_leader() -> Leader {
         Leader::with_engine(noop_leader_engine(), BS)
+    }
+
+    fn manifest_request(request_id: &str) -> Request {
+        let manifest = CacheManifest::new(
+            ModelIdentity::new("hybrid-test", "v1", [9; 32]).unwrap(),
+            "hybrid-test-v1",
+            vec![
+                ResourceRequirement::new(
+                    LogicalResourceId(10),
+                    ResourceRole::PrefixHistory,
+                    BS as u32,
+                )
+                .unwrap(),
+                ResourceRequirement::new(
+                    LogicalResourceId(11),
+                    ResourceRole::BoundaryCapsule,
+                    BS as u32,
+                )
+                .unwrap(),
+            ],
+            Default::default(),
+        )
+        .unwrap();
+        Request::with_token_limits(
+            request_id,
+            (0..12u32).collect::<Vec<_>>(),
+            None,
+            None,
+            None,
+            Some(4),
+            Some(RequestMetadata::with_cache(CacheScope::Manifest(
+                manifest.identity(),
+            ))),
+        )
     }
 
     // --- engine install (deferred construction) --------------------------
@@ -1270,6 +1374,137 @@ mod tests {
             *engine.releases.lock().unwrap(),
             minted,
             "release fires once on final drop"
+        );
+    }
+
+    #[test]
+    fn manifest_allocation_submits_every_destination_and_retains_until_terminal() {
+        let engine = recording_engine(Refresh::Lost);
+        let leader = Arc::new(Leader::with_engine(engine.dyn_clone(), BS));
+        leader.create_slot(manifest_request("bundle")).unwrap();
+
+        assert_eq!(
+            leader.get_num_new_matched_tokens("bundle", 0).unwrap(),
+            (Some(2 * BS), true)
+        );
+        let destinations = vec![
+            ResourceDestination {
+                resource: LogicalResourceId(10),
+                block_ids: vec![1, 2, 3],
+            },
+            ResourceDestination {
+                resource: LogicalResourceId(11),
+                block_ids: vec![20, 21, 22],
+            },
+        ];
+        leader
+            .update_state_after_alloc_all_groups("bundle", destinations.clone(), 2 * BS)
+            .unwrap();
+
+        let calls = engine.bundle_onboards.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, destinations);
+        assert_eq!(calls[0].2, 2 * BS);
+        drop(calls);
+        assert_eq!(leader.request_finished("bundle"), FinishedStatus::Pending);
+        assert!(leader.has_slot("bundle"));
+
+        *engine.onboard_cells.lock().unwrap()[0].lock().unwrap() = ActionStatus::Complete;
+        leader
+            .update_connector_output(HashSet::new(), HashSet::from(["bundle".to_owned()]))
+            .unwrap();
+        assert!(!leader.has_slot("bundle"));
+    }
+
+    #[test]
+    fn manifest_scheduler_walk_submits_one_atomic_bundle() {
+        let engine = recording_engine(Refresh::Lost);
+        let leader = Arc::new(Leader::with_engine(engine.dyn_clone(), BS));
+        leader.create_slot(manifest_request("save-bundle")).unwrap();
+        leader
+            .update_state_after_alloc_all_groups(
+                "save-bundle",
+                vec![
+                    ResourceDestination {
+                        resource: LogicalResourceId(10),
+                        block_ids: vec![1, 2, 3],
+                    },
+                    ResourceDestination {
+                        resource: LogicalResourceId(11),
+                        block_ids: vec![20, 21, 22],
+                    },
+                ],
+                0,
+            )
+            .unwrap();
+        let mut output = SchedulerOutput::new(1);
+        output.set_group_resources(vec![LogicalResourceId(10), LogicalResourceId(11)]);
+        output.add_new_request_all_groups(
+            "save-bundle".to_owned(),
+            (0..12).collect(),
+            vec![vec![1, 2, 3], vec![20, 21, 22]],
+            0,
+        );
+        output.set_num_scheduled_tokens(HashMap::from([("save-bundle".to_owned(), 8)]));
+
+        leader.build_connector_meta(output).unwrap();
+
+        let calls = engine.bundle_offload_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let plan = &calls[0].1;
+        assert_eq!(plan.key.boundary_tokens(), 8);
+        assert_eq!(plan.resources[0].blocks.len(), 2);
+        assert_eq!(plan.resources[1].blocks.len(), 1);
+        assert_eq!(plan.resources[1].blocks[0].1, 21);
+    }
+
+    #[test]
+    fn manifest_scheduler_walk_retries_a_rejected_bundle_boundary() {
+        let engine = recording_engine(Refresh::Lost);
+        let leader = Arc::new(Leader::with_engine(engine.dyn_clone(), BS));
+        leader
+            .create_slot(manifest_request("retry-bundle"))
+            .unwrap();
+        leader
+            .update_state_after_alloc_all_groups(
+                "retry-bundle",
+                vec![
+                    ResourceDestination {
+                        resource: LogicalResourceId(10),
+                        block_ids: vec![1, 2, 3],
+                    },
+                    ResourceDestination {
+                        resource: LogicalResourceId(11),
+                        block_ids: vec![20, 21, 22],
+                    },
+                ],
+                0,
+            )
+            .unwrap();
+
+        let output = |iteration| {
+            let mut output = SchedulerOutput::new(iteration);
+            output.set_group_resources(vec![LogicalResourceId(10), LogicalResourceId(11)]);
+            output.add_new_request_all_groups(
+                "retry-bundle".to_owned(),
+                (0..12).collect(),
+                vec![vec![1, 2, 3], vec![20, 21, 22]],
+                0,
+            );
+            output.set_num_scheduled_tokens(HashMap::from([("retry-bundle".to_owned(), 8)]));
+            output
+        };
+
+        *engine.reject_bundle_offload.lock().unwrap() = true;
+        leader.build_connector_meta(output(1)).unwrap();
+        assert!(engine.bundle_offload_calls.lock().unwrap().is_empty());
+
+        *engine.reject_bundle_offload.lock().unwrap() = false;
+        leader.build_connector_meta(output(2)).unwrap();
+        assert_eq!(
+            engine.bundle_offload_calls.lock().unwrap().len(),
+            1,
+            "an engine refusal must not consume the common bundle boundary"
         );
     }
 
@@ -2810,6 +3045,7 @@ mod tests {
             req_id: req_id.to_string(),
             prompt_token_ids: Vec::new(),
             block_ids,
+            block_ids_by_group: Vec::new(),
             num_computed_tokens: num_computed,
         });
         out.num_scheduled_tokens
@@ -2833,6 +3069,7 @@ mod tests {
             new_token_ids: Vec::new(),
             all_token_ids: None,
             new_block_ids,
+            new_block_ids_by_group: Vec::new(),
             num_computed_tokens: num_computed,
             num_output_tokens: 0,
         });
@@ -3041,6 +3278,7 @@ mod tests {
             req_id: "r1".to_string(),
             prompt_token_ids: Vec::new(),
             block_ids: vec![10, 11],
+            block_ids_by_group: Vec::new(),
             num_computed_tokens: 0,
         });
         // total stays 0
@@ -3108,6 +3346,7 @@ mod tests {
             new_token_ids: Vec::new(),
             all_token_ids: Some(all_tokens),
             new_block_ids: vec![20, 21],
+            new_block_ids_by_group: Vec::new(),
             num_computed_tokens: 0,
             num_output_tokens: 0,
         });
@@ -3432,11 +3671,14 @@ mod tests {
         /// `onboard_blocks` call — asserts USAA hands the engine the parked
         /// lifecycle, the FULL allocated set, and the committed count.
         onboards: Mutex<Vec<(SearchId, Vec<BlockId>, usize)>>,
+        bundle_onboards: Mutex<Vec<(SearchId, Vec<ResourceDestination>, usize)>>,
+        reject_bundle_offload: Mutex<bool>,
         /// Status cell of each minted onboard handle, in `onboards` order.
         onboard_cells: Mutex<Vec<Arc<Mutex<ActionStatus>>>>,
         /// One `(request_id, pairs)` entry per `offload` call.
         #[allow(clippy::type_complexity)]
         offload_calls: Mutex<Vec<(RequestId, Vec<(SequenceHash, BlockId)>)>>,
+        bundle_offload_calls: Mutex<Vec<(RequestId, BundleOffloadPlan)>>,
         /// Status cell of each minted offload handle, in `offload_calls` order.
         offload_cells: Mutex<Vec<Arc<Mutex<ActionStatus>>>>,
         /// Requests whose offload drain is armed; consumed (removed) by
@@ -3512,8 +3754,11 @@ mod tests {
             fence_cells: Mutex::new(Vec::new()),
             self_weak: Mutex::new(None),
             onboards: Mutex::new(Vec::new()),
+            bundle_onboards: Mutex::new(Vec::new()),
+            reject_bundle_offload: Mutex::new(false),
             onboard_cells: Mutex::new(Vec::new()),
             offload_calls: Mutex::new(Vec::new()),
+            bundle_offload_calls: Mutex::new(Vec::new()),
             offload_cells: Mutex::new(Vec::new()),
             drains_armed: Mutex::new(HashSet::new()),
             commits: Arc::new(Mutex::new(Vec::new())),
@@ -3604,6 +3849,34 @@ mod tests {
             ))
         }
 
+        fn onboard_bundle(
+            self: Arc<Self>,
+            handle: &FindBlocksHandle,
+            destinations: Vec<ResourceDestination>,
+            num_external_tokens: usize,
+        ) -> Result<OnboardHandle, LeaderEngineError> {
+            let generation = handle
+                .search_id()
+                .expect("this double mints only search-kind lifecycles");
+            let dest_ids = destinations
+                .iter()
+                .flat_map(|destination| destination.block_ids.iter().copied())
+                .collect();
+            self.bundle_onboards.lock().unwrap().push((
+                generation,
+                destinations,
+                num_external_tokens,
+            ));
+            let cell = Arc::new(Mutex::new(ActionStatus::Pending));
+            self.onboard_cells.lock().unwrap().push(Arc::clone(&cell));
+            Ok(OnboardHandle::new(
+                ActionId::new(),
+                self.weak(),
+                cell,
+                dest_ids,
+            ))
+        }
+
         fn offload(
             self: Arc<Self>,
             req: &RequestId,
@@ -3617,6 +3890,25 @@ mod tests {
             self.offload_cells.lock().unwrap().push(Arc::clone(&cell));
             self.drains_armed.lock().unwrap().insert(req.clone());
             Ok(OffloadHandle::new(ActionId::new(), self.weak(), cell))
+        }
+
+        fn offload_bundle(
+            self: Arc<Self>,
+            req: &RequestId,
+            plan: BundleOffloadPlan,
+        ) -> Result<OffloadHandle, LeaderEngineError> {
+            if *self.reject_bundle_offload.lock().unwrap() {
+                return Err(LeaderEngineError::InvalidBundleTransfer {
+                    reason: "injected bundle rejection".to_owned(),
+                });
+            }
+            self.bundle_offload_calls
+                .lock()
+                .unwrap()
+                .push((req.clone(), plan));
+            let (handle, cell) = self.arm_offload(req);
+            self.offload_cells.lock().unwrap().push(cell);
+            Ok(handle)
         }
 
         fn evict(&self, req: &RequestId) -> EvictionOutcome {

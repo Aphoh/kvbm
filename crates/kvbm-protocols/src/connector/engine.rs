@@ -20,7 +20,7 @@ use kvbm_common::LogicalResourceId;
 use super::handles::{FindBlocksHandle, OffloadHandle, OnboardHandle, RequestOffloadDrain};
 use super::protocol::{
     AcceptId, ActionId, ActionStatus, BundleOffloadPlan, BundleOnboardPlan, EvictionOutcome,
-    FindBlocksOutcome, FindBlocksRequest, LeaderEngineError, SearchId,
+    FindBlocksOutcome, FindBlocksRequest, LeaderEngineError, ResourceDestination, SearchId,
 };
 use super::protocol::{BlockId, RequestId, SequenceHash};
 
@@ -135,6 +135,25 @@ pub trait LeaderEngine: Send + Sync + 'static {
             });
         };
         let _ = req;
+        Err(LeaderEngineError::ResourceOnboardNotConfigured {
+            resource: first.resource,
+        })
+    }
+
+    /// Consume a manifest-scoped search lease and restore every required
+    /// resource into its complete vLLM G1 allocation.
+    fn onboard_bundle(
+        self: Arc<Self>,
+        handle: &FindBlocksHandle,
+        destinations: Vec<ResourceDestination>,
+        num_external_tokens: usize,
+    ) -> Result<OnboardHandle, LeaderEngineError> {
+        let Some(first) = destinations.first() else {
+            return Err(LeaderEngineError::InvalidBundleTransfer {
+                reason: "at least one resource destination is required".to_owned(),
+            });
+        };
+        let _ = (handle, num_external_tokens);
         Err(LeaderEngineError::ResourceOnboardNotConfigured {
             resource: first.resource,
         })

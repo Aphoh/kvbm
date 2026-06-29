@@ -151,6 +151,15 @@ class PdConnector(MultiConnector):
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):
         empty_blocks = blocks.new_empty()
+        group_count = len(blocks.get_block_ids())
+        if group_count > 1 and not self._all_support_hma:
+            raise RuntimeError(
+                "PdConnector hybrid allocation requires every child to support HMA"
+            )
+        if len(empty_blocks.get_block_ids()) != group_count:
+            raise RuntimeError(
+                "PdConnector children disagree on the outer KV-cache group tuple"
+            )
         self._connectors[0].update_state_after_alloc(
             request, blocks, num_external_tokens
         )

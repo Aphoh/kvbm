@@ -21,6 +21,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
     KVConnectorRole,
 )
+try:
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import SupportsHMA
+except ImportError:
+    class SupportsHMA:  # type: ignore[no-redef]
+        """Compatibility stand-in for vLLM releases before HMA."""
+
 from vllm.v1.core.kv_cache_manager import KVCacheConfig
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import KVConnectorOutput
@@ -36,6 +42,7 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 from kvbm.vllm.config import extract_vllm_config_for_kvbm
+from kvbm.vllm.manifest import manifest_from_extra_config
 
 # Import our minimal scheduler connector implementations
 from .leader import KvbmConnectorLeader
@@ -52,7 +59,7 @@ class KvbmConnectorMetadata(KVConnectorMetadata):
         self.metadata = metadata
 
 
-class KvbmConnector(KVConnectorBase_V1):
+class KvbmConnector(KVConnectorBase_V1, SupportsHMA):
     """
     Dynamo Scheduler Connector that uses minimal no-op implementations.
 
@@ -87,6 +94,8 @@ class KvbmConnector(KVConnectorBase_V1):
 
         # Serialize to JSON and pass to Rust (empty dict = use defaults)
         kvbm_override_config = json.dumps(extra_config) if extra_config else None
+        cache_manifest = manifest_from_extra_config(extra_config)
+        cache_manifest_json = cache_manifest.to_json() if cache_manifest else None
 
         kvbm_config = extract_vllm_config_for_kvbm(vllm_config)
 
@@ -96,6 +105,7 @@ class KvbmConnector(KVConnectorBase_V1):
                 kv_cache_config=kv_cache_config,
                 kvbm_config=kvbm_config,
                 kvbm_override_config=kvbm_override_config,
+                cache_manifest_json=cache_manifest_json,
             )
             self._worker = None
         elif role == KVConnectorRole.WORKER:
@@ -104,6 +114,7 @@ class KvbmConnector(KVConnectorBase_V1):
                 kv_cache_config=kv_cache_config,
                 kvbm_config=kvbm_config,
                 kvbm_override_config=kvbm_override_config,
+                cache_manifest_json=cache_manifest_json,
             )
             self._scheduler = None
         else:
@@ -149,7 +160,18 @@ class KvbmConnector(KVConnectorBase_V1):
         """Never delays block freeing - returns (False, None)."""
         if self._scheduler is None:
             raise RuntimeError("Cannot call scheduler methods on WORKER role")
+        if self._scheduler.cache_manifest is not None:
+            return self._scheduler.request_finished_all_groups(request, (block_ids,))
         return self._scheduler.request_finished(request, block_ids)
+
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, Optional[dict[str, Any]]]:
+        if self._scheduler is None:
+            raise RuntimeError("Cannot call scheduler methods on WORKER role")
+        return self._scheduler.request_finished_all_groups(request, block_ids)
 
     # added in v0.11
     def update_connector_output(self, connector_output: KVConnectorOutput):
@@ -216,17 +238,9 @@ class KvbmConnector(KVConnectorBase_V1):
 
         Default ("auto"):
 
-        1. Hybrid models with multiple distinct attention backends are
-           rejected here with a clear log. KVBM does NOT currently
-           support hybrid models in either path — `register_kv_caches`
-           also bails on `len(self._attn_backends) != 1` and `len(groups)
-           != 1`. Returning False here just routes the failure into LW
-           where the `NotImplementedError` is the authoritative source
-           of truth; the FC path's `register_cross_layers_kv_cache` also
-           rejects multi-group inputs defensively. Hybrid kv_cache_groups
-           on a single backend cannot be detected here (kv_cache_config
-           is not yet built when this property is read) and will surface
-           as the LW `NotImplementedError`.
+        1. A configured cache manifest always selects per-layer registration,
+           where each heterogeneous group is validated and registered as its
+           own logical resource.
 
         2. Otherwise: probe the single backend with
            `dim_probe.select_fc_variant`. Return True iff it maps to one
@@ -236,17 +250,30 @@ class KvbmConnector(KVConnectorBase_V1):
            uses LW for the single-backend case.
 
         Override precedence (highest first):
-          1. Env var `KVBM_PREFER_FULLY_CONTIGUOUS_BLOCKS={true,false}`.
+          1. Cache manifest (always per-layer).
+          2. Env var `KVBM_PREFER_FULLY_CONTIGUOUS_BLOCKS={true,false}`.
              Note: vLLM strips parent env when spawning EngineCore, so this
              channel does NOT work for the connector running inside disagg
              EngineCore subprocesses. Use the JSON config channel instead.
-          2. JSON config
+          3. JSON config
              `kv_transfer_config.kv_connector_extra_config.default.prefer_fully_contiguous_blocks`
              (bool). This is the channel that survives the EngineCore spawn
              and is the canonical way for tests / launch scripts to pin
              FC vs LW per run.
-          3. Auto-detect (the body below).
+          4. Auto-detect (the body below).
         """
+        extra = (
+            getattr(self._vllm_config, "kv_transfer_config", None)
+            and getattr(
+                self._vllm_config.kv_transfer_config,
+                "kv_connector_extra_config",
+                None,
+            )
+            or {}
+        )
+        if manifest_from_extra_config(extra) is not None:
+            return False
+
         override = os.getenv("KVBM_PREFER_FULLY_CONTIGUOUS_BLOCKS", "").lower()
         if override in ("false", "0", "no", "n", "off"):
             return False
@@ -298,7 +325,7 @@ class KvbmConnector(KVConnectorBase_V1):
         try:
             from kvbm.vllm.dim_probe import (
                 FC_INELIGIBLE_BACKEND_NO_MATCH,
-                FC_INELIGIBLE_HYBRID_BACKENDS,
+                FC_REQUIRES_LAYER_WISE_HETEROGENEOUS_BACKENDS,
                 FC_INELIGIBLE_NO_BACKENDS,
                 select_fc_for_model,
             )
@@ -329,14 +356,13 @@ class KvbmConnector(KVConnectorBase_V1):
                 "[KVBM] prefer_cross_layer_blocks=False: "
                 "get_current_attn_backends returned no backends."
             )
-        elif reason == FC_INELIGIBLE_HYBRID_BACKENDS:
+        elif reason == FC_REQUIRES_LAYER_WISE_HETEROGENEOUS_BACKENDS:
             backend_names = [b.__name__ for b in backends]
             print(
                 f"[KVBM] prefer_cross_layer_blocks=False: model has "
                 f"{len(backends)} distinct attention backends "
-                f"({backend_names}); hybrid models are not supported in "
-                f"either FC or LW paths. Registration will fail with a "
-                f"NotImplementedError from register_kv_caches."
+                f"({backend_names}); selecting manifest-aware per-layer "
+                f"registration."
             )
         elif reason == FC_INELIGIBLE_BACKEND_NO_MATCH:
             print(

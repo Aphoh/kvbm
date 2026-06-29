@@ -62,6 +62,10 @@ use kvbm_physical::TransferManager;
 use kvbm_physical::layout::{BlockDimension, LayoutConfig, PhysicalLayoutBuilder};
 use kvbm_physical::transfer::TransferCapabilities;
 
+mod resources;
+
+pub(super) use resources::PendingWorkerResources;
+
 /// Whether the registered tensors describe a per-layer set of allocations
 /// (vLLM's default `register_kv_caches` path) or a single cross-layer
 /// contiguous tensor (`register_cross_layers_kv_cache`).

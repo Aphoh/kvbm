@@ -44,6 +44,8 @@ impl LocalConnectorEngine {
                 request_id: req.request_id.clone(),
                 identity: identity.clone(),
                 lease: found.into_lease(),
+                computed_tokens: req.num_computed_tokens,
+                matched_tokens,
             },
         );
         let engine: Arc<dyn LeaderEngine> = Arc::clone(self) as Arc<dyn LeaderEngine>;
@@ -74,6 +76,8 @@ impl LocalConnectorEngine {
         }
         let query = self.bundle_find_query(req, identity, derived);
         if let Some(matched_tokens) = query.matched_tokens_for(state.lease.key()) {
+            state.computed_tokens = req.num_computed_tokens;
+            state.matched_tokens = matched_tokens;
             return Ok(FindBlocksOutcome::Resolved {
                 matched_tokens,
                 minted: None,
@@ -89,6 +93,8 @@ impl LocalConnectorEngine {
         if let Some(found) = replacement {
             let matched_tokens = found.matched_tokens();
             state.lease = found.into_lease();
+            state.computed_tokens = req.num_computed_tokens;
+            state.matched_tokens = matched_tokens;
             return Ok(FindBlocksOutcome::Resolved {
                 matched_tokens,
                 minted: None,
