@@ -10,6 +10,7 @@
 //! - [`TransferMetrics`]: Prometheus counters and gauges for KV transfer operations.
 //! - [`start_metrics_server`]: Optional HTTP server exposing `/metrics` in Prometheus text format.
 
+mod bundle;
 mod cache;
 mod cd;
 mod collector;
@@ -19,6 +20,7 @@ mod server;
 mod stats;
 mod transfer;
 
+pub use bundle::BundleMetrics;
 pub use cache::CacheStatsTracker;
 pub use cd::CdMetrics;
 pub use collector::MetricsAggregator;

@@ -17,6 +17,23 @@ pub struct BundleKey {
 }
 
 impl BundleKey {
+    /// Reconstruct a key from its wire components when the full manifest is
+    /// not locally available. Compatibility with a concrete identity must
+    /// still be checked by the consumer.
+    pub fn from_parts(
+        manifest: CacheManifestId,
+        boundary_hash: SequenceHash,
+        boundary_tokens: u64,
+    ) -> Result<Self, BundleKeyError> {
+        let boundary_tokens =
+            NonZeroU64::new(boundary_tokens).ok_or(BundleKeyError::ZeroBoundary)?;
+        Ok(Self {
+            manifest,
+            boundary_hash,
+            boundary_tokens,
+        })
+    }
+
     pub fn new(
         identity: &CacheIdentity,
         boundary_hash: SequenceHash,

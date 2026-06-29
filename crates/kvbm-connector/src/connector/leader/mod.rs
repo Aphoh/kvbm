@@ -707,10 +707,8 @@ impl Leader {
         // present (the wiring clones what it needs from the stack BEFORE the
         // factory below consumes it). Absent, the engine keeps
         // `RemoteOps::default()` — fully local, byte-equivalent to the
-        // pre-CD build. No remote-search discovery is wired for the connector yet;
-        // `search` stays `None` either way, which is behavior-identical to
-        // the previous hardcoded search_remote=true (proof: the engine's
-        // search_remote_without_discovery_is_ready_local test).
+        // pre-CD build. Remote search composes with CD when both are enabled,
+        // or wires its own Indexer+P2P foundation when CD is absent.
         let disagg_cfg = construction.runtime.config().disagg.clone();
         let remote = if cd::wiring_enabled(disagg_cfg.as_ref(), stack.handshake.as_ref()) {
             let disagg_cfg = disagg_cfg
@@ -721,6 +719,12 @@ impl Leader {
                 .as_ref()
                 .expect("CD wiring gate requires a hub handshake");
             cd::wire_disagg(&self, construction, &stack, disagg_cfg, handshake).await?
+        } else if construction.runtime.config().remote_search.is_some() {
+            let handshake = stack
+                .handshake
+                .as_ref()
+                .expect("remote-search availability was validated during construction");
+            remote_discovery::wire_remote_search(&self, construction, &stack, handshake).await?
         } else {
             kvbm_engine::RemoteOps::default()
         };
@@ -934,6 +938,8 @@ mod tests {
             Default::default(),
         )
         .unwrap();
+        let mut metadata = RequestMetadata::default();
+        metadata.set_cache(CacheScope::Manifest(manifest.identity()));
         Request::with_token_limits(
             request_id,
             (0..12u32).collect::<Vec<_>>(),
@@ -941,9 +947,7 @@ mod tests {
             None,
             None,
             Some(4),
-            Some(RequestMetadata::with_cache(CacheScope::Manifest(
-                manifest.identity(),
-            ))),
+            Some(metadata),
         )
     }
 

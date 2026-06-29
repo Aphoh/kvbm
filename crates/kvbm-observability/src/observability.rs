@@ -7,7 +7,10 @@ use std::sync::Arc;
 
 use prometheus::Registry;
 
-use crate::{CdMetrics, CompatMetrics, MetricsAggregator, TransferMetrics, start_metrics_server};
+use crate::{
+    BundleMetrics, CdMetrics, CompatMetrics, MetricsAggregator, TransferMetrics,
+    start_metrics_server,
+};
 
 /// Shared observability surface for a runtime or embedded component.
 #[derive(Clone)]
@@ -16,6 +19,7 @@ pub struct KvbmObservability {
     logical_aggregator: MetricsAggregator,
     compat_metrics: CompatMetrics,
     transfer_metrics: TransferMetrics,
+    bundle_metrics: BundleMetrics,
     cd_metrics: CdMetrics,
 }
 
@@ -31,6 +35,9 @@ impl KvbmObservability {
         let transfer_metrics = TransferMetrics::new();
         transfer_metrics.register(&registry)?;
 
+        let bundle_metrics = BundleMetrics::new();
+        bundle_metrics.register(&registry)?;
+
         let cd_metrics = CdMetrics::new();
         cd_metrics.register(&registry)?;
 
@@ -39,6 +46,7 @@ impl KvbmObservability {
             logical_aggregator,
             compat_metrics,
             transfer_metrics,
+            bundle_metrics,
             cd_metrics,
         })
     }
@@ -57,6 +65,10 @@ impl KvbmObservability {
 
     pub fn transfer_metrics(&self) -> &TransferMetrics {
         &self.transfer_metrics
+    }
+
+    pub fn bundle_metrics(&self) -> &BundleMetrics {
+        &self.bundle_metrics
     }
 
     pub fn cd_metrics(&self) -> &CdMetrics {

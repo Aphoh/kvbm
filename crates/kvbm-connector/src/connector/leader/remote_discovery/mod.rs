@@ -1,13 +1,23 @@
 //! Hub-backed remote block discovery for the engine search path.
 
+mod index;
+mod wiring;
+
+pub(super) use wiring::wire_remote_search;
+
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use futures::future::BoxFuture;
 use kvbm_engine::leader::{RemoteBlockDiscovery, RemoteCandidates};
 use kvbm_engine::p2p::session::PeerResolver;
-use kvbm_hub::{FindBlocksHit, IndexerLookupClient};
+use kvbm_engine::remote::search::bundle::{
+    BundleAdvertisement, BundleDiscoveryOutcome, BundleDiscoveryQuery, BundleInvalidation,
+};
+use kvbm_hub::IndexerLookupClient;
 use kvbm_logical::SequenceHash;
+
+use index::{BlockIndex, HubBlockIndex};
 
 /// Resolves indexed block holders and makes them reachable before returning.
 pub struct HubRemoteDiscovery {
@@ -70,40 +80,56 @@ impl RemoteBlockDiscovery for HubRemoteDiscovery {
             }))
         })
     }
-}
 
-trait BlockIndex: Send + Sync {
-    fn find_blocks(
+    fn discover_bundle(
         &self,
-        hashes: Vec<SequenceHash>,
-    ) -> BoxFuture<'static, Result<Option<FindBlocksHit>>>;
-}
-
-struct HubBlockIndex(Arc<IndexerLookupClient>);
-
-impl BlockIndex for HubBlockIndex {
-    fn find_blocks(
-        &self,
-        hashes: Vec<SequenceHash>,
-    ) -> BoxFuture<'static, Result<Option<FindBlocksHit>>> {
-        let index = Arc::clone(&self.0);
+        query: BundleDiscoveryQuery,
+    ) -> BoxFuture<'static, Result<BundleDiscoveryOutcome>> {
+        let index = Arc::clone(&self.index);
+        let peers = Arc::clone(&self.peers);
         Box::pin(async move {
-            index
-                .find_blocks(hashes)
+            let candidate = match index.find_bundle(query).await? {
+                BundleDiscoveryOutcome::Hit(candidate) => candidate,
+                miss @ BundleDiscoveryOutcome::Miss(_) => return Ok(miss),
+            };
+            let owner = candidate.advertisement().owner();
+            peers
+                .resolve_and_register(owner)
                 .await
-                .context("query KVBM hub block index")
+                .with_context(|| format!("remote bundle owner {owner} is unreachable"))?;
+            Ok(BundleDiscoveryOutcome::Hit(candidate))
         })
+    }
+
+    fn advertise_bundle(
+        &self,
+        advertisement: BundleAdvertisement,
+    ) -> BoxFuture<'static, Result<()>> {
+        self.index.publish_bundle(advertisement)
+    }
+
+    fn invalidate_bundle(
+        &self,
+        invalidation: BundleInvalidation,
+    ) -> BoxFuture<'static, Result<()>> {
+        self.index.invalidate_bundle(invalidation)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::collections::HashSet;
     use std::sync::Mutex;
 
     use anyhow::{Result, bail};
     use kvbm_engine::InstanceId;
+    use kvbm_hub::{BundleAdvertisementRecord, BundleQueryHit, FindBlocksHit};
+    use kvbm_protocols::cache_manifest::{
+        BundleKey, CacheManifest, ModelIdentity, ResourceRequirement, ResourceRole,
+    };
 
+    use super::index::directory_hit;
     use super::*;
 
     struct StubIndex {
@@ -139,6 +165,51 @@ mod tests {
 
     fn hash(position: u64) -> SequenceHash {
         SequenceHash::new(position, None, position)
+    }
+
+    fn bundle_query() -> (BundleDiscoveryQuery, BundleKey) {
+        let identity = CacheManifest::new(
+            ModelIdentity::new("remote-discovery", "v1", [3; 32]).unwrap(),
+            "remote-discovery-v1",
+            vec![
+                ResourceRequirement::new(
+                    kvbm_common::LogicalResourceId(7),
+                    ResourceRole::PrefixHistory,
+                    4,
+                )
+                .unwrap(),
+            ],
+            BTreeMap::new(),
+        )
+        .unwrap()
+        .identity();
+        let key = BundleKey::new(&identity, hash(1), 8).unwrap();
+        (BundleDiscoveryQuery::new(identity, vec![key], 1_000), key)
+    }
+
+    #[test]
+    fn bundle_directory_hit_preserves_manifest_owner_and_lease() {
+        let (query, key) = bundle_query();
+        let owner = InstanceId::new_v4();
+        let candidate = directory_hit(
+            query,
+            BundleQueryHit {
+                advertisement: BundleAdvertisementRecord {
+                    key,
+                    generation: 4,
+                    owner,
+                    resources: vec![kvbm_common::LogicalResourceId(7)],
+                    expires_at_unix_ms: 10_000,
+                },
+                lease_id: uuid::Uuid::new_v4(),
+                lease_expires_at_unix_ms: 2_000,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(candidate.advertisement().key(), key);
+        assert_eq!(candidate.advertisement().owner(), owner);
+        assert_eq!(candidate.lease_expires_at_unix_ms(), 2_000);
     }
 
     #[tokio::test]

@@ -11,6 +11,7 @@
 //! engine calls it yet. It exists to seed the upcoming async remote-search
 //! refactor, which will re-enable G4 lookups.
 
+pub mod bundle;
 pub(crate) mod composer;
 pub mod discovery;
 pub(crate) mod plan;

@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use futures::future::BoxFuture;
 use kvbm_common::{LogicalResourceId, SequenceHash};
 use kvbm_logical::{BlockRegistry, ImmutableBlock};
 use kvbm_protocols::cache_manifest::{
@@ -17,7 +18,13 @@ use kvbm_protocols::connector::{
 };
 
 use crate::G2;
+use crate::InstanceId;
 use crate::leader::InstanceLeader;
+use crate::leader::{RemoteBlockDiscovery, RemoteCandidates};
+use crate::remote::search::bundle::{
+    BundleAdvertisement, BundleDiscoveryOutcome, BundleDiscoveryQuery, BundleMissReason,
+    RemoteBundleCandidate,
+};
 use crate::testing::managers::TestManagerBuilder;
 use crate::testing::messenger::create_messenger_tcp;
 use crate::testing::token_blocks::create_token_sequence;
@@ -34,6 +41,13 @@ struct FindRig {
 }
 
 async fn find_rig(start: u32) -> Result<FindRig> {
+    find_rig_with_remote(start, None).await
+}
+
+async fn find_rig_with_remote(
+    start: u32,
+    remote: Option<Arc<dyn RemoteBlockDiscovery>>,
+) -> Result<FindRig> {
     let messenger = create_messenger_tcp().await?;
     let registry = BlockRegistry::new();
     let manager = Arc::new(
@@ -53,21 +67,77 @@ async fn find_rig(start: u32) -> Result<FindRig> {
         .collect();
     let held = manager.register_blocks(complete);
     let hashes = held.iter().map(ImmutableBlock::sequence_hash).collect();
-    let leader = InstanceLeader::builder()
-        .messenger(messenger)
-        .registry(registry)
-        .g2_manager(manager)
-        .build()?;
+    let leader = Arc::new(
+        InstanceLeader::builder()
+            .messenger(messenger)
+            .registry(registry)
+            .g2_manager(manager)
+            .build()?,
+    );
+    if let Some(remote) = remote.as_ref() {
+        assert!(leader.set_remote_discovery(Arc::clone(remote)));
+    }
     Ok(FindRig {
         engine: LocalConnectorEngine::new(
-            Arc::new(leader),
+            leader,
             NoopWorkerSink::new(),
             BLOCK_SIZE,
-            false,
+            remote.is_some(),
         ),
         hashes,
         held,
     })
+}
+
+struct MissingBundleDirectory {
+    queries: Arc<std::sync::Mutex<Vec<BundleDiscoveryQuery>>>,
+}
+
+struct FailingThenMissingBundleDirectory {
+    queries: Arc<std::sync::Mutex<Vec<BundleDiscoveryQuery>>>,
+    first: std::sync::Mutex<Option<RemoteBundleCandidate>>,
+}
+
+impl RemoteBlockDiscovery for FailingThenMissingBundleDirectory {
+    fn discover(
+        &self,
+        _hashes: Vec<SequenceHash>,
+    ) -> BoxFuture<'static, Result<Option<RemoteCandidates>>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn discover_bundle(
+        &self,
+        query: BundleDiscoveryQuery,
+    ) -> BoxFuture<'static, Result<BundleDiscoveryOutcome>> {
+        self.queries.lock().unwrap().push(query);
+        let outcome = self
+            .first
+            .lock()
+            .unwrap()
+            .take()
+            .map(Box::new)
+            .map(BundleDiscoveryOutcome::Hit)
+            .unwrap_or(BundleDiscoveryOutcome::Miss(BundleMissReason::NotFound));
+        Box::pin(async move { Ok(outcome) })
+    }
+}
+
+impl RemoteBlockDiscovery for MissingBundleDirectory {
+    fn discover(
+        &self,
+        _hashes: Vec<SequenceHash>,
+    ) -> BoxFuture<'static, Result<Option<RemoteCandidates>>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn discover_bundle(
+        &self,
+        query: BundleDiscoveryQuery,
+    ) -> BoxFuture<'static, Result<BundleDiscoveryOutcome>> {
+        self.queries.lock().unwrap().push(query);
+        Box::pin(async { Ok(BundleDiscoveryOutcome::Miss(BundleMissReason::NotFound)) })
+    }
 }
 
 fn manifest(revision: &str, resources: &[LogicalResourceId]) -> CacheManifest {
@@ -150,6 +220,104 @@ fn resolved(outcome: FindBlocksOutcome) -> (usize, Option<FindBlocksHandle>, boo
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_bundle_miss_is_async_then_releases_the_search() -> Result<()> {
+    let queries = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let directory = Arc::new(MissingBundleDirectory {
+        queries: Arc::clone(&queries),
+    });
+    let rig = find_rig_with_remote(4_300, Some(directory)).await?;
+    let identity = manifest("remote", &RESOURCES).identity();
+    let request = find_request("remote-miss", identity.clone(), rig.hashes.clone());
+
+    let FindBlocksOutcome::Searching { minted: Some(live) } =
+        rig.engine.clone().find_blocks(&request, None)?
+    else {
+        panic!("remote directory lookup must start asynchronously");
+    };
+    let outcome = loop {
+        tokio::task::yield_now().await;
+        let outcome = rig.engine.clone().find_blocks(&request, Some(&live))?;
+        if !matches!(outcome, FindBlocksOutcome::Searching { .. }) {
+            break outcome;
+        }
+    };
+    let (matched, minted, release) = resolved(outcome);
+    assert_eq!(matched, 0);
+    assert!(minted.is_none());
+    assert!(release);
+    let queries = queries.lock().unwrap();
+    assert_eq!(queries.len(), 1);
+    assert_eq!(queries[0].identity(), &identity);
+    assert!(!queries[0].candidates().is_empty());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_deep_remote_pull_retries_only_earlier_boundaries() -> Result<()> {
+    let identity = manifest("remote-retry", &RESOURCES).identity();
+    let hashes = create_token_sequence(3, BLOCK_SIZE, 4_325)
+        .blocks()
+        .iter()
+        .map(kvbm_logical::KvbmSequenceHashProvider::kvbm_sequence_hash)
+        .collect::<Vec<_>>();
+    let deep = BundleKey::new(&identity, hashes[2], 3 * BLOCK_SIZE as u64)?;
+    let advertisement = BundleAdvertisement::new(
+        identity.clone(),
+        deep,
+        1,
+        InstanceId::new_v4(),
+        unix_time_ms() + 30_000,
+        RESOURCES,
+    )?;
+    let candidate =
+        RemoteBundleCandidate::new(advertisement, uuid::Uuid::new_v4(), unix_time_ms() + 20_000)?;
+    let queries = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let directory = Arc::new(FailingThenMissingBundleDirectory {
+        queries: Arc::clone(&queries),
+        first: std::sync::Mutex::new(Some(candidate)),
+    });
+    let rig = find_rig_with_remote(4_325, Some(directory)).await?;
+    let request = find_request("remote-retry", identity, rig.hashes.clone());
+
+    let FindBlocksOutcome::Searching { minted: Some(live) } =
+        rig.engine.clone().find_blocks(&request, None)?
+    else {
+        panic!("remote directory lookup must start asynchronously");
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            tokio::task::yield_now().await;
+            if !matches!(
+                rig.engine.clone().find_blocks(&request, Some(&live))?,
+                FindBlocksOutcome::Searching { .. }
+            ) {
+                return Ok::<(), LeaderEngineError>(());
+            }
+        }
+    })
+    .await
+    .expect("remote retry should terminate")?;
+
+    let queries = queries.lock().unwrap();
+    assert_eq!(queries.len(), 2);
+    assert_eq!(queries[0].candidates()[0], deep);
+    assert!(
+        queries[1]
+            .candidates()
+            .iter()
+            .all(|key| key.boundary_tokens() < deep.boundary_tokens())
+    );
+    Ok(())
+}
+
+fn unix_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn changed_window_reconciles_to_one_new_common_boundary() -> Result<()> {
     let rig = find_rig(4_350).await?;
     let identity = manifest("v1", &RESOURCES).identity();
@@ -178,7 +346,8 @@ async fn changed_window_reconciles_to_one_new_common_boundary() -> Result<()> {
             .bundle_searches
             .get(&live.search_id().unwrap())
             .unwrap()
-            .lease
+            .lease()
+            .unwrap()
             .key(),
         &later
     );

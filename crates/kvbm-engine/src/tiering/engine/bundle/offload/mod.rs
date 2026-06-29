@@ -217,13 +217,23 @@ pub(in crate::tiering::engine) struct BundlePublication<P> {
     resources: BTreeMap<LogicalResourceId, P>,
 }
 
+pub(in crate::tiering::engine) struct BundleCommitMetadata {
+    pub(in crate::tiering::engine) identity: CacheIdentity,
+    pub(in crate::tiering::engine) key: BundleKey,
+    pub(in crate::tiering::engine) generation: u64,
+}
+
 impl<P> BundlePublication<P> {
     pub(in crate::tiering::engine) fn commit_into(
         self,
         index: &mut super::BundleIndex<P>,
-    ) -> Result<BundleKey, super::BundleIndexError> {
+    ) -> Result<BundleCommitMetadata, super::BundleIndexError> {
         index.commit(&self.identity, self.key, self.generation, self.resources)?;
-        Ok(self.key)
+        Ok(BundleCommitMetadata {
+            identity: self.identity,
+            key: self.key,
+            generation: self.generation,
+        })
     }
 }
 

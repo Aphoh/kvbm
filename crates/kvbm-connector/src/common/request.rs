@@ -34,13 +34,6 @@ impl RequestMetadata {
         }
     }
 
-    pub(crate) fn with_cache(cache: CacheScope) -> Self {
-        Self {
-            kv_transfer_params: None,
-            cache,
-        }
-    }
-
     pub fn set_cache(&mut self, cache: CacheScope) {
         self.cache = cache;
     }

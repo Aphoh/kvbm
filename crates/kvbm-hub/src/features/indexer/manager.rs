@@ -20,6 +20,7 @@ use futures::future::BoxFuture;
 use tokio::task::JoinHandle;
 use velo_ext::{InstanceId, PeerInfo};
 
+use super::bundle::BundleDirectory;
 use super::index::PositionalIndex;
 use super::ingest::run_ingest_loop;
 use super::protocol::{
@@ -33,10 +34,12 @@ use crate::protocol::{Feature, FeatureKey};
 /// configured. Single-host / loopback deployments work out of the box;
 /// multi-host deployments must set an explicit advertise host.
 const DEFAULT_ADVERTISE_HOST: &str = "127.0.0.1";
+const DEFAULT_BUNDLE_LEASE_TTL_MS: u64 = 30_000;
 
 /// Hub-side KV block index feature manager.
 pub struct IndexerManager {
     index: Arc<PositionalIndex>,
+    bundle_directory: Arc<BundleDirectory>,
     /// ZMQ bind spec (e.g. `tcp://0.0.0.0:0`).
     zmq_bind: String,
     /// Host advertised to publishers in `GET /config`.
@@ -78,6 +81,7 @@ impl IndexerManager {
         let index = Arc::new(PositionalIndex::new(max_seq_len, block_size)?);
         Ok(Self {
             index,
+            bundle_directory: Arc::new(BundleDirectory::new(DEFAULT_BUNDLE_LEASE_TTL_MS)),
             zmq_bind: zmq_bind.unwrap_or_else(|| "tcp://0.0.0.0:0".to_string()),
             advertise_host: advertise_host.unwrap_or_else(|| DEFAULT_ADVERTISE_HOST.to_string()),
             endpoint: OnceLock::new(),
@@ -183,13 +187,21 @@ impl FeatureManager for IndexerManager {
             // runs with a transport. Discovery-only hubs skip it — clients fall
             // back to the HTTP `POST /query` surface.
             if let Some(velo) = ctx.velo.as_ref() {
-                velo.messenger()
+                let messenger = velo.messenger();
+                messenger
                     .register_handler(super::handlers::create_query_handler(Arc::clone(
                         &self.index,
                     )))
                     .map_err(|e| {
                         FeatureError::Other(anyhow::anyhow!("indexer query handler: {e}"))
                     })?;
+                for handler in
+                    super::handlers::create_bundle_handlers(Arc::clone(&self.bundle_directory))
+                {
+                    messenger.register_handler(handler).map_err(|error| {
+                        FeatureError::Other(anyhow::anyhow!("bundle directory handler: {error}"))
+                    })?;
+                }
             }
             Ok(())
         })
@@ -220,6 +232,7 @@ impl FeatureManager for IndexerManager {
                     if let Ok(mut set) = self.instances.write() {
                         set.insert(instance_id);
                     }
+                    self.bundle_directory.register_owner(instance_id);
                     tracing::debug!(
                         instance = %instance_id,
                         max_seq_len = ?cfg.max_seq_len,
@@ -240,6 +253,7 @@ impl FeatureManager for IndexerManager {
         // Bridge the registry's velo InstanceId to the u128 the events wire
         // format carries (publishers stamp `velo_id.as_u128()`).
         self.index.remove_instance(instance_id.as_u128());
+        self.bundle_directory.remove_owner(instance_id);
         if let Ok(mut set) = self.instances.write() {
             set.remove(&instance_id);
         }

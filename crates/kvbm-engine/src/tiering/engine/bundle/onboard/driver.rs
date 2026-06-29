@@ -259,7 +259,10 @@ fn searched_bundle_plan(
         ));
     }
 
-    let boundary = usize::try_from(state.lease.key().boundary_tokens())
+    let lease = state
+        .lease()
+        .ok_or_else(|| invalid_bundle("bundle search has no committed lease"))?;
+    let boundary = usize::try_from(lease.key().boundary_tokens())
         .map_err(|_| invalid_bundle("bundle boundary does not fit usize"))?;
     let computed = state.computed_tokens;
     let mut resources = Vec::with_capacity(state.identity.resources().len());
@@ -273,8 +276,7 @@ fn searched_bundle_plan(
         let destination = destinations
             .remove(&resource)
             .ok_or_else(|| invalid_bundle(format!("missing destination for {resource:?}")))?;
-        let source = state
-            .lease
+        let source = lease
             .resources()
             .get(&resource)
             .ok_or_else(|| invalid_bundle(format!("search lease is missing {resource:?}")))?;
@@ -296,7 +298,7 @@ fn searched_bundle_plan(
     Ok((
         BundleOnboardPlan {
             identity: state.identity.clone(),
-            key: *state.lease.key(),
+            key: *lease.key(),
             resources,
         },
         source_leases,

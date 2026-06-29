@@ -4,7 +4,7 @@
 #![allow(clippy::disallowed_macros)]
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow};
 use futures::future::BoxFuture;
@@ -23,9 +23,13 @@ use kvbm_protocols::connector::{
 
 use super::super::local::LocalConnectorEngine;
 use super::super::offload::{OffloadSubmit, OffloadTransfer};
-use crate::leader::InstanceLeader;
+use crate::leader::{InstanceLeader, RemoteBlockDiscovery, RemoteCandidates};
 use crate::object::ObjectBlockOps;
 use crate::offload::{ExternalBlock, TransferStatus};
+use crate::remote::search::bundle::{
+    BundleAdvertisement, BundleDiscoveryOutcome, BundleDiscoveryQuery, BundleInvalidation,
+    BundleMissReason,
+};
 use crate::testing::{managers::TestManagerBuilder, messenger::create_messenger_tcp};
 use crate::tiering::policy::{ResourcePolicies, ResourcePolicy};
 use crate::worker::group::ParallelWorkers;
@@ -41,6 +45,44 @@ const RESOURCES: [LogicalResourceId; 3] = [
     LogicalResourceId(11),
     LogicalResourceId(12),
 ];
+
+#[derive(Default)]
+struct RecordingBundleDirectory {
+    advertisements: Mutex<Vec<BundleAdvertisement>>,
+    invalidations: Mutex<Vec<BundleInvalidation>>,
+}
+
+impl RemoteBlockDiscovery for RecordingBundleDirectory {
+    fn discover(
+        &self,
+        _hashes: Vec<SequenceHash>,
+    ) -> BoxFuture<'static, Result<Option<RemoteCandidates>>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn discover_bundle(
+        &self,
+        _query: BundleDiscoveryQuery,
+    ) -> BoxFuture<'static, Result<BundleDiscoveryOutcome>> {
+        Box::pin(async { Ok(BundleDiscoveryOutcome::Miss(BundleMissReason::NotFound)) })
+    }
+
+    fn advertise_bundle(
+        &self,
+        advertisement: BundleAdvertisement,
+    ) -> BoxFuture<'static, Result<()>> {
+        self.advertisements.lock().unwrap().push(advertisement);
+        Box::pin(async { Ok(()) })
+    }
+
+    fn invalidate_bundle(
+        &self,
+        invalidation: BundleInvalidation,
+    ) -> BoxFuture<'static, Result<()>> {
+        self.invalidations.lock().unwrap().push(invalidation);
+        Box::pin(async { Ok(()) })
+    }
+}
 
 struct RegisteringOffloadSubmit {
     managers: BTreeMap<LogicalResourceId, Arc<BlockManager<G2>>>,
@@ -220,8 +262,11 @@ impl ParallelWorkers for CompletedParallelWorkers {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bundle_offload_publishes_once_and_onboard_requires_its_exact_lease() -> Result<()> {
     let (leader, managers) = build_resource_test_leader().await?;
+    let leader = Arc::new(leader);
+    let directory = Arc::new(RecordingBundleDirectory::default());
+    assert!(leader.set_remote_discovery(Arc::clone(&directory) as Arc<dyn RemoteBlockDiscovery>));
     let engine = LocalConnectorEngine::with_offload_submit(
-        Arc::new(leader),
+        leader,
         kvbm_protocols::connector::NoopWorkerSink::new(),
         BLOCK_SIZE,
         true,
@@ -250,6 +295,7 @@ async fn bundle_offload_publishes_once_and_onboard_requires_its_exact_lease() ->
     )?;
 
     assert!(!offload.is_complete());
+    assert!(directory.advertisements.lock().unwrap().is_empty());
     assert!(
         engine
             .bundle_index
@@ -262,6 +308,12 @@ async fn bundle_offload_publishes_once_and_onboard_requires_its_exact_lease() ->
     kvbm_protocols::connector::WorkerEngineDriver::finish_forward_pass(engine.as_ref(), 0);
     wait_until(|| offload.is_complete()).await;
     assert_eq!(offload.outcome(), Some(SaveOutcome::Done));
+    wait_until(|| !directory.advertisements.lock().unwrap().is_empty()).await;
+    let advertisements = directory.advertisements.lock().unwrap();
+    assert_eq!(advertisements.len(), 1);
+    assert_eq!(advertisements[0].key(), key);
+    assert_eq!(advertisements[0].resources().collect::<Vec<_>>(), RESOURCES);
+    drop(advertisements);
     assert_eq!(
         engine
             .bundle_dependencies
@@ -289,7 +341,9 @@ async fn bundle_offload_publishes_once_and_onboard_requires_its_exact_lease() ->
         anyhow::bail!("committed bundle must resolve through manifest search")
     };
     assert_eq!(matched_tokens, BLOCK_SIZE);
-    engine.bundle_index.lock().unwrap().invalidate(key);
+    engine.invalidate_resource_blocks(RESOURCES[2], &[hash(1)]);
+    wait_until(|| !directory.invalidations.lock().unwrap().is_empty()).await;
+    assert_eq!(directory.invalidations.lock().unwrap()[0].key, key);
 
     let duplicate = engine.clone().onboard_bundle(
         &search,

@@ -70,8 +70,10 @@ pub use features::disagg::{
     ConditionalDisaggClient, ConditionalDisaggInstancesResponse, ConditionalDisaggManager,
 };
 pub use features::indexer::{
-    FindBlocksHit, IndexerConfigResponse, IndexerLookupClient, IndexerManager, InstancesResponse,
-    PositionalIndex, QueryRequest, QueryResponse,
+    BundleAdvertisementRecord, BundleInvalidateRequest, BundlePublishRequest, BundleQueryHit,
+    BundleQueryMissReason, BundleQueryOutcome, BundleQueryRequest, FindBlocksHit,
+    IndexerConfigResponse, IndexerLookupClient, IndexerManager, InstancesResponse, PositionalIndex,
+    QueryRequest, QueryResponse,
 };
 #[cfg(feature = "kvbmctl")]
 pub use features::p2p::cli::{p2p_command, run_p2p};

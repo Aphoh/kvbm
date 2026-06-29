@@ -14,6 +14,7 @@
 //! [`FeatureManager::route_prefix`](crate::features::FeatureManager::route_prefix)
 //! — it never piggybacks on routes owned by another manager.
 
+pub mod bundle;
 /// `kvbmctl` client CLI for this feature. Gated behind the `kvbmctl` feature.
 #[cfg(feature = "kvbmctl")]
 pub mod cli;
@@ -26,10 +27,13 @@ pub mod protocol;
 pub mod zmq;
 
 pub use client::IndexerLookupClient;
-pub use handlers::create_query_handler;
+pub use handlers::{create_bundle_handlers, create_query_handler};
 pub use index::PositionalIndex;
 pub use manager::IndexerManager;
 pub use protocol::{
-    ByPositionResponse, FindBlocksHit, IndexEntry, IndexerConfigResponse, InstancesResponse,
-    QUERY_HANDLER, QueryRequest, QueryResponse, ROUTE_PREFIX,
+    BUNDLE_INVALIDATE_HANDLER, BUNDLE_PUBLISH_HANDLER, BUNDLE_QUERY_HANDLER,
+    BundleAdvertisementRecord, BundleInvalidateRequest, BundlePublishRequest, BundleQueryHit,
+    BundleQueryMissReason, BundleQueryOutcome, BundleQueryRequest, ByPositionResponse,
+    FindBlocksHit, IndexEntry, IndexerConfigResponse, InstancesResponse, QUERY_HANDLER,
+    QueryRequest, QueryResponse, ROUTE_PREFIX,
 };

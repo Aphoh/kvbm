@@ -82,6 +82,12 @@ impl<'a> BundleFindQuery<'a> {
             .checked_sub(self.computed_tokens)
     }
 
+    pub(in crate::tiering::engine) fn candidate_keys(&self) -> Vec<BundleKey> {
+        self.candidates()
+            .filter_map(|(hash, tokens)| BundleKey::new(self.identity, hash, tokens).ok())
+            .collect()
+    }
+
     fn candidates(&self) -> impl Iterator<Item = (SequenceHash, u64)> + '_ {
         let block_tokens = self.base_block_tokens.get();
         let eligible_blocks = self.eligible_blocks.min(self.sequence_hashes.len());

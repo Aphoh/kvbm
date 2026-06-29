@@ -406,6 +406,7 @@ impl LocalConnectorEngine {
             }
         };
 
+        let mut advertisement = None;
         let terminal = match transition {
             Ok(OffloadTransition::Pending | OffloadTransition::Settled(_)) => None,
             Ok(OffloadTransition::Abort(abort)) => {
@@ -427,13 +428,14 @@ impl LocalConnectorEngine {
                             .lock()
                             .expect("bundle-dependencies mutex poisoned");
                         let published = match publication.commit_into(&mut bundles) {
-                            Ok(key) => {
-                                let tracked = dependencies.track(key, lineages);
+                            Ok(metadata) => {
+                                let tracked = dependencies.track(metadata.key, lineages);
                                 if let Err(error) = tracked {
-                                    bundles.invalidate(key);
+                                    bundles.invalidate(metadata.key);
                                     tracing::error!(%error, "bundle dependency publication failed");
                                     false
                                 } else {
+                                    advertisement = Some(metadata);
                                     true
                                 }
                             }
@@ -462,6 +464,9 @@ impl LocalConnectorEngine {
                 }))
             }
         };
+        if let Some(metadata) = advertisement {
+            self.advertise_committed_bundle(metadata);
+        }
         if let Some(outcome) = runtime.finish_child(terminal) {
             self.finish_save_action(action_id, request_id, outcome);
         }

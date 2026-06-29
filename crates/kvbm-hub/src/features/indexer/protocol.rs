@@ -9,7 +9,9 @@
 //! Nothing here lives in the central [`crate::protocol::paths`]; the feature
 //! owns its whole namespace.
 
+use kvbm_common::LogicalResourceId;
 use kvbm_logical::SequenceHash;
+use kvbm_protocols::cache_manifest::{BundleKey, CacheManifestId};
 use serde::{Deserialize, Serialize};
 use velo_ext::InstanceId;
 
@@ -23,6 +25,9 @@ pub const ROUTE_PREFIX: &str = "indexer";
 /// [`IndexerLookupClient`](super::client::IndexerLookupClient) calls it. Follows
 /// the `kvbm_hub_*` convention shared with the heartbeat handler.
 pub const QUERY_HANDLER: &str = "kvbm_hub_indexer_query";
+pub const BUNDLE_PUBLISH_HANDLER: &str = "kvbm_hub_bundle_publish";
+pub const BUNDLE_INVALIDATE_HANDLER: &str = "kvbm_hub_bundle_invalidate";
+pub const BUNDLE_QUERY_HANDLER: &str = "kvbm_hub_bundle_query";
 
 /// Relative route paths (mounted under `/v1/features/indexer`).
 pub mod paths {
@@ -122,4 +127,59 @@ pub struct FindBlocksHit {
     pub matched: SequenceHash,
     /// Instances currently holding `matched`. Always non-empty.
     pub candidates: Vec<InstanceId>,
+}
+
+/// One complete-bundle owner record stored by the hub directory.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BundleAdvertisementRecord {
+    pub key: BundleKey,
+    pub generation: u64,
+    pub owner: InstanceId,
+    pub resources: Vec<LogicalResourceId>,
+    pub expires_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BundlePublishRequest {
+    pub advertisement: BundleAdvertisementRecord,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BundleInvalidateRequest {
+    pub key: BundleKey,
+    pub generation: u64,
+    pub owner: InstanceId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BundleQueryRequest {
+    pub manifest: CacheManifestId,
+    pub required_resources: Vec<LogicalResourceId>,
+    pub candidates: Vec<BundleKey>,
+    pub now_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BundleQueryHit {
+    pub advertisement: BundleAdvertisementRecord,
+    pub lease_id: uuid::Uuid,
+    pub lease_expires_at_unix_ms: u64,
+}
+
+/// Why no complete bundle could satisfy a directory query.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BundleQueryMissReason {
+    NotFound,
+    Incompatible,
+    Incomplete,
+    Expired,
+}
+
+/// Complete-bundle directory response, preserving actionable miss telemetry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BundleQueryOutcome {
+    Hit(BundleQueryHit),
+    Miss(BundleQueryMissReason),
 }

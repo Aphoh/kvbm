@@ -52,7 +52,7 @@ use anyhow::Result;
 use dashmap::DashMap;
 use kvbm_common::LogicalResourceId;
 
-use kvbm_protocols::cache_manifest::CacheIdentity;
+use kvbm_protocols::cache_manifest::{BundleKey, CacheIdentity};
 use kvbm_protocols::connector::{
     AcceptId, ActionFailure, ActionId, ActionStatus, BundleOffloadPlan, BundleOnboardPlan,
     EngineWorkerSink, EvictionFence, EvictionOutcome, FenceToken, FindBlocksHandle,
@@ -105,9 +105,26 @@ pub(super) struct SearchState {
 pub(super) struct BundleSearchState {
     pub(super) request_id: RequestId,
     pub(super) identity: CacheIdentity,
-    pub(super) lease: BundleLease<Vec<ImmutableBlock<G2>>>,
+    pub(super) source: BundleSearchSource,
     pub(super) computed_tokens: usize,
     pub(super) matched_tokens: usize,
+}
+
+/// Exactly one source owns a live bundle search: a local lease or a pending
+/// remote lookup. Making the state exclusive prevents invalid `None`/`None`
+/// and `Some`/`Some` combinations.
+pub(super) enum BundleSearchSource {
+    Local(BundleLease<Vec<ImmutableBlock<G2>>>),
+    Remote(tokio::sync::oneshot::Receiver<Result<Option<BundleKey>, String>>),
+}
+
+impl BundleSearchState {
+    pub(super) const fn lease(&self) -> Option<&BundleLease<Vec<ImmutableBlock<G2>>>> {
+        match &self.source {
+            BundleSearchSource::Local(lease) => Some(lease),
+            BundleSearchSource::Remote(_) => None,
+        }
+    }
 }
 
 /// The local, in-process [`LeaderEngine`].
@@ -147,7 +164,7 @@ pub(crate) struct LocalConnectorEngine {
     /// Self-`Weak` so `finish_forward_pass(&self)` can mint an `Arc<Self>` to
     /// move into the per-offload completion driver (the `WorkerEngineDriver`
     /// receiver is `&self`, unlike onboard's `self: Arc<Self>`).
-    weak_self: Weak<LocalConnectorEngine>,
+    pub(super) weak_self: Weak<LocalConnectorEngine>,
     /// Conditional-disaggregation runtime, present iff CD is configured (built
     /// from [`super::DisaggOps`] at construction). The search path interposes
     /// CD when this is `Some`; `None` is a plain local-tiering engine.
@@ -454,37 +471,6 @@ impl BlockEvictionObserver for BundleEvictionObserver {
     fn on_blocks_evicted(&self, hashes: &[SequenceHash]) {
         if let Some(engine) = self.engine.upgrade() {
             engine.invalidate_resource_blocks(self.resource, hashes);
-        }
-    }
-}
-
-impl LocalConnectorEngine {
-    fn invalidate_resource_blocks(&self, resource: LogicalResourceId, hashes: &[SequenceHash]) {
-        let mut invalidated = Vec::new();
-        {
-            let mut dependencies = self
-                .bundle_dependencies
-                .lock()
-                .expect("bundle-dependencies mutex poisoned");
-            for &hash in hashes {
-                dependencies.invalidate(resource, hash, |event| invalidated.push(event));
-            }
-        }
-        if invalidated.is_empty() {
-            return;
-        }
-        let mut bundles = self
-            .bundle_index
-            .lock()
-            .expect("bundle-index mutex poisoned");
-        for event in invalidated {
-            bundles.invalidate(event.key());
-            tracing::debug!(
-                resource = ?event.resource(),
-                hash = ?event.hash(),
-                boundary_tokens = event.key().boundary_tokens(),
-                "resource eviction invalidated a dependent bundle"
-            );
         }
     }
 }

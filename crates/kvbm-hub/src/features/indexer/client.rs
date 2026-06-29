@@ -17,7 +17,11 @@ use kvbm_logical::SequenceHash;
 use velo::Messenger;
 use velo_ext::InstanceId;
 
-use super::protocol::{FindBlocksHit, QUERY_HANDLER, QueryRequest};
+use super::protocol::{
+    BUNDLE_INVALIDATE_HANDLER, BUNDLE_PUBLISH_HANDLER, BUNDLE_QUERY_HANDLER,
+    BundleInvalidateRequest, BundlePublishRequest, BundleQueryOutcome, BundleQueryRequest,
+    FindBlocksHit, QUERY_HANDLER, QueryRequest,
+};
 
 /// Velo-plane lookup client for the hub's KV block index.
 pub struct IndexerLookupClient {
@@ -66,5 +70,33 @@ impl IndexerLookupClient {
             .send()
             .await?;
         Ok(hit)
+    }
+
+    pub async fn publish_bundle(&self, request: BundlePublishRequest) -> Result<()> {
+        self.messenger
+            .typed_unary::<()>(BUNDLE_PUBLISH_HANDLER)?
+            .payload(&request)?
+            .instance(self.hub_velo_id)
+            .send()
+            .await?;
+        Ok(())
+    }
+
+    pub async fn invalidate_bundle(&self, request: BundleInvalidateRequest) -> Result<bool> {
+        self.messenger
+            .typed_unary::<bool>(BUNDLE_INVALIDATE_HANDLER)?
+            .payload(&request)?
+            .instance(self.hub_velo_id)
+            .send()
+            .await
+    }
+
+    pub async fn find_bundle(&self, request: BundleQueryRequest) -> Result<BundleQueryOutcome> {
+        self.messenger
+            .typed_unary::<BundleQueryOutcome>(BUNDLE_QUERY_HANDLER)?
+            .payload(&request)?
+            .instance(self.hub_velo_id)
+            .send()
+            .await
     }
 }

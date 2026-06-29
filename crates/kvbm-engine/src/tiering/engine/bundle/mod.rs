@@ -12,13 +12,14 @@ mod capsule;
 mod find;
 mod offload;
 mod onboard;
+mod remote;
 
 #[cfg(test)]
 mod integration_tests;
 #[cfg(test)]
 mod test_support;
 
-pub(super) use offload::{BundleOffload, OffloadTransition};
+pub(super) use offload::{BundleCommitMetadata, BundleOffload, OffloadTransition};
 
 use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -112,7 +113,13 @@ impl<P> BundleIndex<P> {
 
     /// Remove one committed bundle and release all resource pins atomically.
     pub(super) fn invalidate(&mut self, key: BundleKey) -> bool {
-        self.committed.remove(&key).is_some()
+        self.remove(key).is_some()
+    }
+
+    /// Remove a committed bundle and return the exact generation advertised
+    /// for owner-scoped remote invalidation.
+    pub(super) fn remove(&mut self, key: BundleKey) -> Option<u64> {
+        self.committed.remove(&key).map(|bundle| bundle.generation)
     }
 }
 
