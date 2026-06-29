@@ -268,6 +268,7 @@ mod tests {
             num_provided_tokens: 0,
             request: KvHashingRequestEnvelope::default(),
             expected_hash_digest: None,
+            bundle: None,
         }
     }
 

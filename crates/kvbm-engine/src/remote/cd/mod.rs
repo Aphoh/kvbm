@@ -13,6 +13,7 @@
 
 pub(crate) mod budget;
 pub(crate) mod commit;
+pub(crate) mod cost;
 pub(crate) mod decode;
 pub(crate) mod output;
 pub(crate) mod policy;
@@ -50,6 +51,15 @@ pub struct DisaggConfig {
     /// On inflight-budget exhaustion: `true` downgrades the Remote decision to a
     /// local prefill; `false` rejects it (no external match onboarded).
     pub(crate) local_fallback_on_overload: bool,
+    /// Static transfer/compute cost guard. A missing maximum keeps the guard
+    /// inert for backward compatibility.
+    pub(crate) cost: cost::CostModel,
+    /// Estimated bytes occupied by all logical resources for one token.
+    pub(crate) bundle_bytes_per_token: u64,
+    /// Bound for queue acceptance plus target-bundle publication.
+    pub(crate) bundle_prefill_timeout: Duration,
+    /// Directory poll interval while awaiting the target bundle.
+    pub(crate) bundle_prefill_poll: Duration,
     /// Poll interval of the prefill release's deferred-finalize drain — how
     /// often the drain task re-checks the output observer's `has_pending`.
     pub(crate) output_drain_poll: Duration,
@@ -65,6 +75,10 @@ impl Default for DisaggConfig {
             selection: SelectionPolicy::Never,
             max_inflight_remote_prefill_tokens: usize::MAX,
             local_fallback_on_overload: true,
+            cost: cost::CostModel::default(),
+            bundle_bytes_per_token: 0,
+            bundle_prefill_timeout: Duration::from_secs(10),
+            bundle_prefill_poll: Duration::from_millis(10),
             output_drain_poll: Duration::from_millis(2),
             output_drain_watchdog: Duration::from_secs(10),
         }
@@ -102,6 +116,14 @@ impl DisaggConfig {
             selection,
             max_inflight_remote_prefill_tokens: cfg.max_inflight_remote_prefill_tokens,
             local_fallback_on_overload: cfg.cd_local_fallback_on_overload,
+            cost: cost::CostModel::new(
+                Duration::from_millis(cfg.remote_prefill_fixed_cost_ms),
+                cfg.remote_prefill_bytes_per_second,
+                cfg.remote_prefill_tokens_per_second,
+                cfg.max_remote_prefill_cost_ms.map(Duration::from_millis),
+            ),
+            bundle_bytes_per_token: cfg.bundle_bytes_per_token,
+            bundle_prefill_timeout: Duration::from_millis(cfg.bundle_prefill_timeout_ms),
             ..Self::default()
         }
     }

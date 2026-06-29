@@ -16,6 +16,7 @@ use kvbm_protocols::connector::{
     ActionId, CacheScope, FindBlocksHandle, FindBlocksOutcome, FindBlocksRequest, LeaderEngine,
     LeaderEngineError, NoopWorkerSink,
 };
+use kvbm_protocols::disagg::{BundlePrefillContext, RemotePrefillParams, TransferParams};
 
 use crate::G2;
 use crate::InstanceId;
@@ -180,6 +181,29 @@ fn find_request(
     }
 }
 
+fn with_bundle_context(
+    mut request: FindBlocksRequest,
+    context_identity: &CacheIdentity,
+    target: BundleKey,
+) -> FindBlocksRequest {
+    let mut params = RemotePrefillParams::new(uuid::Uuid::new_v4(), InstanceId::new_v4());
+    params.bundle = Some(
+        BundlePrefillContext::new(
+            context_identity.manifest(),
+            context_identity
+                .resources()
+                .iter()
+                .map(ResourceRequirement::resource),
+            None,
+            target,
+            1,
+        )
+        .unwrap(),
+    );
+    request.transfer_params = Some(TransferParams::remote_prefill(params));
+    request
+}
+
 fn commit(rig: &FindRig, identity: &CacheIdentity) -> BundleKey {
     commit_at(rig, identity, 2)
 }
@@ -217,6 +241,87 @@ fn resolved(outcome: FindBlocksOutcome) -> (usize, Option<FindBlocksHandle>, boo
         } => (matched_tokens, minted, release_parked),
         other => panic!("expected resolved bundle find, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn bundle_prefill_rejects_a_context_for_another_manifest() -> Result<()> {
+    let rig = find_rig(4_250).await?;
+    let identity = manifest("request", &RESOURCES).identity();
+    let foreign = manifest("foreign", &RESOURCES).identity();
+    let target = BundleKey::new(&foreign, rig.hashes[1], (2 * BLOCK_SIZE) as u64)?;
+    let request = with_bundle_context(
+        find_request("manifest-mismatch", identity, rig.hashes.clone()),
+        &foreign,
+        target,
+    );
+
+    assert!(matches!(
+        rig.engine.clone().find_blocks(&request, None),
+        Err(LeaderEngineError::InvalidPrefillRequest { .. })
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn bundle_prefill_rejects_a_target_outside_the_request_chain() -> Result<()> {
+    let rig = find_rig(4_275).await?;
+    let identity = manifest("wrong-target", &RESOURCES).identity();
+    let target = BundleKey::new(
+        &identity,
+        SequenceHash::new(99, None, 99),
+        (2 * BLOCK_SIZE) as u64,
+    )?;
+    let request = with_bundle_context(
+        find_request("wrong-target", identity.clone(), rig.hashes.clone()),
+        &identity,
+        target,
+    );
+
+    assert!(matches!(
+        rig.engine.clone().find_blocks(&request, None),
+        Err(LeaderEngineError::InvalidPrefillRequest { .. })
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn valid_bundle_prefill_context_uses_the_normal_bundle_find_path() -> Result<()> {
+    let rig = find_rig(4_300).await?;
+    let identity = manifest("valid-prefill", &RESOURCES).identity();
+    let target = commit(&rig, &identity);
+    let request = with_bundle_context(
+        find_request("valid-prefill", identity.clone(), rig.hashes.clone()),
+        &identity,
+        target,
+    );
+
+    let (matched, minted, _) = resolved(rig.engine.clone().find_blocks(&request, None)?);
+    assert_eq!(matched, 2 * BLOCK_SIZE);
+    assert!(minted.is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn bundle_prefill_rejects_an_incomplete_resource_set() -> Result<()> {
+    let rig = find_rig(4_325).await?;
+    let identity = manifest("incomplete-resources", &RESOURCES).identity();
+    let target = BundleKey::new(&identity, rig.hashes[1], (2 * BLOCK_SIZE) as u64)?;
+    let mut request = find_request("incomplete-resources", identity.clone(), rig.hashes.clone());
+    let mut params = RemotePrefillParams::new(uuid::Uuid::new_v4(), InstanceId::new_v4());
+    params.bundle = Some(BundlePrefillContext::new(
+        identity.manifest(),
+        [RESOURCES[0]],
+        None,
+        target,
+        1,
+    )?);
+    request.transfer_params = Some(TransferParams::remote_prefill(params));
+
+    assert!(matches!(
+        rig.engine.clone().find_blocks(&request, None),
+        Err(LeaderEngineError::InvalidPrefillRequest { .. })
+    ));
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

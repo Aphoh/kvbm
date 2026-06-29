@@ -7,8 +7,11 @@
 //! is shared by the connector, hub, and future admission code without making
 //! any one of those crates depend on another.
 
+use std::collections::BTreeSet;
+
+use crate::cache_manifest::{BundleKey, CacheManifestId};
 use dynamo_tokens::{TokenBlockMmInfo, compute_hash_v2};
-use kvbm_common::SequenceHash;
+use kvbm_common::{LogicalResourceId, SequenceHash};
 use serde::{Deserialize, Serialize};
 use velo_ext::InstanceId;
 
@@ -116,6 +119,82 @@ pub struct SessionEndpoint {
     pub payload: serde_json::Value,
 }
 
+/// Manifest-scoped input and target carried by a bundle prefill dispatch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BundlePrefillContext {
+    manifest: CacheManifestId,
+    resources: BTreeSet<LogicalResourceId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    initial_bundle: Option<BundleKey>,
+    target_bundle: BundleKey,
+    estimated_bundle_bytes: u64,
+}
+
+impl BundlePrefillContext {
+    pub fn new<I>(
+        manifest: CacheManifestId,
+        resources: I,
+        initial_bundle: Option<BundleKey>,
+        target_bundle: BundleKey,
+        estimated_bundle_bytes: u64,
+    ) -> Result<Self, BundlePrefillContextError>
+    where
+        I: IntoIterator<Item = LogicalResourceId>,
+    {
+        if target_bundle.manifest() != manifest
+            || initial_bundle.is_some_and(|key| key.manifest() != manifest)
+        {
+            return Err(BundlePrefillContextError::ManifestMismatch);
+        }
+        if initial_bundle
+            .is_some_and(|key| key.boundary_tokens() >= target_bundle.boundary_tokens())
+        {
+            return Err(BundlePrefillContextError::InvalidBoundaryOrder);
+        }
+        let resources = resources.into_iter().collect::<BTreeSet<_>>();
+        if resources.is_empty() {
+            return Err(BundlePrefillContextError::EmptyResources);
+        }
+        Ok(Self {
+            manifest,
+            resources,
+            initial_bundle,
+            target_bundle,
+            estimated_bundle_bytes,
+        })
+    }
+
+    pub const fn manifest(&self) -> CacheManifestId {
+        self.manifest
+    }
+
+    pub fn resources(&self) -> impl Iterator<Item = LogicalResourceId> + '_ {
+        self.resources.iter().copied()
+    }
+
+    pub const fn initial_bundle(&self) -> Option<BundleKey> {
+        self.initial_bundle
+    }
+
+    pub const fn target_bundle(&self) -> BundleKey {
+        self.target_bundle
+    }
+
+    pub const fn estimated_bundle_bytes(&self) -> u64 {
+        self.estimated_bundle_bytes
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum BundlePrefillContextError {
+    #[error("bundle prefill keys do not match the declared manifest")]
+    ManifestMismatch,
+    #[error("bundle prefill target must be later than its initial bundle")]
+    InvalidBoundaryOrder,
+    #[error("bundle prefill context requires at least one logical resource")]
+    EmptyResources,
+}
+
 /// Typed transfer parameters carried in request metadata.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransferParams {
@@ -203,6 +282,12 @@ pub struct RemotePrefillParams {
     /// skips the assertion (legacy tests and paths that don't compute it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_hash_digest: Option<u64>,
+    /// Complete-bundle compute context. When present, the prefill connector
+    /// uses normal manifest-scoped search/onboard and publishes the target
+    /// through the atomic bundle lifecycle instead of the legacy unitary
+    /// session pipeline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle: Option<BundlePrefillContext>,
 }
 
 impl RemotePrefillParams {
@@ -215,6 +300,7 @@ impl RemotePrefillParams {
             num_provided_tokens: 0,
             request: KvHashingRequestEnvelope::default(),
             expected_hash_digest: None,
+            bundle: None,
         }
     }
 }
@@ -267,6 +353,8 @@ pub struct RemotePrefillRequest {
     pub request: KvHashingRequestEnvelope,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_hash_digest: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle: Option<BundlePrefillContext>,
 }
 
 impl RemotePrefillRequest {
@@ -279,6 +367,7 @@ impl RemotePrefillRequest {
             num_provided_tokens: self.num_provided_tokens,
             request: self.request.clone(),
             expected_hash_digest: self.expected_hash_digest,
+            bundle: self.bundle.clone(),
         }
     }
 
@@ -303,9 +392,32 @@ pub enum ControlSignal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache_manifest::{BundleKey, CacheManifestId};
 
     fn instance_id() -> InstanceId {
         uuid::Uuid::new_v4().into()
+    }
+
+    #[test]
+    fn bundle_prefill_context_round_trips_with_manifest_scoped_keys() {
+        let manifest = CacheManifestId::from_bytes([7; 32]);
+        let initial = BundleKey::from_parts(manifest, fake_plh(1, 1), 8).unwrap();
+        let target = BundleKey::from_parts(manifest, fake_plh(2, 3), 16).unwrap();
+        let resources = [
+            kvbm_common::LogicalResourceId(3),
+            kvbm_common::LogicalResourceId(5),
+        ];
+        let context =
+            BundlePrefillContext::new(manifest, resources, Some(initial), target, 65_536).unwrap();
+
+        let encoded = serde_json::to_vec(&context).unwrap();
+        let decoded: BundlePrefillContext = serde_json::from_slice(&encoded).unwrap();
+
+        assert_eq!(decoded, context);
+        assert_eq!(decoded.initial_bundle(), Some(initial));
+        assert_eq!(decoded.target_bundle(), target);
+        assert_eq!(decoded.resources().collect::<Vec<_>>(), resources);
+        assert_eq!(decoded.estimated_bundle_bytes(), 65_536);
     }
 
     #[test]
@@ -323,6 +435,7 @@ mod tests {
             num_provided_tokens: 48,
             request: KvHashingRequestEnvelope::default(),
             expected_hash_digest: Some(0xDEADBEEF),
+            bundle: None,
         };
 
         let params = request
@@ -348,6 +461,7 @@ mod tests {
             num_provided_tokens: 48,
             request: KvHashingRequestEnvelope::default(),
             expected_hash_digest: Some(0x1234_5678_9ABC_DEF0),
+            bundle: None,
         });
 
         let encoded = serde_json::to_vec(&params).unwrap();

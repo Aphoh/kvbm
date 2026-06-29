@@ -75,6 +75,32 @@ pub struct DisaggConfig {
     /// more Remote.
     #[serde(default = "default_cd_local_fallback_on_overload")]
     pub cd_local_fallback_on_overload: bool,
+
+    /// Estimated bytes occupied by all manifest resources per cached token.
+    /// `0` disables byte-cost contribution while keeping token thresholds.
+    #[serde(default)]
+    pub bundle_bytes_per_token: u64,
+
+    /// Static queue/network setup cost included in the remote estimate.
+    #[serde(default)]
+    pub remote_prefill_fixed_cost_ms: u64,
+
+    /// Effective all-resource transfer bandwidth. `0` omits transfer time.
+    #[serde(default)]
+    pub remote_prefill_bytes_per_second: u64,
+
+    /// Effective remote compute throughput. `0` omits compute time.
+    #[serde(default)]
+    pub remote_prefill_tokens_per_second: u64,
+
+    /// Optional TTFT guard for the static remote estimate. Absent preserves
+    /// the existing token-only decision.
+    #[serde(default)]
+    pub max_remote_prefill_cost_ms: Option<u64>,
+
+    /// Bound for queue acceptance and complete target-bundle publication.
+    #[serde(default = "default_bundle_prefill_timeout_ms")]
+    pub bundle_prefill_timeout_ms: u64,
     // NOTE: the CD prefill-overload circuit breaker is configured ENTIRELY on
     // the hub (the `kvbm_hub --cd-breaker` CLI flags), NOT on the connector's
     // DisaggConfig. The breaker lives in the hub's prefill-router (it senses the
@@ -94,6 +120,10 @@ fn default_cd_local_fallback_on_overload() -> bool {
     true
 }
 
+fn default_bundle_prefill_timeout_ms() -> u64 {
+    10_000
+}
+
 impl Default for DisaggConfig {
     /// Every field at its `serde` default. `role` defaults to
     /// [`DisaggregationRole::Decode`] (the threshold / overflow knobs are
@@ -106,6 +136,12 @@ impl Default for DisaggConfig {
             max_inflight_remote_prefill_tokens: default_max_inflight_remote_prefill_tokens(),
             min_remote_prefill_tokens: 0,
             cd_local_fallback_on_overload: default_cd_local_fallback_on_overload(),
+            bundle_bytes_per_token: 0,
+            remote_prefill_fixed_cost_ms: 0,
+            remote_prefill_bytes_per_second: 0,
+            remote_prefill_tokens_per_second: 0,
+            max_remote_prefill_cost_ms: None,
+            bundle_prefill_timeout_ms: default_bundle_prefill_timeout_ms(),
         }
     }
 }

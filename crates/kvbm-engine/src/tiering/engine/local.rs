@@ -202,13 +202,13 @@ pub(crate) struct LocalConnectorEngine {
 /// passes an empty `pending_hashes`, and the load terminal always observes a
 /// drained ledger.
 pub(super) struct CdRuntime {
-    cfg: DisaggConfig,
-    tier: Arc<TierCell>,
+    pub(in crate::tiering::engine) cfg: DisaggConfig,
+    pub(in crate::tiering::engine) tier: Arc<TierCell>,
     /// The inflight remote-prefill token budget — the waiting consumer of
     /// `cfg.max_inflight_remote_prefill_tokens`, built once at construction.
-    budget: InflightBudget,
+    pub(in crate::tiering::engine) budget: Arc<InflightBudget>,
     pub(super) sessions: Arc<dyn SessionFactory>,
-    plane: Arc<dyn PrefillPlane>,
+    pub(in crate::tiering::engine) plane: Arc<dyn PrefillPlane>,
     requests: CdRequests,
     /// Resolves + registers the decode peer before the prefill pipeline
     /// attaches (velo's streaming-transport registry is lazily populated).
@@ -235,7 +235,7 @@ impl CdRuntime {
         peer_resolver: Option<Arc<dyn PeerResolver>>,
     ) -> Self {
         Self {
-            budget: InflightBudget::new(cfg.max_inflight_remote_prefill_tokens),
+            budget: Arc::new(InflightBudget::new(cfg.max_inflight_remote_prefill_tokens)),
             cfg,
             tier,
             sessions,
@@ -1471,6 +1471,7 @@ impl LocalConnectorEngine {
             num_computed_tokens: num_computed,
             matched_tokens: local_hit * bs,
             block_size: bs,
+            bundle_bytes: 0,
         };
 
         match decode::plan(&cd.cfg, &cd.tier, &cd.budget, &inputs) {
@@ -1618,6 +1619,7 @@ impl LocalConnectorEngine {
             decode_endpoint: session.endpoint(),
             num_provided_tokens: num_computed + local_hit * bs,
             num_window_tokens: num_computed + fbet,
+            bundle: None,
         };
         let plane = cd.plane.clone();
         let dispatch_state = Arc::clone(&state);
@@ -1880,6 +1882,7 @@ fn local_reason_label(reason: LocalReason) -> &'static str {
         LocalReason::BreakerHot => "remote_downgraded_breaker_hot",
         LocalReason::ZeroBlock => "remote_downgraded_zero_block",
         LocalReason::OverloadFallback => "remote_downgraded_overload",
+        LocalReason::CostGuard => "remote_downgraded_cost_guard",
     }
 }
 

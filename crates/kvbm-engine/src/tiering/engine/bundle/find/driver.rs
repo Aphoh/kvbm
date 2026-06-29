@@ -17,6 +17,7 @@ use crate::remote::search::bundle::{
     BundleDiscoveryOutcome, BundleDiscoveryQuery, BundlePullOutcome, BundlePullTarget,
     pull_remote_bundle, unix_time_ms,
 };
+use crate::tiering::engine::bundle::BundlePrefillRequest;
 use crate::tiering::engine::find::DerivedWindow;
 use crate::tiering::engine::local::{BundleSearchSource, BundleSearchState, LocalConnectorEngine};
 
@@ -102,9 +103,14 @@ impl LocalConnectorEngine {
             },
         );
         let target: Arc<dyn BundlePullTarget> = Arc::clone(self) as Arc<dyn BundlePullTarget>;
+        let target_key = candidates[0];
         let sequence_hashes = Arc::clone(&req.sequence_hashes);
         let block_size = self.block_size;
         let identity = identity.clone();
+        let engine = self.weak_self.clone();
+        let request_id = req.request_id.clone();
+        let num_computed_tokens = req.num_computed_tokens;
+        let total_tokens = req.total_tokens;
         let metrics = self
             .leader
             .observability()
@@ -169,6 +175,23 @@ impl LocalConnectorEngine {
                     }
                 }
                 remaining.retain(|key| key.boundary_tokens() < attempted.boundary_tokens());
+            }
+            if matches!(result, Ok(None))
+                && let Some(engine) = engine.upgrade()
+            {
+                result = engine
+                    .run_bundle_prefill(
+                        Arc::clone(&directory),
+                        BundlePrefillRequest::new(
+                            request_id,
+                            identity,
+                            target_key,
+                            sequence_hashes,
+                            num_computed_tokens,
+                            total_tokens,
+                        ),
+                    )
+                    .await;
             }
             let _ = tx.send(result.map_err(|error| error.to_string()));
         });

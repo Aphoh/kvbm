@@ -790,6 +790,7 @@ mod tests {
             num_provided_tokens: 48,
             request: KvHashingRequestEnvelope::default(),
             expected_hash_digest: Some(0xABCD_EF01_2345_6789),
+            bundle: None,
         };
         let json = serde_json::to_string(&orig).unwrap();
         let back: PrefillRequest = serde_json::from_str(&json).unwrap();

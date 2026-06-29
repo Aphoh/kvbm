@@ -9,6 +9,7 @@ mod barrier;
     reason = "phase K1 defines capsule copy descriptors before the vLLM integration wires them in K4"
 )]
 mod capsule;
+mod disagg;
 mod find;
 mod offload;
 mod onboard;
@@ -19,6 +20,7 @@ mod integration_tests;
 #[cfg(test)]
 mod test_support;
 
+pub(super) use disagg::{BundlePrefillRequest, validate_prefill_context};
 pub(super) use offload::{BundleCommitMetadata, BundleOffload, OffloadTransition};
 
 use std::borrow::Borrow;
