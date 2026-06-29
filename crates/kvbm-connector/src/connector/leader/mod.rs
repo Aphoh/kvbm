@@ -688,7 +688,11 @@ impl Leader {
         let (engine, driver) = kvbm_engine::build_local_connector_engine(
             stack.instance_leader,
             sink,
-            kvbm_engine::ConnectorEngineConfig { block_size, remote },
+            kvbm_engine::ConnectorEngineConfig {
+                block_size,
+                remote,
+                resource_policies: Default::default(),
+            },
             stack.offload,
         );
         self.install_engine(engine)?;

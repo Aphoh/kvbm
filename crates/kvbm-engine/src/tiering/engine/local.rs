@@ -50,6 +50,7 @@ use std::sync::{Arc, Mutex, Weak};
 
 use anyhow::Result;
 use dashmap::DashMap;
+use kvbm_common::LogicalResourceId;
 
 use kvbm_protocols::connector::{
     AcceptId, ActionFailure, ActionId, ActionStatus, BundleOffloadPlan, BundleOnboardPlan,
@@ -59,6 +60,7 @@ use kvbm_protocols::connector::{
 };
 use kvbm_protocols::connector::{BlockId, RequestId, SequenceHash};
 
+use kvbm_logical::BlockEvictionObserver;
 use kvbm_logical::blocks::ImmutableBlock;
 
 use super::bundle::BundleIndex;
@@ -82,6 +84,7 @@ use crate::remote::cd::output::PrefillOutputObserver;
 use crate::remote::cd::prefill::PrefillRequests;
 use crate::remote::cd::state::{CdRequestState, CdRequests};
 use crate::remote::cd::wire::{PrefillDispatch, PrefillPlane};
+use crate::tiering::policy::{BundleDependencyIndex, ResourcePolicies};
 
 /// Per-search engine state, keyed by [`SearchId`] in `searches`.
 pub(super) struct SearchState {
@@ -102,6 +105,8 @@ pub(crate) struct LocalConnectorEngine {
     pub(super) leader: Arc<InstanceLeader>,
     pub(super) sink: Arc<dyn EngineWorkerSink>,
     pub(super) block_size: usize,
+    /// Model-configured resource policy, kept out of connector/model branches.
+    pub(super) resource_policies: ResourcePolicies,
     /// Whether shard finds request the leader's remote-search path. Set from
     /// the [`RemoteOps`](super::RemoteOps) selection at construction; threaded
     /// into every `FindMatchesOptions` the engine issues.
@@ -119,6 +124,10 @@ pub(crate) struct LocalConnectorEngine {
     pub(super) offload_buffer: Mutex<Vec<BufferedOffload>>,
     /// Only complete, manifest-scoped multi-resource bundles are visible here.
     pub(super) bundle_index: Mutex<BundleIndex<Vec<ImmutableBlock<G2>>>>,
+    /// Reverse resource-block lineage for every committed bundle.
+    pub(super) bundle_dependencies: Mutex<BundleDependencyIndex>,
+    /// Keeps manager-installed weak eviction callbacks live with this engine.
+    bundle_eviction_observers: Vec<Arc<dyn BlockEvictionObserver>>,
     /// Requests with at least one offload — the once-only source for
     /// `take_offload_drain` (removal *is* the consume-once guard).
     pub(super) offload_drains: DashMap<RequestId, ()>,
@@ -360,29 +369,111 @@ impl LocalConnectorEngine {
         offload_submit: Arc<dyn OffloadSubmit>,
         cd: Option<CdRuntime>,
     ) -> Arc<Self> {
+        Self::with_offload_submit_and_policies(
+            leader,
+            sink,
+            block_size,
+            search_remote,
+            offload_submit,
+            cd,
+            ResourcePolicies::default(),
+        )
+    }
+
+    pub(super) fn with_offload_submit_and_policies(
+        leader: Arc<InstanceLeader>,
+        sink: Arc<dyn EngineWorkerSink>,
+        block_size: usize,
+        search_remote: bool,
+        offload_submit: Arc<dyn OffloadSubmit>,
+        cd: Option<CdRuntime>,
+        resource_policies: ResourcePolicies,
+    ) -> Arc<Self> {
         // Source the in-flight-onboard gauge from the leader's observability
         // BEFORE `leader` moves into the cyclic closure. Bare test leaders have
         // no observability → `None` → an inert guard.
         let inflight_gauge = leader
             .observability()
             .map(|o| o.compat_metrics().inflight_onboard_hashes.clone());
-        Arc::new_cyclic(|weak| Self {
-            leader,
-            sink,
-            block_size,
-            search_remote,
-            searches: DashMap::new(),
-            actions: DashMap::new(),
-            by_request: DashMap::new(),
-            offload_submit,
-            offload_buffer: Mutex::new(Vec::new()),
-            bundle_index: Mutex::new(BundleIndex::new()),
-            offload_drains: DashMap::new(),
-            current_iteration: AtomicUsize::new(0),
-            weak_self: weak.clone(),
-            cd,
-            inflight: Mutex::new(InflightOnboards::with_gauge(inflight_gauge)),
+        Arc::new_cyclic(|weak| {
+            let bundle_eviction_observers = leader
+                .g2_managers()
+                .iter()
+                .map(|(resource, manager)| {
+                    let observer: Arc<dyn BlockEvictionObserver> =
+                        Arc::new(BundleEvictionObserver {
+                            engine: weak.clone(),
+                            resource,
+                        });
+                    manager.observe_evictions(&observer);
+                    observer
+                })
+                .collect();
+            Self {
+                leader,
+                sink,
+                block_size,
+                resource_policies,
+                search_remote,
+                searches: DashMap::new(),
+                actions: DashMap::new(),
+                by_request: DashMap::new(),
+                offload_submit,
+                offload_buffer: Mutex::new(Vec::new()),
+                bundle_index: Mutex::new(BundleIndex::new()),
+                bundle_dependencies: Mutex::new(BundleDependencyIndex::new()),
+                bundle_eviction_observers,
+                offload_drains: DashMap::new(),
+                current_iteration: AtomicUsize::new(0),
+                weak_self: weak.clone(),
+                cd,
+                inflight: Mutex::new(InflightOnboards::with_gauge(inflight_gauge)),
+            }
         })
+    }
+}
+
+struct BundleEvictionObserver {
+    engine: Weak<LocalConnectorEngine>,
+    resource: LogicalResourceId,
+}
+
+impl BlockEvictionObserver for BundleEvictionObserver {
+    fn on_blocks_evicted(&self, hashes: &[SequenceHash]) {
+        if let Some(engine) = self.engine.upgrade() {
+            engine.invalidate_resource_blocks(self.resource, hashes);
+        }
+    }
+}
+
+impl LocalConnectorEngine {
+    fn invalidate_resource_blocks(&self, resource: LogicalResourceId, hashes: &[SequenceHash]) {
+        let mut invalidated = Vec::new();
+        {
+            let mut dependencies = self
+                .bundle_dependencies
+                .lock()
+                .expect("bundle-dependencies mutex poisoned");
+            for &hash in hashes {
+                dependencies.invalidate(resource, hash, |event| invalidated.push(event));
+            }
+        }
+        if invalidated.is_empty() {
+            return;
+        }
+        let mut bundles = self
+            .bundle_index
+            .lock()
+            .expect("bundle-index mutex poisoned");
+        for event in invalidated {
+            bundles.invalidate(event.key());
+            tracing::debug!(
+                resource = ?event.resource(),
+                hash = ?event.hash(),
+                boundary_tokens = event.key().boundary_tokens(),
+                "resource eviction invalidated a dependent bundle"
+            );
+        }
     }
 }
 
@@ -3768,6 +3859,7 @@ mod tests {
             ConnectorEngineConfig {
                 block_size: BS,
                 remote: RemoteOps::with_search(stub()),
+                resource_policies: Default::default(),
             },
             None,
         );
@@ -3784,6 +3876,7 @@ mod tests {
             ConnectorEngineConfig {
                 block_size: BS,
                 remote: RemoteOps::default(),
+                resource_policies: Default::default(),
             },
             None,
         );
@@ -4086,6 +4179,7 @@ mod tests {
                         ..DisaggConfig::default()
                     },
                 ),
+                resource_policies: Default::default(),
             };
             let (engine, _driver) =
                 build_local_connector_engine(Arc::new(leader), NoopWorkerSink::new(), config, None);
@@ -5233,6 +5327,7 @@ mod tests {
                     Arc::new(TierCell::default()),
                     DisaggConfig::default(),
                 ),
+                resource_policies: Default::default(),
             };
             let (_engine, _driver) =
                 build_local_connector_engine(leader, NoopWorkerSink::new(), config, None);

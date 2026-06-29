@@ -39,7 +39,7 @@ pub use integrations::{
     ApplyError, DecodeOutcome, NoopDelegate, RequestSequence, SchedulableSequence,
     SchedulableSequenceBuilder, ScheduleError, SequenceDelegate, SequenceEvent, SequenceState,
 };
-pub use manager::BlockManager;
+pub use manager::{BlockEvictionObserver, BlockManager};
 pub use registry::BlockRegistry;
 pub use resources::{BlockManagerSet, DuplicateLogicalResource, LogicalResourceId};
 pub use sequence::{

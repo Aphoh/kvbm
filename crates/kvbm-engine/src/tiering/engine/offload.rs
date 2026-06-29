@@ -36,6 +36,7 @@ use kvbm_logical::blocks::ImmutableBlock;
 
 use super::bundle::{BundleOffload, OffloadTransition};
 use super::local::LocalConnectorEngine;
+use crate::tiering::policy::ResourceLineage;
 
 pub(super) type LocalBundleOffload =
     BundleOffload<Vec<(SequenceHash, BlockId)>, Vec<ImmutableBlock<G2>>>;
@@ -48,13 +49,19 @@ pub(super) enum BufferedOffloadCompletion {
 pub(super) struct BundleOffloadRuntime {
     transaction: Mutex<LocalBundleOffload>,
     drain: BundleChildDrain,
+    lineages: Mutex<Option<Vec<ResourceLineage>>>,
 }
 
 impl BundleOffloadRuntime {
-    pub(super) fn new(transaction: LocalBundleOffload, child_count: NonZeroUsize) -> Self {
+    pub(super) fn new(
+        transaction: LocalBundleOffload,
+        child_count: NonZeroUsize,
+        lineages: Vec<ResourceLineage>,
+    ) -> Self {
         Self {
             transaction: Mutex::new(transaction),
             drain: BundleChildDrain::new(child_count),
+            lineages: Mutex::new(Some(lineages)),
         }
     }
 
@@ -66,6 +73,13 @@ impl BundleOffloadRuntime {
 
     fn finish_child(&self, terminal: Option<ActionStatus>) -> Option<ActionStatus> {
         self.drain.finish_child(terminal)
+    }
+
+    fn take_lineages(&self) -> Option<Vec<ResourceLineage>> {
+        self.lineages
+            .lock()
+            .expect("bundle-lineages mutex poisoned")
+            .take()
     }
 }
 
@@ -402,19 +416,43 @@ impl LocalConnectorEngine {
             }
             Ok(OffloadTransition::Commit(commit)) => {
                 let (publication, _retained_sources) = commit.into_publication();
-                let published = publication
-                    .commit_into(
-                        &mut self
+                match runtime.take_lineages() {
+                    Some(lineages) => {
+                        let mut bundles = self
                             .bundle_index
                             .lock()
-                            .expect("bundle-index mutex poisoned"),
-                    )
-                    .is_ok();
-                Some(if published {
-                    ActionStatus::Complete
-                } else {
-                    ActionStatus::Failed(ActionFailure::AllBlocks)
-                })
+                            .expect("bundle-index mutex poisoned");
+                        let mut dependencies = self
+                            .bundle_dependencies
+                            .lock()
+                            .expect("bundle-dependencies mutex poisoned");
+                        let published = match publication.commit_into(&mut bundles) {
+                            Ok(key) => {
+                                let tracked = dependencies.track(key, lineages);
+                                if let Err(error) = tracked {
+                                    bundles.invalidate(key);
+                                    tracing::error!(%error, "bundle dependency publication failed");
+                                    false
+                                } else {
+                                    true
+                                }
+                            }
+                            Err(error) => {
+                                tracing::error!(%error, "bundle index publication failed");
+                                false
+                            }
+                        };
+                        Some(if published {
+                            ActionStatus::Complete
+                        } else {
+                            ActionStatus::Failed(ActionFailure::AllBlocks)
+                        })
+                    }
+                    None => {
+                        tracing::error!("bundle lineage was already consumed before publication");
+                        Some(ActionStatus::Failed(ActionFailure::AllBlocks))
+                    }
+                }
             }
             Err(error) => {
                 tracing::error!(%error, ?resource, "bundle offload completion fold failed");

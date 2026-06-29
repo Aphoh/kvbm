@@ -111,6 +111,27 @@ mod builder_tests {
     }
 
     #[test]
+    fn inactive_backend_policy_round_trips_and_is_applied_at_build() {
+        let policy = InactiveBackendConfig::MultiLru {
+            frequency_thresholds: [2, 6, 12],
+        };
+        let json = serde_json::to_string(&policy).unwrap();
+        let decoded: InactiveBackendConfig = serde_json::from_str(&json).unwrap();
+        let manager = BlockManager::<TestBlockData>::builder()
+            .block_count(8)
+            .registry(
+                BlockRegistry::builder()
+                    .frequency_tracker(FrequencyTrackingCapacity::Small.create_tracker())
+                    .build(),
+            )
+            .inactive_backend(decoded.clone())
+            .build()
+            .unwrap();
+
+        assert_eq!(manager.inactive_backend(), &decoded);
+    }
+
+    #[test]
     fn test_builder_with_duplication_policy() {
         let registry = BlockRegistry::new();
         let manager = BlockManager::<TestBlockData>::builder()
@@ -1919,6 +1940,58 @@ mod capacity_lifecycle_tests {
             })
             .collect();
         manager.register_blocks(complete)
+    }
+
+    #[test]
+    fn inactive_eviction_never_selects_an_active_block() {
+        let manager = create_backend_manager(2, |builder| builder.with_lru_backend());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_for_callback = std::sync::Arc::clone(&observed);
+        let observer: std::sync::Arc<dyn BlockEvictionObserver> =
+            std::sync::Arc::new(move |hashes: &[SequenceHash]| {
+                observed_for_callback
+                    .lock()
+                    .unwrap()
+                    .extend_from_slice(hashes);
+            });
+        manager.observe_evictions(&observer);
+        let mut registered = allocate_complete_register_all(&manager, 2, 4_000);
+        let inactive = registered.pop().unwrap();
+        let inactive_hash = inactive.sequence_hash();
+        let active = registered.pop().unwrap();
+        let active_hash = active.sequence_hash();
+        drop(inactive);
+
+        let (_allocated, evicted) = manager
+            .allocate_blocks_with_evictions(1)
+            .expect("the inactive slot is available");
+
+        assert_eq!(evicted, vec![inactive_hash]);
+        assert_eq!(*observed.lock().unwrap(), vec![inactive_hash]);
+        assert_eq!(active.sequence_hash(), active_hash);
+        assert_eq!(manager.match_blocks(&[active_hash]).len(), 1);
+    }
+
+    #[test]
+    fn resetting_inactive_pool_notifies_dependency_observers() {
+        let manager = create_backend_manager(1, |builder| builder.with_lru_backend());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_for_callback = std::sync::Arc::clone(&observed);
+        let observer: std::sync::Arc<dyn BlockEvictionObserver> =
+            std::sync::Arc::new(move |hashes: &[SequenceHash]| {
+                observed_for_callback
+                    .lock()
+                    .unwrap()
+                    .extend_from_slice(hashes);
+            });
+        manager.observe_evictions(&observer);
+        let registered = allocate_complete_register_all(&manager, 1, 8_000);
+        let hash = registered[0].sequence_hash();
+        drop(registered);
+
+        manager.reset_inactive_pool().unwrap();
+
+        assert_eq!(*observed.lock().unwrap(), vec![hash]);
     }
 
     // ====================================================================

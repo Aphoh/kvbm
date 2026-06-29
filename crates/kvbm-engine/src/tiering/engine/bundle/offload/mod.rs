@@ -221,8 +221,9 @@ impl<P> BundlePublication<P> {
     pub(in crate::tiering::engine) fn commit_into(
         self,
         index: &mut super::BundleIndex<P>,
-    ) -> Result<(), super::BundleIndexError> {
-        index.commit(&self.identity, self.key, self.generation, self.resources)
+    ) -> Result<BundleKey, super::BundleIndexError> {
+        index.commit(&self.identity, self.key, self.generation, self.resources)?;
+        Ok(self.key)
     }
 }
 

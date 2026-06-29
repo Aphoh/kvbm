@@ -8,6 +8,7 @@ use kvbm_protocols::cache_manifest::{
 };
 
 use super::{BundleIndex, BundleIndexError};
+use crate::tiering::policy::{BundleDependencyIndex, ResourceLineage};
 
 const CSA: LogicalResourceId = LogicalResourceId(10);
 const HCA: LogicalResourceId = LogicalResourceId(11);
@@ -211,4 +212,47 @@ fn older_generation_cannot_overwrite_a_newer_capsule_bundle() {
         .unwrap();
     assert_eq!(lease.generation(), 8);
     assert_eq!(Arc::strong_count(&original), 3);
+}
+
+#[test]
+fn resource_invalidation_removes_every_dependent_bundle_from_visibility() {
+    let manifest = manifest("revision-a");
+    let identity = manifest.identity();
+    let shallow = key(&manifest, 256);
+    let deep = key(&manifest, 512);
+    let shallow_hash = shallow.boundary_hash();
+    let mut bundles = BundleIndex::new();
+    bundles
+        .commit(&identity, shallow, 1, complete_pins())
+        .unwrap();
+    bundles.commit(&identity, deep, 2, complete_pins()).unwrap();
+
+    let mut dependencies = BundleDependencyIndex::new();
+    dependencies
+        .track(
+            shallow,
+            [ResourceLineage::new(
+                CSA,
+                ResourceRole::PrefixHistory,
+                vec![shallow_hash],
+            )],
+        )
+        .unwrap();
+    dependencies
+        .track(
+            deep,
+            [ResourceLineage::new(
+                CSA,
+                ResourceRole::PrefixHistory,
+                vec![shallow_hash, deep.boundary_hash()],
+            )],
+        )
+        .unwrap();
+
+    dependencies.invalidate(CSA, shallow_hash, |event| {
+        bundles.invalidate(event.key());
+    });
+
+    assert!(bundles.lease_exact(&identity, &shallow).is_none());
+    assert!(bundles.lease_exact(&identity, &deep).is_none());
 }

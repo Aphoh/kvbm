@@ -9,6 +9,7 @@ use std::sync::Arc;
 use anyhow::{Result, anyhow};
 use futures::future::BoxFuture;
 use kvbm_common::{BlockId, LogicalLayoutHandle, LogicalResourceId, SequenceHash};
+use kvbm_logical::manager::InactiveBackendConfig;
 use kvbm_logical::{BlockManager, BlockManagerSet, BlockRegistry};
 use kvbm_physical::TransferOptions;
 use kvbm_physical::transfer::TransferCompleteNotification;
@@ -26,6 +27,7 @@ use crate::leader::InstanceLeader;
 use crate::object::ObjectBlockOps;
 use crate::offload::{ExternalBlock, TransferStatus};
 use crate::testing::{managers::TestManagerBuilder, messenger::create_messenger_tcp};
+use crate::tiering::policy::{ResourcePolicies, ResourcePolicy};
 use crate::worker::group::ParallelWorkers;
 use crate::worker::{
     ConnectRemoteResponse, ImportMetadataResponse, InstanceId, RemoteDescriptor, SerializedLayout,
@@ -260,6 +262,15 @@ async fn bundle_offload_publishes_once_and_onboard_requires_its_exact_lease() ->
     kvbm_protocols::connector::WorkerEngineDriver::finish_forward_pass(engine.as_ref(), 0);
     wait_until(|| offload.is_complete()).await;
     assert_eq!(offload.outcome(), Some(SaveOutcome::Done));
+    assert_eq!(
+        engine
+            .bundle_dependencies
+            .lock()
+            .unwrap()
+            .dependents(RESOURCES[0], hash(1)),
+        vec![key],
+        "publication installs resource-lineage invalidation before visibility"
+    );
 
     let lease = engine
         .bundle_index
@@ -357,6 +368,58 @@ async fn bundle_offload_rejects_incomplete_or_wrong_lineage_children() -> Result
     );
     assert!(matches!(
         wrong_lineage,
+        Err(kvbm_protocols::connector::LeaderEngineError::InvalidBundleTransfer { .. })
+    ));
+    assert!(engine.offload_buffer.lock().unwrap().is_empty());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resource_policy_role_must_agree_with_the_manifest() -> Result<()> {
+    let (leader, managers) = build_resource_test_leader().await?;
+    let mut policies = ResourcePolicies::new();
+    policies
+        .insert(
+            RESOURCES[0],
+            ResourcePolicy::new(
+                ResourceRole::BoundaryCapsule,
+                InactiveBackendConfig::Lru,
+                InactiveBackendConfig::Lru,
+            ),
+        )
+        .unwrap();
+    let engine = LocalConnectorEngine::with_offload_submit_and_policies(
+        Arc::new(leader),
+        kvbm_protocols::connector::NoopWorkerSink::new(),
+        BLOCK_SIZE,
+        true,
+        Arc::new(RegisteringOffloadSubmit { managers }),
+        None,
+        policies,
+    );
+    let identity = manifest()?.identity();
+    let key = BundleKey::new(&identity, hash(1), BLOCK_SIZE as u64)?;
+
+    let result = engine.clone().offload_bundle(
+        &"policy-role-mismatch".into(),
+        BundleOffloadPlan {
+            identity,
+            key,
+            generation: 1,
+            mode: OffloadMode::Move,
+            resources: RESOURCES
+                .iter()
+                .enumerate()
+                .map(|(index, &resource)| ResourceOffload {
+                    resource,
+                    blocks: vec![(hash(1), 50 + index)],
+                })
+                .collect(),
+        },
+    );
+
+    assert!(matches!(
+        result,
         Err(kvbm_protocols::connector::LeaderEngineError::InvalidBundleTransfer { .. })
     ));
     assert!(engine.offload_buffer.lock().unwrap().is_empty());

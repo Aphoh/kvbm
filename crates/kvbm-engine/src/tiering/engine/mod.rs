@@ -120,7 +120,11 @@ fn build_local_connector_engine_inner(
     primary_offload: Option<Arc<OffloadEngine>>,
     offload_submit: Arc<dyn offload::OffloadSubmit>,
 ) -> (Arc<dyn LeaderEngine>, Arc<dyn WorkerEngineDriver>) {
-    let ConnectorEngineConfig { block_size, remote } = config;
+    let ConnectorEngineConfig {
+        block_size,
+        remote,
+        resource_policies,
+    } = config;
     let RemoteOps { search, disagg } = remote;
 
     // Install the discovery on the leader before constructing the engine — this
@@ -171,13 +175,14 @@ fn build_local_connector_engine_inner(
         }
     }
 
-    let engine = LocalConnectorEngine::with_offload_submit(
+    let engine = LocalConnectorEngine::with_offload_submit_and_policies(
         leader,
         sink,
         block_size,
         search_remote,
         offload_submit,
         cd,
+        resource_policies,
     );
     (
         Arc::clone(&engine) as Arc<dyn LeaderEngine>,

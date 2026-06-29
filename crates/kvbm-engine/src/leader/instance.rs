@@ -635,6 +635,10 @@ impl InstanceLeader {
         self.g2_managers.get(resource)
     }
 
+    pub(crate) fn g2_managers(&self) -> &BlockManagerSet<G2> {
+        &self.g2_managers
+    }
+
     pub fn primary_g2_resource(&self) -> LogicalResourceId {
         self.primary_g2_resource
     }

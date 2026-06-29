@@ -6,6 +6,8 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use crate::metrics::{BlockPoolMetrics, MetricsAggregator, short_type_name};
 use crate::tinylfu::TinyLFUTracker;
 
@@ -52,7 +54,9 @@ impl FrequencyTrackingCapacity {
     }
 }
 
-/// Configuration for the inactive pool backend.
+/// Serializable construction policy for the inactive pool backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "backend", rename_all = "snake_case")]
 pub enum InactiveBackendConfig {
     /// HashMap with FIFO reuse order.
     HashMap,
@@ -71,9 +75,18 @@ pub enum InactiveBackendConfig {
     },
 }
 
+impl Default for InactiveBackendConfig {
+    fn default() -> Self {
+        Self::Lineage {
+            eviction: LineageEviction::default(),
+        }
+    }
+}
+
 /// Leaf-eviction ordering for the [`Lineage`](InactiveBackendConfig::Lineage)
 /// inactive backend.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LineageEviction {
     /// `BTreeMap` ordered by a per-node insertion tick — a node that
     /// re-becomes a leaf returns to its original position. Historical
@@ -206,6 +219,12 @@ impl<T: BlockMetadata> BlockManagerConfigBuilder<T> {
     /// Set the block registry.
     pub fn registry(mut self, registry: BlockRegistry) -> Self {
         self.registry = Some(registry);
+        self
+    }
+
+    /// Select the inactive backend from serializable policy data.
+    pub fn inactive_backend(mut self, policy: InactiveBackendConfig) -> Self {
+        self.inactive_backend = Some(policy);
         self
     }
 
@@ -389,21 +408,22 @@ impl<T: BlockMetadata> BlockManagerConfigBuilder<T> {
 
         metrics.set_reset_pool_size(block_count as i64);
 
-        // Create backend based on configuration
-        let backend: Box<dyn InactiveIndex> = match self.inactive_backend.take() {
-            Some(InactiveBackendConfig::HashMap) => {
+        // Create backend based on configuration.
+        let inactive_backend = self.inactive_backend.take().unwrap_or_default();
+        let backend: Box<dyn InactiveIndex> = match inactive_backend {
+            InactiveBackendConfig::HashMap => {
                 tracing::info!("Using HashMap for inactive pool");
                 Box::new(HashMapBackend::new(Box::new(FifoReusePolicy::new())))
             }
-            Some(InactiveBackendConfig::Lru) => {
+            InactiveBackendConfig::Lru => {
                 // Capacity automatically set to block_count
                 let capacity = NonZeroUsize::new(block_count).expect("block_count must be > 0");
                 tracing::info!("Using LRU for inactive pool");
                 Box::new(LruBackend::new(capacity))
             }
-            Some(InactiveBackendConfig::MultiLru {
+            InactiveBackendConfig::MultiLru {
                 frequency_thresholds,
-            }) => {
+            } => {
                 // Require frequency tracker for MultiLRU
                 let frequency_tracker = registry.frequency_tracker().ok_or_else(|| {
                     BlockManagerBuilderError::InvalidBackend(
@@ -429,16 +449,8 @@ impl<T: BlockMetadata> BlockManagerConfigBuilder<T> {
                     .map_err(|e| BlockManagerBuilderError::InvalidBackend(e.to_string()))?,
                 )
             }
-            Some(InactiveBackendConfig::Lineage { eviction }) => {
+            InactiveBackendConfig::Lineage { eviction } => {
                 tracing::info!("Using Lineage inactive backend ({eviction:?})");
-                Box::new(LineageBackend::with_policy(
-                    block_count,
-                    lineage_leaf_policy(eviction, block_count),
-                ))
-            }
-            None => {
-                let eviction = LineageEviction::default();
-                tracing::info!("Using default inactive backend: Lineage ({eviction:?})");
                 Box::new(LineageBackend::with_policy(
                     block_count,
                     lineage_leaf_policy(eviction, block_count),
@@ -463,12 +475,14 @@ impl<T: BlockMetadata> BlockManagerConfigBuilder<T> {
         Ok(BlockManager {
             store,
             block_registry: registry,
+            inactive_backend,
             duplication_policy: self
                 .duplication_policy
                 .unwrap_or(BlockDuplicationPolicy::Allow),
             total_blocks: block_count,
             block_size,
             metrics,
+            eviction_observers: Default::default(),
         })
     }
 }

@@ -108,6 +108,11 @@ impl<P> BundleIndex<P> {
         );
         Ok(())
     }
+
+    /// Remove one committed bundle and release all resource pins atomically.
+    pub(super) fn invalidate(&mut self, key: BundleKey) -> bool {
+        self.committed.remove(&key).is_some()
+    }
 }
 
 impl<P: Clone> BundleIndex<P> {

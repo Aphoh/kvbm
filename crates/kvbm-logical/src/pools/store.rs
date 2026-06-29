@@ -481,14 +481,18 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         Some((blocks, evicted))
     }
 
-    /// Drain the inactive pool entirely into MutableBlocks.
-    pub(crate) fn drain_inactive_to_mutable(self: &Arc<Self>) -> Vec<MutableBlock<T>> {
+    /// Drain the inactive pool entirely into mutable blocks and report every
+    /// lineage hash that ceased to be cached.
+    pub(crate) fn drain_inactive_to_mutable(
+        self: &Arc<Self>,
+    ) -> (Vec<MutableBlock<T>>, Vec<SequenceHash>) {
         let mut inner = self.inner.lock();
         let drained = inner.inactive.allocate_all();
         let count = drained.len();
         let mut handles = Vec::with_capacity(count);
         let mut out = Vec::with_capacity(count);
-        for (_seq_hash, block_id) in drained {
+        let mut evicted = Vec::with_capacity(count);
+        for (seq_hash, block_id) in drained {
             // Eviction discards the override; the slot leaves Inactive.
             let handle = take_inactive_handle(&mut inner.slots[block_id], block_id);
             inner.slots[block_id].state = SlotState::Mutable;
@@ -496,6 +500,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
             handles.push(handle);
             let block_size = inner.slots[block_id].block_size;
             out.push(MutableBlock::from_store(self.clone(), block_id, block_size));
+            evicted.push(seq_hash);
         }
         self.metrics.dec_inactive_pool_size_by(count as i64);
         self.metrics.inc_inflight_mutable_by(count as i64);
@@ -503,7 +508,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         for h in handles {
             h.mark_absent::<T>();
         }
-        out
+        (out, evicted)
     }
 
     /// Promote inactive slots to `Primary`, building fresh

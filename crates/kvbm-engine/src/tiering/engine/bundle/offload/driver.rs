@@ -17,6 +17,7 @@ use crate::tiering::engine::local::LocalConnectorEngine;
 use crate::tiering::engine::offload::{
     BufferedOffload, BufferedOffloadCompletion, BundleOffloadRuntime, LocalBundleOffload,
 };
+use crate::tiering::policy::ResourceLineage;
 
 type SourceBlocksByResource = BTreeMap<LogicalResourceId, Vec<(SequenceHash, BlockId)>>;
 
@@ -27,6 +28,7 @@ impl LocalConnectorEngine {
         plan: BundleOffloadPlan,
     ) -> Result<OffloadHandle, LeaderEngineError> {
         let sources = self.validate_bundle_offload(&plan)?;
+        let lineages = bundle_lineages(&plan)?;
         let mut transaction =
             LocalBundleOffload::new(plan.identity, plan.key, plan.generation, plan.mode, sources)
                 .map_err(|error| LeaderEngineError::InvalidBundleTransfer {
@@ -38,7 +40,11 @@ impl LocalConnectorEngine {
                 reason: "at least one resource is required".to_owned(),
             }
         })?;
-        let runtime = Arc::new(BundleOffloadRuntime::new(transaction, child_count));
+        let runtime = Arc::new(BundleOffloadRuntime::new(
+            transaction,
+            child_count,
+            lineages,
+        ));
 
         let action_id = ActionId::new();
         let cell = Arc::new(Mutex::new(ActionStatus::Pending));
@@ -116,6 +122,18 @@ impl LocalConnectorEngine {
                         child.resource
                     ),
                 })?;
+            if let Some(policy) = self.resource_policies.get(child.resource)
+                && policy.role() != requirement.role()
+            {
+                return Err(LeaderEngineError::InvalidBundleTransfer {
+                    reason: format!(
+                        "resource {:?} policy role {:?} disagrees with manifest role {:?}",
+                        child.resource,
+                        policy.role(),
+                        requirement.role()
+                    ),
+                });
+            }
             let expected_blocks = match requirement.role() {
                 ResourceRole::PrefixHistory => plan
                     .key
@@ -148,4 +166,29 @@ impl LocalConnectorEngine {
         }
         Ok(sources)
     }
+}
+
+fn bundle_lineages(plan: &BundleOffloadPlan) -> Result<Vec<ResourceLineage>, LeaderEngineError> {
+    plan.resources
+        .iter()
+        .map(|child| {
+            let role = plan
+                .identity
+                .resources()
+                .iter()
+                .find(|requirement| requirement.resource() == child.resource)
+                .map(|requirement| requirement.role())
+                .ok_or_else(|| LeaderEngineError::InvalidBundleTransfer {
+                    reason: format!(
+                        "resource {:?} is absent from the cache identity",
+                        child.resource
+                    ),
+                })?;
+            Ok(ResourceLineage::new(
+                child.resource,
+                role,
+                child.blocks.iter().map(|(hash, _)| *hash).collect(),
+            ))
+        })
+        .collect()
 }

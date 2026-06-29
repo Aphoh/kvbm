@@ -18,7 +18,9 @@ pub use builder::{
 };
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
+
+use parking_lot::RwLock;
 
 use crate::blocks::{BlockMetadata, CompleteBlock, ImmutableBlock, MutableBlock};
 use crate::metrics::BlockPoolMetrics;
@@ -31,10 +33,26 @@ use crate::registry::BlockRegistry;
 pub struct BlockManager<T: BlockMetadata> {
     pub(crate) store: Arc<BlockStore<T>>,
     pub(crate) block_registry: BlockRegistry,
+    pub(crate) inactive_backend: InactiveBackendConfig,
     pub(crate) duplication_policy: BlockDuplicationPolicy,
     pub(crate) total_blocks: usize,
     pub(crate) block_size: usize,
     pub(crate) metrics: Arc<BlockPoolMetrics>,
+    eviction_observers: RwLock<Vec<Weak<dyn BlockEvictionObserver>>>,
+}
+
+/// Batch callback fired after inactive slots have been evicted and reset.
+pub trait BlockEvictionObserver: Send + Sync + 'static {
+    fn on_blocks_evicted(&self, hashes: &[SequenceHash]);
+}
+
+impl<F> BlockEvictionObserver for F
+where
+    F: Fn(&[SequenceHash]) + Send + Sync + 'static,
+{
+    fn on_blocks_evicted(&self, hashes: &[SequenceHash]) {
+        self(hashes);
+    }
 }
 
 impl<T: BlockMetadata + Sync> BlockManager<T> {
@@ -70,12 +88,15 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
         &self,
         count: usize,
     ) -> Option<(Vec<MutableBlock<T>>, Vec<SequenceHash>)> {
-        self.store.allocate_atomic(count)
+        let allocation = self.store.allocate_atomic(count)?;
+        self.notify_evictions(&allocation.1);
+        Some(allocation)
     }
 
     /// Drain the inactive pool, returning all blocks to the reset pool.
     pub fn reset_inactive_pool(&self) -> Result<(), BlockManagerResetError> {
-        let blocks = self.store.drain_inactive_to_mutable();
+        let (blocks, evicted) = self.store.drain_inactive_to_mutable();
+        self.notify_evictions(&evicted);
         drop(blocks);
 
         let reset_count = self.store.reset_len();
@@ -87,6 +108,28 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
         }
 
         Ok(())
+    }
+
+    fn notify_evictions(&self, hashes: &[SequenceHash]) {
+        if hashes.is_empty() {
+            return;
+        }
+        let observers = {
+            let mut registered = self.eviction_observers.write();
+            let mut live = Vec::with_capacity(registered.len());
+            registered.retain(|observer| {
+                if let Some(observer) = observer.upgrade() {
+                    live.push(observer);
+                    true
+                } else {
+                    false
+                }
+            });
+            live
+        };
+        for observer in observers {
+            observer.on_blocks_evicted(hashes);
+        }
     }
 
     /// Register a batch of completed blocks.
@@ -234,6 +277,18 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
     /// Reference to the shared block registry.
     pub fn block_registry(&self) -> &BlockRegistry {
         &self.block_registry
+    }
+
+    /// Construction policy selected for this manager's inactive pool.
+    pub const fn inactive_backend(&self) -> &InactiveBackendConfig {
+        &self.inactive_backend
+    }
+
+    /// Observe future inactive-pool evictions while the caller retains `observer`.
+    pub fn observe_evictions(&self, observer: &Arc<dyn BlockEvictionObserver>) {
+        self.eviction_observers
+            .write()
+            .push(Arc::downgrade(observer));
     }
 
     /// Reference to the block pool metrics.
