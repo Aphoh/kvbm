@@ -117,6 +117,13 @@ impl OnboardHandle {
                     block_ids: block_ids.clone(),
                 })
             }
+            ActionStatus::Failed(ActionFailure::Resource { block_ids, .. }) => {
+                Some(LoadOutcome::FailedPartial {
+                    block_ids: block_ids
+                        .clone()
+                        .unwrap_or_else(|| self.dest_block_ids.clone()),
+                })
+            }
         }
     }
 }
@@ -310,6 +317,12 @@ impl OffloadHandle {
                     block_ids: block_ids.clone(),
                 })
             }
+            ActionStatus::Failed(ActionFailure::Resource { block_ids, .. }) => match block_ids {
+                Some(block_ids) => Some(SaveOutcome::FailedPartial {
+                    block_ids: block_ids.clone(),
+                }),
+                None => Some(SaveOutcome::FailedAllBlocks),
+            },
         }
     }
 }

@@ -32,10 +32,6 @@
 
 pub(crate) mod reconcile;
 
-#[allow(
-    dead_code,
-    reason = "phase K0 defines the bundle index before phase K1 wires transactions into the engine"
-)]
 mod bundle;
 mod config;
 mod driver;

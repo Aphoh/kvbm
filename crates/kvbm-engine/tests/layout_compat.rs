@@ -21,10 +21,11 @@ use kvbm_common::{BlockLayoutMode, KvBlockLayout, KvDim};
 use kvbm_engine::leader::layout_compat::check_import_compat;
 use kvbm_physical::layout::{
     BlockFormat, FullyContiguousDetails, LayoutConfig, LayoutDescriptor, LayoutTypeDetails,
-    NixlMetadata,
+    NixlMetadata, RaggedLayerSeparateDetails,
 };
 use kvbm_physical::manager::{
-    LayoutHandle, LogicalLayoutDescriptor, ParallelismDescriptor, SerializedLayout, WorkerAddress,
+    LayoutHandle, LogicalLayoutDescriptor, ParallelismDescriptor, ResourceLayoutDescriptor,
+    ResourceLayouts, SerializedLayout, WorkerAddress,
 };
 
 // ---------------------------------------------------------------------------
@@ -310,6 +311,106 @@ fn universal_rejects_unknown_remote() {
 fn empty_sides_short_circuit() {
     let res = check_import_compat(BlockLayoutMode::Operational, &[], &[], None);
     assert!(res.is_ok(), "empty local + empty remote is a no-op");
+}
+
+fn build_resource_pool(
+    worker_id: u64,
+    pool_id: u16,
+    page_size: usize,
+    fixed_slots: bool,
+) -> LogicalLayoutDescriptor {
+    let config = LayoutConfig::builder()
+        .num_blocks(8)
+        .num_layers(1)
+        .outer_dim(1)
+        .page_size(page_size)
+        .inner_dim(1)
+        .dtype_width_bytes(2)
+        .build()
+        .unwrap();
+    let layout_type_details = if fixed_slots {
+        LayoutTypeDetails::FullyContiguous(FullyContiguousDetails {
+            block_format: BlockFormat::Operational,
+            kv_block_layout: KvBlockLayout::Unknown,
+        })
+    } else {
+        LayoutTypeDetails::RaggedLayerSeparate(RaggedLayerSeparateDetails {
+            bytes_per_layer_block: vec![page_size * 2],
+            kv_block_layout: KvBlockLayout::Unknown,
+        })
+    };
+    LogicalLayoutDescriptor::new(
+        LayoutHandle::new(worker_id, pool_id),
+        LogicalLayoutHandle::G2,
+        LayoutDescriptor {
+            version: LayoutDescriptor::CURRENT_VERSION,
+            layout_config: config,
+            location: StorageKind::System,
+            nixl_metadata: NixlMetadata::new(format!("agent-{worker_id}"), MemType::Dram, 0),
+            memory_descriptors: Vec::new(),
+            layout_type_details,
+        },
+    )
+}
+
+#[test]
+fn resource_metadata_round_trips_ragged_histories_and_fixed_capsules() {
+    let worker_id = 91;
+    let csa = kvbm_common::LogicalResourceId(10);
+    let hca = kvbm_common::LogicalResourceId(11);
+    let capsule = kvbm_common::LogicalResourceId(12);
+    let csa_pools = vec![
+        build_resource_pool(worker_id, 1, 64, false),
+        build_resource_pool(worker_id, 2, 64, false),
+    ];
+    let hca_pools = vec![build_resource_pool(worker_id, 3, 2, false)];
+    let capsule_pools = vec![
+        build_resource_pool(worker_id, 4, 1, true),
+        build_resource_pool(worker_id, 5, 1, true),
+    ];
+    let resources = ResourceLayouts::new(
+        csa,
+        vec![
+            ResourceLayoutDescriptor::new(csa, csa_pools.clone()),
+            ResourceLayoutDescriptor::new(hca, hca_pools),
+            ResourceLayoutDescriptor::new(capsule, capsule_pools),
+        ],
+    )
+    .unwrap();
+    let packed = SerializedLayout::pack_with_resources(
+        WorkerAddress::new(worker_id, format!("agent-{worker_id}")),
+        Vec::new(),
+        csa_pools,
+        None,
+        None,
+        Some(resources),
+    )
+    .unwrap();
+
+    let unpacked = packed.unpack().unwrap();
+    let resources = unpacked.resource_layouts.unwrap();
+    assert_eq!(resources.get(csa).unwrap().len(), 2);
+    assert!(
+        resources
+            .get(csa)
+            .unwrap()
+            .iter()
+            .all(|pool| pool.layout.layout_config.page_size == 64)
+    );
+    assert_eq!(
+        resources.get(hca).unwrap()[0]
+            .layout
+            .layout_config
+            .page_size,
+        2
+    );
+    assert!(resources.get(capsule).unwrap().iter().all(|pool| {
+        pool.layout.layout_config.page_size == 1
+            && matches!(
+                pool.layout.layout_type_details,
+                LayoutTypeDetails::FullyContiguous(_)
+            )
+    }));
 }
 
 // ---------------------------------------------------------------------------

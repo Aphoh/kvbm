@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use kvbm_common::LogicalResourceId;
 
 use crate::cache_manifest::{
-    CacheManifest, CacheScope, ModelIdentity, ResourceRequirement, ResourceRole,
+    BundleKey, CacheManifest, CacheScope, ModelIdentity, ResourceRequirement, ResourceRole,
 };
 use crate::disagg::RemotePrefillParams;
 
@@ -31,8 +31,9 @@ use super::noop::NoopBlockEngine;
 use super::noop::NoopWorkerSink;
 use super::protocol::RequestId;
 use super::protocol::{
-    AcceptId, ActionFailure, ActionId, ActionStatus, EvictionFence, EvictionOutcome, FenceToken,
-    FindBlocksOutcome, FindBlocksRequest, LeaderEngineError, ResourceOnboard, SearchId,
+    AcceptId, ActionFailure, ActionId, ActionStatus, BundleOffloadPlan, BundleOnboardPlan,
+    EvictionFence, EvictionOutcome, FenceToken, FindBlocksOutcome, FindBlocksRequest,
+    LeaderEngineError, OffloadMode, ResourceOffload, ResourceOnboard, SearchId,
 };
 
 fn engine() -> Arc<dyn LeaderEngine> {
@@ -235,16 +236,29 @@ fn noop_onboard_blocks_is_immediately_terminal() {
 fn legacy_engine_rejects_resource_batched_onboard() {
     let engine = engine();
     let resource = LogicalResourceId(7);
+    let manifest = CacheManifest::new(
+        ModelIdentity::new("hybrid-cache", "revision-a", [8; 32]).unwrap(),
+        "hybrid-cache-v1",
+        vec![ResourceRequirement::new(resource, ResourceRole::PrefixHistory, 16).unwrap()],
+        Default::default(),
+    )
+    .unwrap();
+    let identity = manifest.identity();
 
     assert_eq!(
         engine
             .onboard_resources(
                 &"r1".to_string(),
-                vec![ResourceOnboard {
-                    resource,
-                    source_block_ids: vec![2],
-                    destination_block_ids: vec![5],
-                }],
+                BundleOnboardPlan {
+                    key: BundleKey::new(&identity, super::protocol::SequenceHash::default(), 16,)
+                        .unwrap(),
+                    identity,
+                    resources: vec![ResourceOnboard {
+                        resource,
+                        source_block_ids: vec![2],
+                        destination_block_ids: vec![5],
+                    }],
+                },
             )
             .unwrap_err(),
         LeaderEngineError::ResourceOnboardNotConfigured { resource }
@@ -299,6 +313,80 @@ fn find_blocks_request_carries_chain_counts_and_transfer_params() {
     // Plain-local construction carries no params.
     assert!(find_blocks_req("r2").transfer_params.is_none());
     assert!(find_blocks_req("r2").cache.identity().is_none());
+}
+
+#[test]
+fn bundle_transfer_plans_carry_one_identity_key_and_exact_resource_children() {
+    let manifest = CacheManifest::new(
+        ModelIdentity::new("hybrid-cache", "revision-a", [7; 32]).unwrap(),
+        "hybrid-cache-v1",
+        vec![
+            ResourceRequirement::new(LogicalResourceId(4), ResourceRole::PrefixHistory, 16)
+                .unwrap(),
+            ResourceRequirement::new(LogicalResourceId(5), ResourceRole::BoundaryCapsule, 16)
+                .unwrap(),
+        ],
+        Default::default(),
+    )
+    .unwrap();
+    let identity = manifest.identity();
+    let key = BundleKey::new(&identity, super::protocol::SequenceHash::default(), 32).unwrap();
+    let onboard = BundleOnboardPlan {
+        identity: identity.clone(),
+        key,
+        resources: vec![
+            ResourceOnboard {
+                resource: LogicalResourceId(4),
+                source_block_ids: vec![1, 2],
+                destination_block_ids: vec![11, 12],
+            },
+            ResourceOnboard {
+                resource: LogicalResourceId(5),
+                source_block_ids: vec![3],
+                destination_block_ids: vec![13],
+            },
+        ],
+    };
+    let offload = BundleOffloadPlan {
+        identity,
+        key,
+        generation: 9,
+        mode: OffloadMode::Move,
+        resources: vec![
+            ResourceOffload {
+                resource: LogicalResourceId(4),
+                blocks: vec![(super::protocol::SequenceHash::default(), 2)],
+            },
+            ResourceOffload {
+                resource: LogicalResourceId(5),
+                blocks: vec![(super::protocol::SequenceHash::default(), 3)],
+            },
+        ],
+    };
+
+    assert_eq!(onboard.key, offload.key);
+    assert_eq!(offload.generation, 9);
+    assert_eq!(offload.mode, OffloadMode::Move);
+    assert_eq!(onboard.resources[0].resource, LogicalResourceId(4));
+    assert_eq!(offload.resources[0].resource, LogicalResourceId(4));
+    assert_eq!(onboard.resources.len(), 2);
+    assert_eq!(offload.resources.len(), 2);
+}
+
+#[test]
+fn action_failure_can_name_a_resource_without_breaking_all_blocks() {
+    let resource = LogicalResourceId(7);
+    assert_eq!(
+        ActionFailure::Resource {
+            resource,
+            block_ids: Some(vec![3, 5]),
+        },
+        ActionFailure::Resource {
+            resource,
+            block_ids: Some(vec![3, 5]),
+        }
+    );
+    assert_eq!(ActionFailure::AllBlocks, ActionFailure::AllBlocks);
 }
 
 /// The three outcome variants construct and pattern-match with the fields the

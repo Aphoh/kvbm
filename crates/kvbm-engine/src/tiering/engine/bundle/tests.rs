@@ -175,3 +175,40 @@ fn bundle_lease_clones_every_resource_pin() {
     drop(lease);
     assert_eq!(Arc::strong_count(&csa), 2);
 }
+
+#[test]
+fn older_generation_cannot_overwrite_a_newer_capsule_bundle() {
+    let manifest = manifest("revision-a");
+    let identity = manifest.identity();
+    let bundle_key = key(&manifest, 256);
+    let original = Arc::new("new-generation");
+    let mut index = BundleIndex::new();
+    index
+        .commit(
+            &identity,
+            bundle_key,
+            8,
+            vec![
+                (CSA, Arc::clone(&original)),
+                (HCA, Arc::new("hca")),
+                (CAPSULE, Arc::new("capsule")),
+            ],
+        )
+        .unwrap();
+
+    assert_eq!(
+        index.commit(&identity, bundle_key, 7, complete_pins()),
+        Err(BundleIndexError::StaleGeneration {
+            current: 8,
+            attempted: 7,
+        })
+    );
+    index
+        .commit(&identity, bundle_key, 8, complete_pins())
+        .expect("same-generation retry is idempotent");
+    let lease = index
+        .find_longest(&identity, &[(SequenceHash::new(256, None, 256), 256)])
+        .unwrap();
+    assert_eq!(lease.generation(), 8);
+    assert_eq!(Arc::strong_count(&original), 3);
+}

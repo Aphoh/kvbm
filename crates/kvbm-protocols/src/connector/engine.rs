@@ -19,10 +19,10 @@ use kvbm_common::LogicalResourceId;
 
 use super::handles::{FindBlocksHandle, OffloadHandle, OnboardHandle, RequestOffloadDrain};
 use super::protocol::{
-    AcceptId, ActionId, ActionStatus, EvictionOutcome, FindBlocksOutcome, FindBlocksRequest,
-    LeaderEngineError, SearchId,
+    AcceptId, ActionId, ActionStatus, BundleOffloadPlan, BundleOnboardPlan, EvictionOutcome,
+    FindBlocksOutcome, FindBlocksRequest, LeaderEngineError, SearchId,
 };
-use super::protocol::{BlockId, RequestId, ResourceOnboard, SequenceHash};
+use super::protocol::{BlockId, RequestId, SequenceHash};
 
 /// Leader-side block-engine contract. The connector drives unified match and
 /// onboard, legacy or resource-explicit offload, eviction, and the request
@@ -61,6 +61,23 @@ pub trait LeaderEngine: Send + Sync + 'static {
             return Err(LeaderEngineError::ResourceOffloadNotConfigured { resource });
         }
         self.offload(req, pairs)
+    }
+
+    /// OFFLOAD an exact logical-resource bundle under one atomic action.
+    fn offload_bundle(
+        self: Arc<Self>,
+        req: &RequestId,
+        plan: BundleOffloadPlan,
+    ) -> Result<OffloadHandle, LeaderEngineError> {
+        let Some(first) = plan.resources.first() else {
+            return Err(LeaderEngineError::InvalidBundleTransfer {
+                reason: "at least one resource is required".to_owned(),
+            });
+        };
+        let _ = req;
+        Err(LeaderEngineError::ResourceOffloadNotConfigured {
+            resource: first.resource,
+        })
     }
 
     /// EVICTION (non-terminal). DRAINS (does not cancel — submitted CUDA copies
@@ -110,10 +127,10 @@ pub trait LeaderEngine: Send + Sync + 'static {
     fn onboard_resources(
         self: Arc<Self>,
         req: &RequestId,
-        resources: Vec<ResourceOnboard>,
+        plan: BundleOnboardPlan,
     ) -> Result<OnboardHandle, LeaderEngineError> {
-        let Some(first) = resources.first() else {
-            return Err(LeaderEngineError::InvalidResourceOnboard {
+        let Some(first) = plan.resources.first() else {
+            return Err(LeaderEngineError::InvalidBundleTransfer {
                 reason: "at least one resource is required".to_owned(),
             });
         };

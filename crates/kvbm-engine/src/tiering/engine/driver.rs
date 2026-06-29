@@ -156,12 +156,16 @@ pub(super) struct ActionRecord {
     /// restored request finishes while the old drain is still in flight).
     pub(super) drain: Option<Arc<DrainBarrier>>,
     /// Set `true` if the handle's RAII drop fired [`LocalConnectorEngine::release_action`]
-    /// while `fence` or `drain` was still armed (the driver had not reached terminal).
+    /// while `fence`, `drain`, or a direct-bundle in-flight record was still
+    /// armed (the driver had not reached terminal).
     /// Removal of the `actions` entry is then DEFERRED to the driver's terminal:
     /// dropping the record — and with it the live barrier clone(s) — now would
     /// complete the fence / fire the emission before the transfer drained. The
     /// terminal removes the record once it observes this flag.
     pub(super) dropped_by_handle: bool,
+    /// Optional in-flight onboard generation cleared with this action record.
+    /// While present, an early handle drop defers removal until terminal.
+    pub(super) inflight: Option<super::inflight::InflightKey>,
 }
 
 impl ActionRecord {
@@ -173,7 +177,13 @@ impl ActionRecord {
             fence: None,
             drain: None,
             dropped_by_handle: false,
+            inflight: None,
         }
+    }
+
+    pub(super) fn with_inflight(mut self, key: super::inflight::InflightKey) -> Self {
+        self.inflight = Some(key);
+        self
     }
 }
 
@@ -197,6 +207,11 @@ fn load_outcome_of(status: &ActionStatus) -> LoadOutcome {
         ActionStatus::Failed(ActionFailure::Partial { block_ids }) => LoadOutcome::FailedPartial {
             block_ids: block_ids.clone(),
         },
+        ActionStatus::Failed(ActionFailure::Resource { block_ids, .. }) => {
+            LoadOutcome::FailedPartial {
+                block_ids: block_ids.clone().unwrap_or_default(),
+            }
+        }
     }
 }
 
@@ -243,6 +258,13 @@ impl LocalConnectorEngine {
                     block_ids: dest_ids,
                 })
             }
+            ActionStatus::Failed(ActionFailure::Resource {
+                resource,
+                block_ids: None,
+            }) => ActionStatus::Failed(ActionFailure::Resource {
+                resource,
+                block_ids: Some(dest_ids),
+            }),
             other => other,
         };
 
@@ -407,6 +429,12 @@ impl LocalConnectorEngine {
     /// fence-armed action's record outlives a premature handle drop.
     pub(super) fn remove_action_record(&self, id: &ActionId) {
         if let Some((_id, record)) = self.actions.remove(id) {
+            if let Some(key) = record.inflight {
+                self.inflight
+                    .lock()
+                    .expect("inflight-guard mutex poisoned")
+                    .clear(&key);
+            }
             self.untrack_action(&record.request_id, *id);
         }
     }

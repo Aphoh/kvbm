@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub use crate::cache_manifest::CacheScope;
+use crate::cache_manifest::{BundleKey, CacheIdentity};
 use crate::disagg::TransferParams;
 
 use super::handles::FindBlocksHandle;
@@ -142,6 +143,49 @@ pub struct ResourceOnboard {
     pub destination_block_ids: Vec<BlockId>,
 }
 
+/// One exact G1-to-G2 save within a logical model resource.
+///
+/// Within a [`BundleOffloadPlan`], prefix-history resources carry the complete
+/// native-block chain through the bundle boundary. A boundary capsule carries
+/// one logical object even when that object spans several physical pools.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceOffload {
+    pub resource: kvbm_common::LogicalResourceId,
+    pub blocks: Vec<(SequenceHash, BlockId)>,
+}
+
+/// Source-tier retention after an atomic bundle offload commits.
+///
+/// The source owner must keep external G1 ownership live until the parent
+/// offload handle reaches terminal. It then applies this disposition: retain
+/// the allocation for `Mirror`, release it for `Move`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OffloadMode {
+    /// Publish the G2 bundle while retaining the G1 source allocation.
+    Mirror,
+    /// Release the G1 source allocation only after the G2 bundle commits.
+    Move,
+}
+
+/// Atomic multi-resource G1-to-G2 save contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BundleOffloadPlan {
+    pub identity: CacheIdentity,
+    pub key: BundleKey,
+    pub generation: u64,
+    pub mode: OffloadMode,
+    pub resources: Vec<ResourceOffload>,
+}
+
+/// Atomic multi-resource G2-to-G1 restore contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BundleOnboardPlan {
+    pub identity: CacheIdentity,
+    pub key: BundleKey,
+    pub resources: Vec<ResourceOnboard>,
+}
+
 /// Outcome of [`super::engine::LeaderEngine::find_blocks`]. Encodes everything
 /// the connector needs without exposing handle internals.
 #[derive(Debug)]
@@ -183,6 +227,12 @@ pub enum ActionFailure {
     AllBlocks,
     /// Named G1 block ids failed.
     Partial { block_ids: Vec<usize> },
+    /// One logical resource failed, optionally with concrete G1 source block
+    /// ids for offload or G1 destination block ids for onboard.
+    Resource {
+        resource: kvbm_common::LogicalResourceId,
+        block_ids: Option<Vec<usize>>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -227,6 +277,9 @@ pub enum LeaderEngineError {
     /// A resource-batched restore request is structurally invalid.
     #[error("invalid resource onboard: {reason}")]
     InvalidResourceOnboard { reason: String },
+    /// A bundle plan is structurally inconsistent with its manifest identity.
+    #[error("invalid bundle transfer: {reason}")]
+    InvalidBundleTransfer { reason: String },
     /// `onboard_blocks` routed to a local search whose pin is no longer live.
     #[error("search not matched (pin lost or still pending)")]
     SearchNotMatched,

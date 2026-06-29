@@ -3,6 +3,22 @@
 
 //! Atomic multi-resource cache-bundle ownership.
 
+mod barrier;
+#[allow(
+    dead_code,
+    reason = "phase K1 defines capsule copy descriptors before the vLLM integration wires them in K4"
+)]
+mod capsule;
+mod offload;
+mod onboard;
+
+#[cfg(test)]
+mod integration_tests;
+#[cfg(test)]
+mod test_support;
+
+pub(super) use offload::{BundleOffload, OffloadTransition};
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use kvbm_common::{LogicalResourceId, SequenceHash};
@@ -21,7 +37,9 @@ struct CommittedBundle<P> {
 
 /// All-resource lease returned by one bundle lookup.
 pub(super) struct BundleLease<P> {
+    #[allow(dead_code, reason = "phase K3 consumes the matched bundle key")]
     key: BundleKey,
+    #[allow(dead_code, reason = "phase K3 exposes the matched bundle generation")]
     generation: u64,
     resources: BTreeMap<LogicalResourceId, P>,
 }
@@ -69,6 +87,18 @@ impl<P> BundleIndex<P> {
             return Err(BundleIndexError::MissingResources { resources: missing });
         }
 
+        if let Some(current) = self.committed.get(&key) {
+            if current.generation > generation {
+                return Err(BundleIndexError::StaleGeneration {
+                    current: current.generation,
+                    attempted: generation,
+                });
+            }
+            if current.generation == generation {
+                return Ok(());
+            }
+        }
+
         self.committed.insert(
             key,
             CommittedBundle {
@@ -81,8 +111,24 @@ impl<P> BundleIndex<P> {
 }
 
 impl<P: Clone> BundleIndex<P> {
+    pub(super) fn lease_exact(
+        &self,
+        identity: &CacheIdentity,
+        key: &BundleKey,
+    ) -> Option<BundleLease<P>> {
+        if !key.is_compatible_with(identity) {
+            return None;
+        }
+        self.committed.get(key).map(|bundle| BundleLease {
+            key: *key,
+            generation: bundle.generation,
+            resources: bundle.resources.clone(),
+        })
+    }
+
     /// Return the greatest complete candidate boundary and clone every
     /// resource pin atomically into the resulting lease.
+    #[allow(dead_code, reason = "phase K3 wires bundle-wide prefix discovery")]
     pub(super) fn find_longest(
         &self,
         identity: &CacheIdentity,
@@ -102,16 +148,23 @@ impl<P: Clone> BundleIndex<P> {
 }
 
 impl<P> BundleLease<P> {
+    #[cfg(test)]
     pub(super) const fn key(&self) -> &BundleKey {
         &self.key
     }
 
+    #[cfg(test)]
     pub(super) const fn generation(&self) -> u64 {
         self.generation
     }
 
+    #[cfg(test)]
     pub(super) const fn resources(&self) -> &BTreeMap<LogicalResourceId, P> {
         &self.resources
+    }
+
+    pub(super) fn into_resources(self) -> BTreeMap<LogicalResourceId, P> {
+        self.resources
     }
 }
 
@@ -128,6 +181,8 @@ pub(super) enum BundleIndexError {
     DuplicateResource { resource: LogicalResourceId },
     #[error("bundle is missing required resources {resources:?}")]
     MissingResources { resources: Vec<LogicalResourceId> },
+    #[error("bundle generation {attempted} is older than committed generation {current}")]
+    StaleGeneration { current: u64, attempted: u64 },
 }
 
 #[cfg(test)]

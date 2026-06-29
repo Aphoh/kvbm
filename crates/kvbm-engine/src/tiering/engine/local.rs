@@ -52,18 +52,21 @@ use anyhow::Result;
 use dashmap::DashMap;
 
 use kvbm_protocols::connector::{
-    AcceptId, ActionFailure, ActionId, ActionStatus, EngineWorkerSink, EvictionFence,
-    EvictionOutcome, FenceToken, FindBlocksHandle, FindBlocksOutcome, FindBlocksRequest,
-    LeaderEngine, LeaderEngineError, OffloadHandle, OnboardHandle, RequestOffloadDrain,
-    ResourceOnboard, SearchId, WorkerEngineDriver,
+    AcceptId, ActionFailure, ActionId, ActionStatus, BundleOffloadPlan, BundleOnboardPlan,
+    EngineWorkerSink, EvictionFence, EvictionOutcome, FenceToken, FindBlocksHandle,
+    FindBlocksOutcome, FindBlocksRequest, LeaderEngine, LeaderEngineError, OffloadHandle,
+    OnboardHandle, RequestOffloadDrain, SearchId, WorkerEngineDriver,
 };
 use kvbm_protocols::connector::{BlockId, RequestId, SequenceHash};
 
 use kvbm_logical::blocks::ImmutableBlock;
 
+use super::bundle::BundleIndex;
 use super::driver::{ActionRecord, FenceBarrier};
 use super::inflight::{InflightKey, InflightOnboards};
-use super::offload::{self, BufferedOffload, DisabledOffloadSubmit, OffloadSubmit};
+use super::offload::{
+    self, BufferedOffload, BufferedOffloadCompletion, DisabledOffloadSubmit, OffloadSubmit,
+};
 use super::onboard;
 use super::reconcile::{
     MatchCheckOutcome, OnboardingState, compute_outcome, issue_shard, reconcile_state,
@@ -114,6 +117,8 @@ pub(crate) struct LocalConnectorEngine {
     /// Pairs buffered by `offload`, flushed by `finish_forward_pass` (Decision A:
     /// never enqueue a G1 read mid-forward-pass).
     pub(super) offload_buffer: Mutex<Vec<BufferedOffload>>,
+    /// Only complete, manifest-scoped multi-resource bundles are visible here.
+    pub(super) bundle_index: Mutex<BundleIndex<Vec<ImmutableBlock<G2>>>>,
     /// Requests with at least one offload — the once-only source for
     /// `take_offload_drain` (removal *is* the consume-once guard).
     pub(super) offload_drains: DashMap<RequestId, ()>,
@@ -371,6 +376,7 @@ impl LocalConnectorEngine {
             by_request: DashMap::new(),
             offload_submit,
             offload_buffer: Mutex::new(Vec::new()),
+            bundle_index: Mutex::new(BundleIndex::new()),
             offload_drains: DashMap::new(),
             current_iteration: AtomicUsize::new(0),
             weak_self: weak.clone(),
@@ -662,6 +668,7 @@ impl LocalConnectorEngine {
                 resource,
                 pairs,
                 iteration: self.current_iteration.load(Ordering::Relaxed),
+                completion: BufferedOffloadCompletion::Single,
             });
 
         let me: Arc<dyn LeaderEngine> = self;
@@ -685,6 +692,14 @@ impl LeaderEngine for LocalConnectorEngine {
         pairs: Vec<(SequenceHash, BlockId)>,
     ) -> Result<OffloadHandle, LeaderEngineError> {
         self.buffer_offload(Some(resource), req, pairs)
+    }
+
+    fn offload_bundle(
+        self: Arc<Self>,
+        req: &RequestId,
+        plan: BundleOffloadPlan,
+    ) -> Result<OffloadHandle, LeaderEngineError> {
+        self.start_bundle_offload(req, plan)
     }
 
     fn evict(&self, req: &RequestId) -> EvictionOutcome {
@@ -848,16 +863,22 @@ impl LeaderEngine for LocalConnectorEngine {
         // an unknown or already-released id finds no entry and does nothing (the noop
         // offload path and a second drop are both no-ops).
         //
-        // DEFER if a fence is armed: the action was evicted and its driver has not
-        // reached terminal (`finish_*_action` takes the fence). Removing the record
-        // now would drop the live fence clone and could complete the eviction fence
-        // BEFORE the transfer drains — freeing G1 blocks mid-transfer. Instead flag
-        // `dropped_by_handle` under the per-action guard (serialized against
-        // `finish_*_action`); the driver's terminal then removes the record. Takes
-        // only DashMap guards — lock order dashmap→cell is preserved.
+        // DEFER if a fence/drain is armed or a direct bundle onboard is still
+        // pending. Removing early could complete a fence, fire a drain, or clear
+        // the bundle overlap guard before the transfer drains. Instead flag
+        // `dropped_by_handle` under the per-action guard; the driver's terminal
+        // then removes the record. Legacy actions with no in-flight key retain
+        // the original lock-free status path.
         let defer = {
             if let Some(mut record) = self.actions.get_mut(id) {
-                let armed = record.fence.is_some() || record.drain.is_some();
+                let bundle_pending = record.inflight.is_some()
+                    && record.cell.upgrade().is_some_and(|cell| {
+                        matches!(
+                            *cell.lock().expect("action-status mutex poisoned"),
+                            ActionStatus::Pending
+                        )
+                    });
+                let armed = record.fence.is_some() || record.drain.is_some() || bundle_pending;
                 if armed {
                     record.dropped_by_handle = true;
                 }
@@ -892,98 +913,9 @@ impl LeaderEngine for LocalConnectorEngine {
     fn onboard_resources(
         self: Arc<Self>,
         req: &RequestId,
-        resources: Vec<ResourceOnboard>,
+        plan: BundleOnboardPlan,
     ) -> Result<OnboardHandle, LeaderEngineError> {
-        if resources.is_empty() {
-            return Err(LeaderEngineError::InvalidResourceOnboard {
-                reason: "at least one resource is required".to_owned(),
-            });
-        }
-        let mut seen = std::collections::HashSet::new();
-        for transfer in &resources {
-            if !seen.insert(transfer.resource) {
-                return Err(LeaderEngineError::InvalidResourceOnboard {
-                    reason: format!("duplicate logical resource {:?}", transfer.resource),
-                });
-            }
-            if transfer.source_block_ids.is_empty()
-                || transfer.source_block_ids.len() != transfer.destination_block_ids.len()
-            {
-                return Err(LeaderEngineError::InvalidResourceOnboard {
-                    reason: format!(
-                        "resource {:?} has {} G2 sources and {} G1 destinations",
-                        transfer.resource,
-                        transfer.source_block_ids.len(),
-                        transfer.destination_block_ids.len()
-                    ),
-                });
-            }
-            if self.leader.g2_manager_for(transfer.resource).is_none() {
-                return Err(LeaderEngineError::ResourceOnboardNotConfigured {
-                    resource: transfer.resource,
-                });
-            }
-        }
-
-        let action_id = ActionId::new();
-        let cell = Arc::new(Mutex::new(ActionStatus::Pending));
-        self.actions.insert(
-            action_id,
-            ActionRecord::new(req.clone(), Arc::downgrade(&cell)),
-        );
-        self.by_request
-            .entry(req.clone())
-            .or_default()
-            .push(action_id);
-        let handle_dest_ids = resources
-            .iter()
-            .flat_map(|transfer| transfer.destination_block_ids.iter().copied())
-            .collect::<Vec<_>>();
-        let request_id = req.clone();
-        let driver = Arc::clone(&self);
-        let terminal_dest_ids = handle_dest_ids.clone();
-        self.leader.runtime().spawn(async move {
-            let mut outcome = ActionStatus::Complete;
-            for transfer in resources {
-                let notification = match driver.leader.execute_local_transfer_for_resource(
-                    transfer.resource,
-                    kvbm_common::LogicalLayoutHandle::G2,
-                    kvbm_common::LogicalLayoutHandle::G1,
-                    transfer.source_block_ids,
-                    transfer.destination_block_ids,
-                    kvbm_physical::TransferOptions::default(),
-                ) {
-                    Ok(notification) => notification,
-                    Err(error) => {
-                        tracing::error!(
-                            error = %error,
-                            resource = ?transfer.resource,
-                            "resource onboard dispatch failed"
-                        );
-                        outcome = ActionStatus::Failed(ActionFailure::AllBlocks);
-                        break;
-                    }
-                };
-                if let Err(error) = notification.await {
-                    tracing::error!(
-                        error = %error,
-                        resource = ?transfer.resource,
-                        "resource onboard transfer failed"
-                    );
-                    outcome = ActionStatus::Failed(ActionFailure::AllBlocks);
-                    break;
-                }
-            }
-            driver.finish_load_action(action_id, &request_id, outcome, terminal_dest_ids);
-        });
-
-        let engine: Arc<dyn LeaderEngine> = self;
-        Ok(OnboardHandle::new(
-            action_id,
-            Arc::downgrade(&engine),
-            cell,
-            handle_dest_ids,
-        ))
+        self.start_bundle_onboard(req, plan)
     }
 
     fn release_prefill_session(&self, request_id: &RequestId, accept_id: AcceptId) {
@@ -1911,12 +1843,18 @@ impl LocalConnectorEngine {
         let precondition = event.as_ref().map(|ev| ev.handle());
 
         for b in buffered {
-            let blocks = offload::build_external_blocks(&b.pairs);
-            let action_id = b.action_id;
-            let request_id = b.request_id;
+            let BufferedOffload {
+                action_id,
+                request_id,
+                resource,
+                pairs,
+                completion,
+                ..
+            } = b;
+            let blocks = offload::build_external_blocks(&pairs);
             match self
                 .offload_submit
-                .submit_g1_to_g2(b.resource, blocks, precondition)
+                .submit_g1_to_g2(resource, blocks, precondition)
             {
                 Ok(transfer) => {
                     let driver = this.clone();
@@ -1925,7 +1863,14 @@ impl LocalConnectorEngine {
                         // Write terminal into the cell + notify with no engine
                         // lock held (per-action terminal flips the cell only —
                         // `mark_save_finished` is drain-driven).
-                        driver.finish_save_action(action_id, &request_id, outcome);
+                        driver.finish_offload_child(
+                            action_id,
+                            &request_id,
+                            resource,
+                            pairs,
+                            completion,
+                            outcome,
+                        );
                     });
                 }
                 Err(e) => {
@@ -1934,9 +1879,12 @@ impl LocalConnectorEngine {
                         %request_id,
                         "offload submit failed; marking action Failed(AllBlocks)"
                     );
-                    this.finish_save_action(
+                    this.finish_offload_child(
                         action_id,
                         &request_id,
+                        resource,
+                        pairs,
+                        completion,
                         ActionStatus::Failed(ActionFailure::AllBlocks),
                     );
                 }
@@ -1998,7 +1946,7 @@ mod tests {
     };
     use crate::offload::{ExternalBlock, TransferStatus};
     use kvbm_protocols::connector::NoopWorkerSink;
-    use kvbm_protocols::connector::{LoadOutcome, ResourceOnboard, SaveOutcome};
+    use kvbm_protocols::connector::{LoadOutcome, SaveOutcome};
     use std::sync::Mutex as StdMutex;
     use tokio::sync::{Mutex as TokioMutex, watch};
     use uuid::Uuid;
@@ -3279,32 +3227,6 @@ mod tests {
     }
 
     // ----- offload tests -----
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn resource_batched_onboard_mints_one_request_action() -> Result<()> {
-        let leader = Arc::new(build_test_leader().await?);
-        let engine = LocalConnectorEngine::new(leader, RecordingSink::new(), BS, true);
-
-        let onboard = engine
-            .clone()
-            .onboard_resources(
-                &"resource-restore".into(),
-                vec![ResourceOnboard {
-                    resource: kvbm_common::LogicalResourceId::default(),
-                    source_block_ids: vec![0],
-                    destination_block_ids: vec![5],
-                }],
-            )
-            .unwrap();
-
-        wait_complete(&onboard).await;
-        assert_eq!(
-            onboard.outcome(),
-            Some(LoadOutcome::FailedPartial { block_ids: vec![5] }),
-            "the test leader has no physical worker, but the resource action must run to terminal"
-        );
-        Ok(())
-    }
 
     /// The highest-value test: `(SequenceHash, BlockId)` pairs map to
     /// `ExternalBlock::new(block_id, sequence_hash)` — REVERSED. A naive splat

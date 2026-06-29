@@ -18,7 +18,9 @@
 //! engine lock held (see [`super::driver::LocalConnectorEngine::finish_save_action`]).
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use futures::future::BoxFuture;
@@ -28,8 +30,91 @@ use velo::EventHandle;
 use kvbm_protocols::connector::{ActionFailure, ActionId, ActionStatus};
 use kvbm_protocols::connector::{BlockId, RequestId, SequenceHash};
 
-use crate::G1;
 use crate::offload::{ExternalBlock, OffloadEngine, TransferHandle, TransferStatus};
+use crate::{G1, G2};
+use kvbm_logical::blocks::ImmutableBlock;
+
+use super::bundle::{BundleOffload, OffloadTransition};
+use super::local::LocalConnectorEngine;
+
+pub(super) type LocalBundleOffload =
+    BundleOffload<Vec<(SequenceHash, BlockId)>, Vec<ImmutableBlock<G2>>>;
+
+pub(super) enum BufferedOffloadCompletion {
+    Single,
+    Bundle(Arc<BundleOffloadRuntime>),
+}
+
+pub(super) struct BundleOffloadRuntime {
+    transaction: Mutex<LocalBundleOffload>,
+    drain: BundleChildDrain,
+}
+
+impl BundleOffloadRuntime {
+    pub(super) fn new(transaction: LocalBundleOffload, child_count: NonZeroUsize) -> Self {
+        Self {
+            transaction: Mutex::new(transaction),
+            drain: BundleChildDrain::new(child_count),
+        }
+    }
+
+    fn transaction(&self) -> std::sync::MutexGuard<'_, LocalBundleOffload> {
+        self.transaction
+            .lock()
+            .expect("bundle-offload mutex poisoned")
+    }
+
+    fn finish_child(&self, terminal: Option<ActionStatus>) -> Option<ActionStatus> {
+        self.drain.finish_child(terminal)
+    }
+}
+
+struct BundleChildDrain {
+    remaining: AtomicUsize,
+    terminal: Mutex<Option<ActionStatus>>,
+}
+
+impl BundleChildDrain {
+    fn new(child_count: NonZeroUsize) -> Self {
+        Self {
+            remaining: AtomicUsize::new(child_count.get()),
+            terminal: Mutex::new(None),
+        }
+    }
+
+    fn finish_child(&self, candidate: Option<ActionStatus>) -> Option<ActionStatus> {
+        if let Some(candidate) = candidate {
+            let mut terminal = self
+                .terminal
+                .lock()
+                .expect("bundle-child-drain mutex poisoned");
+            let replace = terminal.is_none()
+                || matches!(
+                    (&*terminal, &candidate),
+                    (Some(ActionStatus::Complete), ActionStatus::Failed(_))
+                );
+            if replace {
+                *terminal = Some(candidate);
+            }
+        }
+        let previous = self
+            .remaining
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .ok()?;
+        if previous != 1 {
+            return None;
+        }
+        Some(
+            self.terminal
+                .lock()
+                .expect("bundle-child-drain mutex poisoned")
+                .take()
+                .unwrap_or(ActionStatus::Failed(ActionFailure::AllBlocks)),
+        )
+    }
+}
 
 /// One offload buffered by `offload`, flushed at `finish_forward_pass`.
 ///
@@ -47,6 +132,7 @@ pub(super) struct BufferedOffload {
     pub(super) resource: Option<LogicalResourceId>,
     pub(super) pairs: Vec<(SequenceHash, BlockId)>,
     pub(super) iteration: usize,
+    pub(super) completion: BufferedOffloadCompletion,
 }
 
 /// The offload-submission seam over [`OffloadEngine`].
@@ -255,4 +341,112 @@ pub(super) fn project_offload_status(
 pub(super) async fn run_offload(transfer: Box<dyn OffloadTransfer>) -> ActionStatus {
     transfer.wait_terminal().await;
     project_offload_status(transfer.status(), transfer.failed_blocks())
+}
+
+impl LocalConnectorEngine {
+    pub(super) fn finish_offload_child(
+        &self,
+        action_id: ActionId,
+        request_id: &RequestId,
+        resource: Option<LogicalResourceId>,
+        pairs: Vec<(SequenceHash, BlockId)>,
+        completion: BufferedOffloadCompletion,
+        outcome: ActionStatus,
+    ) {
+        let BufferedOffloadCompletion::Bundle(runtime) = completion else {
+            self.finish_save_action(action_id, request_id, outcome);
+            return;
+        };
+        let Some(resource) = resource else {
+            if let Some(outcome) =
+                runtime.finish_child(Some(ActionStatus::Failed(ActionFailure::AllBlocks)))
+            {
+                self.finish_save_action(action_id, request_id, outcome);
+            }
+            return;
+        };
+
+        let completion = match outcome {
+            ActionStatus::Complete => {
+                let hashes = pairs.iter().map(|(hash, _)| *hash).collect::<Vec<_>>();
+                let pins = self
+                    .leader
+                    .g2_manager_for(resource)
+                    .map(|manager| manager.match_blocks(&hashes))
+                    .unwrap_or_default();
+                if pins.len() == hashes.len() {
+                    Ok(pins)
+                } else {
+                    Err(Some(pairs.iter().map(|(_, block_id)| *block_id).collect()))
+                }
+            }
+            ActionStatus::Failed(ActionFailure::Partial { block_ids }) => Err(Some(block_ids)),
+            ActionStatus::Failed(ActionFailure::Resource { block_ids, .. }) => Err(block_ids),
+            ActionStatus::Failed(ActionFailure::AllBlocks) | ActionStatus::Pending => Err(None),
+        };
+        let transition = {
+            let mut transaction = runtime.transaction();
+            match completion {
+                Ok(pins) => transaction.complete(resource, Ok(pins)),
+                Err(failed_blocks) => transaction.fail(resource, failed_blocks),
+            }
+        };
+
+        let terminal = match transition {
+            Ok(OffloadTransition::Pending | OffloadTransition::Settled(_)) => None,
+            Ok(OffloadTransition::Abort(abort)) => {
+                Some(ActionStatus::Failed(ActionFailure::Resource {
+                    resource: abort.failure().resource(),
+                    block_ids: abort.failure().failed_blocks().map(<[usize]>::to_vec),
+                }))
+            }
+            Ok(OffloadTransition::Commit(commit)) => {
+                let (publication, _retained_sources) = commit.into_publication();
+                let published = publication
+                    .commit_into(
+                        &mut self
+                            .bundle_index
+                            .lock()
+                            .expect("bundle-index mutex poisoned"),
+                    )
+                    .is_ok();
+                Some(if published {
+                    ActionStatus::Complete
+                } else {
+                    ActionStatus::Failed(ActionFailure::AllBlocks)
+                })
+            }
+            Err(error) => {
+                tracing::error!(%error, ?resource, "bundle offload completion fold failed");
+                Some(ActionStatus::Failed(ActionFailure::Resource {
+                    resource,
+                    block_ids: None,
+                }))
+            }
+        };
+        if let Some(outcome) = runtime.finish_child(terminal) {
+            self.finish_save_action(action_id, request_id, outcome);
+        }
+    }
+}
+
+#[cfg(test)]
+mod bundle_drain_tests {
+    use super::BundleChildDrain;
+    use kvbm_common::LogicalResourceId;
+    use kvbm_protocols::connector::{ActionFailure, ActionStatus};
+    use std::num::NonZeroUsize;
+
+    #[test]
+    fn failed_child_waits_for_every_sibling_before_parent_terminal() {
+        let drain = BundleChildDrain::new(NonZeroUsize::new(3).unwrap());
+        let failure = ActionStatus::Failed(ActionFailure::Resource {
+            resource: LogicalResourceId(7),
+            block_ids: None,
+        });
+
+        assert_eq!(drain.finish_child(Some(failure.clone())), None);
+        assert_eq!(drain.finish_child(None), None);
+        assert_eq!(drain.finish_child(None), Some(failure));
+    }
 }
