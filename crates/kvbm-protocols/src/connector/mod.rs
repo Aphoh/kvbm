@@ -35,7 +35,7 @@ pub use handles::{
 };
 pub use noop::{NoopBlockEngine, NoopWorkerSink};
 pub use protocol::{
-    AcceptId, ActionFailure, ActionId, ActionStatus, BlockId, EvictionFence, EvictionOutcome,
-    FenceToken, FindBlocksOutcome, FindBlocksRequest, FinishedStatus, LeaderEngineError, RequestId,
-    ResourceOnboard, SearchId, SequenceHash, WorkerRank,
+    AcceptId, ActionFailure, ActionId, ActionStatus, BlockId, CacheScope, EvictionFence,
+    EvictionOutcome, FenceToken, FindBlocksOutcome, FindBlocksRequest, FinishedStatus,
+    LeaderEngineError, RequestId, ResourceOnboard, SearchId, SequenceHash, WorkerRank,
 };

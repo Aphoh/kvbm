@@ -21,8 +21,8 @@ use std::sync::Arc;
 
 use kvbm_common::{BlockId, SequenceHash};
 use kvbm_protocols::connector::{
-    EvictionFence, FindBlocksOutcome, FindBlocksRequest, FinishedStatus as EngineFinishedStatus,
-    LeaderEngine, OnboardHandle,
+    CacheScope, EvictionFence, FindBlocksOutcome, FindBlocksRequest,
+    FinishedStatus as EngineFinishedStatus, LeaderEngine, OnboardHandle,
 };
 use prometheus::IntCounter;
 
@@ -175,6 +175,7 @@ impl LeaderState {
         };
         let request = FindBlocksRequest {
             request_id: request_id.to_string(),
+            cache: CacheScope::LegacyPrimary,
             sequence_hashes: slot.sequence_hashes(),
             num_computed_tokens,
             total_tokens: slot.total_tokens(),

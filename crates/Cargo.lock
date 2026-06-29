@@ -2780,6 +2780,7 @@ name = "kvbm-protocols"
 version = "1.2.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "bytes",
  "dynamo-tokens",
  "kvbm-common",

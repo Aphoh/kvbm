@@ -19,6 +19,7 @@
 //!   envelope, per-module request/response types, the `ModuleId` registry,
 //!   and (with `--features client`) the `LeaderControlClient`.
 
+pub mod cache_manifest;
 pub mod connector;
 pub mod control;
 pub mod disagg;

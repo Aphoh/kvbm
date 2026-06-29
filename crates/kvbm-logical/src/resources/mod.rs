@@ -70,6 +70,7 @@ pub struct DuplicateLogicalResource {
 #[cfg(test)]
 mod tests {
     use super::{BlockManagerSet, LogicalResourceId};
+    use crate::manager::BlockManagerConfigBuilder;
     use crate::{BlockManager, BlockRegistry};
     use std::sync::Arc;
 
@@ -77,15 +78,18 @@ mod tests {
     struct G2;
 
     fn manager(blocks: usize) -> Arc<BlockManager<G2>> {
-        Arc::new(
-            BlockManager::builder()
-                .block_count(blocks)
-                .block_size(4)
-                .registry(BlockRegistry::new())
-                .with_lru_backend()
-                .build()
-                .unwrap(),
-        )
+        manager_with_backend(blocks, BlockManagerConfigBuilder::with_lru_backend)
+    }
+
+    fn manager_with_backend(
+        blocks: usize,
+        configure: impl FnOnce(BlockManagerConfigBuilder<G2>) -> BlockManagerConfigBuilder<G2>,
+    ) -> Arc<BlockManager<G2>> {
+        let builder = BlockManager::builder()
+            .block_count(blocks)
+            .block_size(4)
+            .registry(BlockRegistry::new());
+        Arc::new(configure(builder).build().unwrap())
     }
 
     #[test]
@@ -113,5 +117,19 @@ mod tests {
         set.insert(LogicalResourceId(3), manager(4)).unwrap();
         let error = set.insert(LogicalResourceId(3), manager(8)).unwrap_err();
         assert_eq!(error.resource, LogicalResourceId(3));
+    }
+
+    #[test]
+    fn owns_managers_with_independent_inactive_backends() {
+        let lru = manager_with_backend(4, BlockManagerConfigBuilder::with_lru_backend);
+        let lineage = manager_with_backend(8, BlockManagerConfigBuilder::with_lineage_backend);
+        let mut set = BlockManagerSet::new();
+
+        set.insert(LogicalResourceId(1), Arc::clone(&lru)).unwrap();
+        set.insert(LogicalResourceId(2), Arc::clone(&lineage))
+            .unwrap();
+
+        assert_eq!(set.get(LogicalResourceId(1)).unwrap().id(), lru.id());
+        assert_eq!(set.get(LogicalResourceId(2)).unwrap().id(), lineage.id());
     }
 }

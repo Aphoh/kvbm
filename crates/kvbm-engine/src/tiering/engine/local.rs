@@ -2961,6 +2961,7 @@ mod tests {
     fn fb(request_id: &str, hashes: Vec<SequenceHash>, total_tokens: usize) -> FindBlocksRequest {
         FindBlocksRequest {
             request_id: request_id.to_string(),
+            cache: kvbm_protocols::connector::CacheScope::LegacyPrimary,
             sequence_hashes: Arc::from(hashes),
             num_computed_tokens: 0,
             total_tokens,
@@ -9063,6 +9064,7 @@ mod tests {
         ) -> FindBlocksRequest {
             FindBlocksRequest {
                 request_id: request_id.to_string(),
+                cache: kvbm_protocols::connector::CacheScope::LegacyPrimary,
                 sequence_hashes: Arc::from(sequence_hashes),
                 num_computed_tokens,
                 total_tokens,
@@ -9084,6 +9086,7 @@ mod tests {
             params.num_provided_tokens = provided_tokens;
             FindBlocksRequest {
                 request_id: "rq".to_string(),
+                cache: kvbm_protocols::connector::CacheScope::LegacyPrimary,
                 sequence_hashes: Arc::from(plhs.to_vec()),
                 num_computed_tokens: computed_tokens,
                 total_tokens,

@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub use crate::cache_manifest::CacheScope;
 use crate::disagg::TransferParams;
 
 use super::handles::FindBlocksHandle;
@@ -121,6 +122,8 @@ impl FenceToken {
 #[derive(Debug, Clone)]
 pub struct FindBlocksRequest {
     pub request_id: RequestId,
+    /// Explicit legacy-primary or manifest-scoped cache contract.
+    pub cache: CacheScope,
     /// Full per-block hash chain in absolute-position order.
     pub sequence_hashes: Arc<[SequenceHash]>,
     /// vLLM's `num_computed_tokens` at this poll.

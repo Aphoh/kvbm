@@ -18,6 +18,9 @@ use std::sync::{Arc, Mutex};
 
 use kvbm_common::LogicalResourceId;
 
+use crate::cache_manifest::{
+    CacheManifest, CacheScope, ModelIdentity, ResourceRequirement, ResourceRole,
+};
 use crate::disagg::RemotePrefillParams;
 
 use super::actions::{EngineWorkerSink, WorkerEngineDriver};
@@ -186,6 +189,7 @@ fn worker_delegates_are_object_safe() {
 fn find_blocks_req(id: &str) -> FindBlocksRequest {
     FindBlocksRequest {
         request_id: id.to_string(),
+        cache: CacheScope::LegacyPrimary,
         sequence_hashes: Arc::from([]),
         num_computed_tokens: 0,
         total_tokens: 0,
@@ -254,6 +258,17 @@ fn legacy_engine_rejects_resource_batched_onboard() {
 #[test]
 fn find_blocks_request_carries_chain_counts_and_transfer_params() {
     let params = RemotePrefillParams::new(uuid::Uuid::new_v4(), uuid::Uuid::new_v4().into());
+    let manifest = CacheManifest::new(
+        ModelIdentity::new("test-model", "revision-a", [3; 32]).unwrap(),
+        "test-cache-v1",
+        vec![
+            ResourceRequirement::new(LogicalResourceId(4), ResourceRole::PrefixHistory, 16)
+                .unwrap(),
+        ],
+        Default::default(),
+    )
+    .unwrap();
+    let cache_identity = manifest.identity();
     let chain: Arc<[super::protocol::SequenceHash]> = Arc::from([
         super::protocol::SequenceHash::default(),
         super::protocol::SequenceHash::default(),
@@ -261,6 +276,7 @@ fn find_blocks_request_carries_chain_counts_and_transfer_params() {
     ]);
     let req = FindBlocksRequest {
         request_id: "r1".to_string(),
+        cache: CacheScope::Manifest(cache_identity.clone()),
         sequence_hashes: Arc::clone(&chain),
         num_computed_tokens: 16,
         total_tokens: 48,
@@ -269,6 +285,7 @@ fn find_blocks_request_carries_chain_counts_and_transfer_params() {
     assert_eq!(req.sequence_hashes.len(), 3);
     assert_eq!(req.num_computed_tokens, 16);
     assert_eq!(req.total_tokens, 48);
+    assert_eq!(req.cache.identity(), Some(&cache_identity));
     assert!(
         req.transfer_params
             .as_ref()
@@ -281,6 +298,7 @@ fn find_blocks_request_carries_chain_counts_and_transfer_params() {
     );
     // Plain-local construction carries no params.
     assert!(find_blocks_req("r2").transfer_params.is_none());
+    assert!(find_blocks_req("r2").cache.identity().is_none());
 }
 
 /// The three outcome variants construct and pattern-match with the fields the

@@ -494,6 +494,7 @@ mod tests {
     ) -> FindBlocksRequest {
         FindBlocksRequest {
             request_id: "rq".to_string(),
+            cache: kvbm_protocols::connector::CacheScope::LegacyPrimary,
             sequence_hashes: Arc::from(sequence_hashes),
             num_computed_tokens,
             total_tokens,
