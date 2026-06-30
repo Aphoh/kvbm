@@ -57,7 +57,7 @@ use kvbm_protocols::connector::{
     AcceptId, ActionFailure, ActionId, ActionStatus, BundleOffloadPlan, BundleOnboardPlan,
     EngineWorkerSink, EvictionFence, EvictionOutcome, FenceToken, FindBlocksHandle,
     FindBlocksOutcome, FindBlocksRequest, LeaderEngine, LeaderEngineError, OffloadHandle,
-    OnboardHandle, RequestOffloadDrain, SearchId, WorkerEngineDriver,
+    OnboardHandle, RequestOffloadDrain, ResourceOnboard, SearchId, WorkerEngineDriver,
 };
 use kvbm_protocols::connector::{BlockId, RequestId, SequenceHash};
 
@@ -1007,6 +1007,14 @@ impl LeaderEngine for LocalConnectorEngine {
         plan: BundleOnboardPlan,
     ) -> Result<OnboardHandle, LeaderEngineError> {
         self.start_bundle_onboard(req, plan)
+    }
+
+    fn onboard_resource_blocks(
+        self: Arc<Self>,
+        req: &RequestId,
+        resources: Vec<ResourceOnboard>,
+    ) -> Result<OnboardHandle, LeaderEngineError> {
+        self.start_resource_onboard(req, resources)
     }
 
     fn onboard_bundle(

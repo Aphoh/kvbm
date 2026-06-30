@@ -18,7 +18,7 @@ use kvbm_protocols::cache_manifest::{
 };
 use kvbm_protocols::connector::{
     BundleOffloadPlan, CacheScope, FindBlocksOutcome, FindBlocksRequest, LeaderEngine, LoadOutcome,
-    OffloadMode, ResourceDestination, ResourceOffload, SaveOutcome,
+    OffloadMode, ResourceDestination, ResourceOffload, ResourceOnboard, SaveOutcome,
 };
 
 use super::super::local::LocalConnectorEngine;
@@ -456,6 +456,33 @@ async fn bundle_offload_rejects_incomplete_or_wrong_lineage_children() -> Result
         Err(kvbm_protocols::connector::LeaderEngineError::InvalidBundleTransfer { .. })
     ));
     assert!(engine.offload_buffer.lock().unwrap().is_empty());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_same_request_resource_restore_does_not_require_a_bundle_identity() -> Result<()> {
+    let (leader, _) = build_resource_test_leader().await?;
+    let engine = LocalConnectorEngine::new(
+        Arc::new(leader),
+        kvbm_protocols::connector::NoopWorkerSink::new(),
+        BLOCK_SIZE,
+        false,
+    );
+    let resources = RESOURCES
+        .into_iter()
+        .enumerate()
+        .map(|(index, resource)| ResourceOnboard {
+            resource,
+            source_block_ids: vec![index],
+            destination_block_ids: vec![100 + index],
+        })
+        .collect();
+
+    let onboard = engine
+        .clone()
+        .onboard_resource_blocks(&"same-request".to_owned(), resources)?;
+    wait_until(|| onboard.is_complete()).await;
+    assert_eq!(onboard.outcome(), Some(LoadOutcome::Done));
     Ok(())
 }
 

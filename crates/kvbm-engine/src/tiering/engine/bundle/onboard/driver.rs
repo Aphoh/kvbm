@@ -85,6 +85,49 @@ impl LocalConnectorEngine {
         self.start_bundle_onboard_with_sources(&request_id, plan, source_leases, inflight_hashes)
     }
 
+    pub(in crate::tiering::engine) fn start_resource_onboard(
+        self: Arc<Self>,
+        req: &RequestId,
+        resources: Vec<ResourceOnboard>,
+    ) -> Result<OnboardHandle, LeaderEngineError> {
+        if resources.is_empty() {
+            return Err(LeaderEngineError::InvalidResourceOnboard {
+                reason: "at least one resource is required".to_owned(),
+            });
+        }
+        validate_resource_transfers(self.as_ref(), &resources)?;
+        let action_id = ActionId::new();
+        let cell = Arc::new(Mutex::new(ActionStatus::Pending));
+        self.actions.insert(
+            action_id,
+            ActionRecord::new(req.clone(), Arc::downgrade(&cell)),
+        );
+        self.by_request
+            .entry(req.clone())
+            .or_default()
+            .push(action_id);
+        let destination_block_ids = resources
+            .iter()
+            .flat_map(|transfer| transfer.destination_block_ids.iter().copied())
+            .collect::<Vec<_>>();
+        let request_id = req.clone();
+        let driver = Arc::clone(&self);
+        let terminal_block_ids = destination_block_ids.clone();
+        self.leader.runtime().spawn(async move {
+            let (dispatch_failure, completed) = driver.execute_resource_onboards(resources).await;
+            let outcome = fold_resource_onboard(dispatch_failure, completed);
+            driver.finish_load_action(action_id, &request_id, outcome, terminal_block_ids);
+        });
+
+        let engine: Arc<dyn LeaderEngine> = self;
+        Ok(OnboardHandle::new(
+            action_id,
+            Arc::downgrade(&engine),
+            cell,
+            destination_block_ids,
+        ))
+    }
+
     fn start_bundle_onboard_with_sources(
         self: Arc<Self>,
         req: &RequestId,
@@ -184,6 +227,14 @@ impl LocalConnectorEngine {
         resources: Vec<ResourceOnboard>,
         transaction: BundleOnboardTransaction,
     ) -> ActionStatus {
+        let (dispatch_failure, completed) = self.execute_resource_onboards(resources).await;
+        fold_bundle_onboard(transaction, dispatch_failure, completed)
+    }
+
+    async fn execute_resource_onboards(
+        &self,
+        resources: Vec<ResourceOnboard>,
+    ) -> (Option<DispatchFailure>, Vec<CompletedResource>) {
         let batch = self.dispatch_bundle_onboard(resources);
         let completed =
             futures::future::join_all(batch.transfers.into_iter().map(|dispatched| async move {
@@ -194,7 +245,7 @@ impl LocalConnectorEngine {
                 }
             }))
             .await;
-        fold_bundle_onboard(transaction, batch.failure, completed)
+        (batch.failure, completed)
     }
 
     fn dispatch_bundle_onboard(&self, resources: Vec<ResourceOnboard>) -> DispatchBatch {
@@ -234,6 +285,32 @@ impl LocalConnectorEngine {
             failure: None,
         }
     }
+}
+
+fn fold_resource_onboard(
+    dispatch_failure: Option<DispatchFailure>,
+    completed: Vec<CompletedResource>,
+) -> ActionStatus {
+    if let Some(failure) = dispatch_failure {
+        return ActionStatus::Failed(ActionFailure::Resource {
+            resource: failure.resource,
+            block_ids: Some(failure.destination_block_ids),
+        });
+    }
+    for completed in completed {
+        if let Err(error) = completed.result {
+            tracing::error!(
+                %error,
+                resource = ?completed.resource,
+                "same-request resource onboard transfer failed"
+            );
+            return ActionStatus::Failed(ActionFailure::Resource {
+                resource: completed.resource,
+                block_ids: Some(completed.destination_block_ids),
+            });
+        }
+    }
+    ActionStatus::Complete
 }
 
 fn searched_bundle_plan(

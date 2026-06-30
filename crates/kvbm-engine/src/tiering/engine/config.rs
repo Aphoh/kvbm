@@ -28,7 +28,8 @@ use crate::tiering::policy::ResourcePolicies;
 /// Construction config for the in-process connector engine.
 ///
 /// No `Default`: `block_size` has no sane default, so an engine configured by
-/// omission would be a silent misconfiguration. Callers must name both fields.
+/// omission would be a silent misconfiguration. Callers must name the layout,
+/// remote capabilities, and resource policies explicitly.
 #[derive(Clone, Debug)]
 pub struct ConnectorEngineConfig {
     /// Layout block size, carried here because `InstanceLeader` exposes no

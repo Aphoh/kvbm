@@ -20,7 +20,8 @@ use kvbm_common::LogicalResourceId;
 use super::handles::{FindBlocksHandle, OffloadHandle, OnboardHandle, RequestOffloadDrain};
 use super::protocol::{
     AcceptId, ActionId, ActionStatus, BundleOffloadPlan, BundleOnboardPlan, EvictionOutcome,
-    FindBlocksOutcome, FindBlocksRequest, LeaderEngineError, ResourceDestination, SearchId,
+    FindBlocksOutcome, FindBlocksRequest, LeaderEngineError, ResourceDestination, ResourceOnboard,
+    SearchId,
 };
 use super::protocol::{BlockId, RequestId, SequenceHash};
 
@@ -131,6 +132,26 @@ pub trait LeaderEngine: Send + Sync + 'static {
     ) -> Result<OnboardHandle, LeaderEngineError> {
         let Some(first) = plan.resources.first() else {
             return Err(LeaderEngineError::InvalidBundleTransfer {
+                reason: "at least one resource is required".to_owned(),
+            });
+        };
+        let _ = req;
+        Err(LeaderEngineError::ResourceOnboardNotConfigured {
+            resource: first.resource,
+        })
+    }
+
+    /// Restore explicit G2 blocks for one existing request without publishing
+    /// or consuming a cross-request bundle identity. This compatibility seam
+    /// is for same-request suspension/resume ownership; reusable prefix hits
+    /// must use [`Self::onboard_bundle`] or [`Self::onboard_resources`].
+    fn onboard_resource_blocks(
+        self: Arc<Self>,
+        req: &RequestId,
+        resources: Vec<ResourceOnboard>,
+    ) -> Result<OnboardHandle, LeaderEngineError> {
+        let Some(first) = resources.first() else {
+            return Err(LeaderEngineError::InvalidResourceOnboard {
                 reason: "at least one resource is required".to_owned(),
             });
         };
