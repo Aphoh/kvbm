@@ -14,20 +14,25 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use kvbm_logical::SequenceHash;
+use kvbm_protocols::cache_manifest::RegistrationEpoch;
 use velo::Messenger;
 use velo_ext::InstanceId;
 
 use super::protocol::{
     BUNDLE_INVALIDATE_HANDLER, BUNDLE_PUBLISH_HANDLER, BUNDLE_QUERY_HANDLER,
-    BundleInvalidateRequest, BundlePublishRequest, BundleQueryOutcome, BundleQueryRequest,
-    FindBlocksHit, QUERY_HANDLER, QueryRequest,
+    BundleAdvertisementRecord, BundleInvalidateRequest, BundleInvalidationRecord,
+    BundlePublishRequest, BundleQueryOutcome, BundleQueryRequest, FindBlocksHit, QUERY_HANDLER,
+    QueryRequest,
 };
+use crate::protocol::MutationCredential;
 
 /// Velo-plane lookup client for the hub's KV block index.
 pub struct IndexerLookupClient {
     messenger: Arc<Messenger>,
     /// Hub's velo `InstanceId` — the target of the lookup unary RPC.
     hub_velo_id: InstanceId,
+    mutation_credential: MutationCredential,
+    registration_epoch: RegistrationEpoch,
 }
 
 impl std::fmt::Debug for IndexerLookupClient {
@@ -40,10 +45,17 @@ impl std::fmt::Debug for IndexerLookupClient {
 
 impl IndexerLookupClient {
     /// Wrap a [`Messenger`] targeting the hub at `hub_velo_id`.
-    pub fn new(messenger: Arc<Messenger>, hub_velo_id: InstanceId) -> Arc<Self> {
+    pub(crate) fn new(
+        messenger: Arc<Messenger>,
+        hub_velo_id: InstanceId,
+        mutation_credential: MutationCredential,
+        registration_epoch: RegistrationEpoch,
+    ) -> Arc<Self> {
         Arc::new(Self {
             messenger,
             hub_velo_id,
+            mutation_credential,
+            registration_epoch,
         })
     }
 
@@ -72,7 +84,12 @@ impl IndexerLookupClient {
         Ok(hit)
     }
 
-    pub async fn publish_bundle(&self, request: BundlePublishRequest) -> Result<()> {
+    pub async fn publish_bundle(&self, advertisement: BundleAdvertisementRecord) -> Result<()> {
+        validate_registration_epoch(advertisement.registration_epoch, self.registration_epoch)?;
+        let request = BundlePublishRequest {
+            credential: self.mutation_credential.clone(),
+            advertisement,
+        };
         self.messenger
             .typed_unary::<()>(BUNDLE_PUBLISH_HANDLER)?
             .payload(&request)?
@@ -82,7 +99,14 @@ impl IndexerLookupClient {
         Ok(())
     }
 
-    pub async fn invalidate_bundle(&self, request: BundleInvalidateRequest) -> Result<bool> {
+    pub async fn invalidate_bundle(&self, invalidation: BundleInvalidationRecord) -> Result<bool> {
+        let request = BundleInvalidateRequest {
+            credential: self.mutation_credential.clone(),
+            key: invalidation.key,
+            generation: invalidation.generation,
+            owner: invalidation.owner,
+            retain_until_unix_ms: invalidation.retain_until_unix_ms,
+        };
         self.messenger
             .typed_unary::<bool>(BUNDLE_INVALIDATE_HANDLER)?
             .payload(&request)?
@@ -98,5 +122,30 @@ impl IndexerLookupClient {
             .instance(self.hub_velo_id)
             .send()
             .await
+    }
+}
+
+fn validate_registration_epoch(
+    advertised: Option<RegistrationEpoch>,
+    registered: RegistrationEpoch,
+) -> Result<()> {
+    anyhow::ensure!(
+        advertised == Some(registered),
+        "bundle advertisement registration epoch does not match the indexer client registration"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bundle_publication_rejects_missing_or_mismatched_registration_epoch() {
+        let registered = RegistrationEpoch::new();
+
+        assert!(validate_registration_epoch(None, registered).is_err());
+        assert!(validate_registration_epoch(Some(RegistrationEpoch::new()), registered).is_err());
+        assert!(validate_registration_epoch(Some(registered), registered).is_ok());
     }
 }

@@ -97,16 +97,38 @@ impl TransferCompleteNotification {
         events: &Arc<EventManager>,
         runtime: &tokio::runtime::Handle,
     ) -> Result<Self> {
-        if notifications.is_empty() {
-            return Ok(Self::completed());
+        Self::aggregate_results(notifications.into_iter().map(Ok).collect(), events, runtime)
+    }
+
+    /// Aggregate dispatch results without abandoning transfers that launched
+    /// before a later synchronous dispatch error.
+    ///
+    /// Every successful notification is drained. Synchronous dispatch errors
+    /// and asynchronous completion errors are combined into one terminal
+    /// failure, delivered only after all launched work has settled.
+    pub fn aggregate_results(
+        results: Vec<Result<Self>>,
+        events: &Arc<EventManager>,
+        runtime: &tokio::runtime::Handle,
+    ) -> Result<Self> {
+        let mut notifications = Vec::with_capacity(results.len());
+        let mut dispatch_errors = Vec::new();
+        for result in results {
+            match result {
+                Ok(notification) => notifications.push(notification),
+                Err(error) => dispatch_errors.push(error),
+            }
         }
-        if notifications.len() == 1 {
+        if notifications.is_empty() {
+            return errors_or_completed(dispatch_errors);
+        }
+        if notifications.len() == 1 && dispatch_errors.is_empty() {
             return Ok(notifications.into_iter().next().unwrap());
         }
 
         // Check if all notifications are already complete (no yielding needed)
         if notifications.iter().all(|n| !n.could_yield()) {
-            return Ok(Self::completed());
+            return errors_or_completed(dispatch_errors);
         }
 
         // Create a new event for the aggregate completion
@@ -114,7 +136,11 @@ impl TransferCompleteNotification {
         let awaiter = events.awaiter(event.handle())?;
 
         // Spawn task that awaits all notifications and triggers/poisons the event
-        runtime.spawn(await_all_notifications(notifications, event));
+        runtime.spawn(await_all_notifications(
+            notifications,
+            dispatch_errors,
+            event,
+        ));
 
         Ok(Self::from_awaiter(awaiter))
     }
@@ -126,6 +152,7 @@ impl TransferCompleteNotification {
 /// then triggers the event on success or poisons it with error details on failure.
 async fn await_all_notifications(
     notifications: Vec<TransferCompleteNotification>,
+    mut errors: Vec<anyhow::Error>,
     local_event: Event,
 ) {
     // Await all notifications, collecting results
@@ -133,20 +160,32 @@ async fn await_all_notifications(
         futures::future::join_all(notifications.into_iter().map(|n| n.into_future())).await;
 
     // Check for any failures
-    let errors: Vec<_> = results.into_iter().filter_map(|r| r.err()).collect();
+    errors.extend(results.into_iter().filter_map(|result| result.err()));
 
     if errors.is_empty() {
         // Ignore trigger error - if event system is shutdown, nothing to do
         let _ = local_event.trigger();
     } else {
-        let error_msg = errors
-            .iter()
-            .map(|e| e.to_string())
-            .collect::<Vec<_>>()
-            .join("; ");
+        let error_msg = combined_error_message(&errors);
         // Ignore poison error - if event system is shutdown, nothing to do
         let _ = local_event.poison(error_msg);
     }
+}
+
+fn errors_or_completed(errors: Vec<anyhow::Error>) -> Result<TransferCompleteNotification> {
+    if errors.is_empty() {
+        Ok(TransferCompleteNotification::completed())
+    } else {
+        Err(anyhow::anyhow!(combined_error_message(&errors)))
+    }
+}
+
+fn combined_error_message(errors: &[anyhow::Error]) -> String {
+    errors
+        .iter()
+        .map(|error| format!("{error:#}"))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 impl std::future::IntoFuture for TransferCompleteNotification {
@@ -155,5 +194,73 @@ impl std::future::IntoFuture for TransferCompleteNotification {
 
     fn into_future(self) -> Self::IntoFuture {
         self.awaiter
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use anyhow::{Result, anyhow};
+    use velo::EventManager;
+
+    use super::TransferCompleteNotification;
+
+    #[tokio::test]
+    async fn later_dispatch_error_waits_for_earlier_notification_to_drain() -> Result<()> {
+        let events = Arc::new(EventManager::local());
+        let delayed_event = events.new_event()?;
+        let delayed =
+            TransferCompleteNotification::from_awaiter(events.awaiter(delayed_event.handle())?);
+
+        let aggregate = TransferCompleteNotification::aggregate_results(
+            vec![
+                Ok(delayed),
+                Err(anyhow!("later synchronous dispatch failed")),
+            ],
+            &events,
+            &tokio::runtime::Handle::current(),
+        )?;
+        let mut completion = tokio::spawn(aggregate.into_future());
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut completion)
+                .await
+                .is_err(),
+            "a synchronous error must not abandon an already-launched transfer"
+        );
+        delayed_event.trigger()?;
+        let failure = tokio::time::timeout(Duration::from_secs(1), completion)
+            .await??
+            .expect_err("the deferred synchronous dispatch failure must poison completion");
+        assert!(
+            failure
+                .to_string()
+                .contains("later synchronous dispatch failed")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dispatch_and_completion_errors_are_combined_after_drain() -> Result<()> {
+        let events = Arc::new(EventManager::local());
+        let delayed_event = events.new_event()?;
+        let delayed =
+            TransferCompleteNotification::from_awaiter(events.awaiter(delayed_event.handle())?);
+
+        let aggregate = TransferCompleteNotification::aggregate_results(
+            vec![Ok(delayed), Err(anyhow!("synchronous dispatch failure"))],
+            &events,
+            &tokio::runtime::Handle::current(),
+        )?;
+        delayed_event.poison("asynchronous completion failure")?;
+        let failure = aggregate
+            .await
+            .expect_err("both terminal failures must poison aggregate completion");
+        let message = failure.to_string();
+        assert!(message.contains("synchronous dispatch failure"));
+        assert!(message.contains("asynchronous completion failure"));
+        Ok(())
     }
 }

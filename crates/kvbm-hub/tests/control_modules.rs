@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use kvbm_hub::protocol::{MUTATION_CREDENTIAL_HEADER, RegisterRequest, RegisterResponse, paths};
 use kvbm_hub::{ControlPlaneManager, HubServer};
 use kvbm_protocols::control::{
     LIST_MODULES_HANDLER, ListModulesRequest, ListModulesResponse, ModuleId,
@@ -121,6 +122,42 @@ fn install_slow_list_modules(peer: &velo::Velo, modules: Vec<ModuleId>, delay: D
                 let modules = modules.clone();
                 async move {
                     tokio::time::sleep(delay).await;
+                    Ok(kvbm_protocols::control::ControlReply::Ok(
+                        ListModulesResponse { modules },
+                    ))
+                }
+            },
+        )
+        .build(),
+    )
+    .unwrap();
+}
+
+fn install_replacement_race_list_modules(
+    peer: &velo::Velo,
+    first_started: Arc<tokio::sync::Notify>,
+    release_first: Arc<tokio::sync::Semaphore>,
+) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    peer.register_handler(
+        Handler::typed_unary_async::<ListModulesRequest, _, _, _>(
+            LIST_MODULES_HANDLER,
+            move |_ctx| {
+                let call = calls.fetch_add(1, Ordering::SeqCst);
+                let first_started = Arc::clone(&first_started);
+                let release_first = Arc::clone(&release_first);
+                async move {
+                    let modules = if call == 0 {
+                        first_started.notify_one();
+                        release_first
+                            .acquire()
+                            .await
+                            .expect("first response release semaphore closed")
+                            .forget();
+                        vec![ModuleId::Core]
+                    } else {
+                        vec![ModuleId::Transfer]
+                    };
                     Ok(kvbm_protocols::control::ControlReply::Ok(
                         ListModulesResponse { modules },
                     ))
@@ -289,6 +326,65 @@ async fn cache_drops_stale_insert_after_unregister() {
         mgr.modules_for(id),
         None,
         "stale list_modules result re-populated cache after unregister"
+    );
+
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delayed_old_incarnation_result_cannot_overwrite_replacement_cache() {
+    let (server, mgr) = start_hub_returning_mgr().await;
+    let peer = new_velo().await;
+    let first_started = Arc::new(tokio::sync::Notify::new());
+    let release_first = Arc::new(tokio::sync::Semaphore::new(0));
+    install_replacement_race_list_modules(
+        &peer,
+        Arc::clone(&first_started),
+        Arc::clone(&release_first),
+    );
+
+    let request = RegisterRequest {
+        peer_info: peer.peer_info(),
+        features: Vec::new(),
+        runtime: None,
+    };
+    let register_url = format!("http://{}{}", server.control_addr(), paths::INSTANCES);
+    let initial: RegisterResponse = http()
+        .post(&register_url)
+        .json(&request)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let credential = initial.mutation_credential.unwrap();
+    first_started.notified().await;
+
+    let replacement = http()
+        .post(&register_url)
+        .header(MUTATION_CREDENTIAL_HEADER, credential.to_header_value())
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(replacement.status(), reqwest::StatusCode::OK);
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while mgr.modules_for(peer.instance_id()) != Some(vec![ModuleId::Transfer]) {
+        assert!(
+            Instant::now() < deadline,
+            "replacement cache did not populate"
+        );
+        tokio::task::yield_now().await;
+    }
+
+    release_first.add_permits(1);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        mgr.modules_for(peer.instance_id()),
+        Some(vec![ModuleId::Transfer]),
+        "late result from the old incarnation overwrote replacement state"
     );
 
     server.shutdown().await.unwrap();

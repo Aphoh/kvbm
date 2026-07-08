@@ -272,6 +272,14 @@ impl WorkerTransfers for ReplicatedDataWorker {
 }
 
 impl Worker for ReplicatedDataWorker {
+    fn compute_host_payload_digests(
+        &self,
+        resource: LogicalResourceId,
+        block_ids: Vec<BlockId>,
+    ) -> BoxFuture<'static, Result<Vec<kvbm_physical::transfer::PayloadDigest>>> {
+        Worker::compute_host_payload_digests(self.inner.as_ref(), resource, block_ids)
+    }
+
     fn g1_handle(&self) -> Option<LayoutHandle> {
         self.inner.g1_handle()
     }
@@ -329,55 +337,281 @@ async fn execute_onboard_plans(
     options: kvbm_physical::transfer::TransferOptions,
     layer_range: Option<std::ops::Range<usize>>,
 ) -> Result<()> {
-    for plan in plans {
-        let g1_block_ids: Arc<[BlockId]> = Arc::from(plan.g1_block_ids());
-
-        if rank == plan.root_rank() {
-            inner
-                .execute_local_transfer_for_resource(
-                    resource,
-                    LogicalLayoutHandle::G2,
-                    LogicalLayoutHandle::G1,
-                    Arc::from(plan.local_g2_block_ids()),
-                    Arc::clone(&g1_block_ids),
-                    options.clone(),
-                )?
-                .await
-                .with_context(|| {
-                    format!("rank {rank} failed to load its striped G2 batch before broadcast")
-                })?;
-        }
-
-        collective
-            .broadcast_for_resource(
-                resource,
-                plan.root_rank(),
-                LogicalLayoutHandle::G1,
-                LogicalLayoutHandle::G1,
-                g1_block_ids.as_ref(),
-                g1_block_ids.as_ref(),
-                layer_range.clone(),
-            )?
+    drain_all_replica_steps(plans, move |plan| {
+        let inner = Arc::clone(&inner);
+        let collective = Arc::clone(&collective);
+        let options = options.clone();
+        let layer_range = layer_range.clone();
+        async move {
+            let g1_block_ids: Arc<[BlockId]> = Arc::from(plan.g1_block_ids());
+            let root_rank = plan.root_rank();
+            execute_owner_copy_then_broadcast(
+                rank == root_rank,
+                || {
+                    inner.execute_local_transfer_for_resource(
+                        resource,
+                        LogicalLayoutHandle::G2,
+                        LogicalLayoutHandle::G1,
+                        Arc::from(plan.local_g2_block_ids()),
+                        Arc::clone(&g1_block_ids),
+                        options,
+                    )
+                },
+                || {
+                    collective.broadcast_for_resource(
+                        resource,
+                        root_rank,
+                        LogicalLayoutHandle::G1,
+                        LogicalLayoutHandle::G1,
+                        g1_block_ids.as_ref(),
+                        g1_block_ids.as_ref(),
+                        layer_range,
+                    )
+                },
+            )
             .await
-            .with_context(|| {
-                format!(
-                    "replicated G1 broadcast from rank {} failed",
-                    plan.root_rank()
-                )
-            })?;
-    }
+            .with_context(|| format!("replicated onboard step from rank {root_rank} failed"))
+        }
+    })
+    .await
+}
 
-    Ok(())
+/// Drain every replica step before returning any earlier failure so all ranks
+/// preserve the same collective sequence across a multi-plan onboard.
+async fn drain_all_replica_steps<Steps, Step, StepFuture>(
+    steps: Steps,
+    mut execute: Step,
+) -> Result<()>
+where
+    Steps: IntoIterator,
+    Step: FnMut(Steps::Item) -> StepFuture,
+    StepFuture: std::future::Future<Output = Result<()>>,
+{
+    let mut errors = Vec::new();
+    for step in steps {
+        if let Err(error) = execute(step).await {
+            errors.push(format!("{error:#}"));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        bail!(errors.join("; "))
+    }
+}
+
+/// Preserve the collective sequence even when the root's local copy fails.
+///
+/// Every rank must enter the broadcast in the same order. The root therefore
+/// retains its copy failure, drains the broadcast alongside its peers, and only
+/// then reports the combined terminal error.
+async fn execute_owner_copy_then_broadcast<OwnerCopy, Broadcast>(
+    is_root: bool,
+    owner_copy: OwnerCopy,
+    broadcast: Broadcast,
+) -> Result<()>
+where
+    OwnerCopy: FnOnce() -> Result<TransferCompleteNotification>,
+    Broadcast: FnOnce() -> Result<TransferCompleteNotification>,
+{
+    let mut errors = Vec::new();
+    if is_root {
+        drain_replica_phase("owner G2 to G1 copy", owner_copy(), &mut errors).await;
+    }
+    drain_replica_phase("replicated G1 broadcast", broadcast(), &mut errors).await;
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        bail!(errors.join("; "))
+    }
+}
+
+async fn drain_replica_phase(
+    phase: &str,
+    notification: Result<TransferCompleteNotification>,
+    errors: &mut Vec<String>,
+) {
+    match notification {
+        Ok(notification) => {
+            if let Err(error) = notification.await {
+                errors.push(format!("{phase} completion failed: {error}"));
+            }
+        }
+        Err(error) => errors.push(format!("{phase} dispatch failed: {error}")),
+    }
 }
 
 #[cfg(test)]
 mod trait_tests {
+    use dynamo_memory::StorageKind;
+    use kvbm_config::KvbmConfig;
+    use kvbm_physical::testing::{create_fc_layout, create_test_agent, create_transfer_manager};
+    use kvbm_physical::transfer::{FillPattern, fill_blocks};
+
     use super::*;
+    use crate::collectives::StubCollectiveOps;
+    use crate::testing::create_messenger_tcp;
 
     fn assert_worker<T: Worker>() {}
 
     #[test]
     fn replicated_data_policy_is_a_complete_worker() {
         assert_worker::<ReplicatedDataWorker>();
+    }
+
+    #[tokio::test]
+    async fn replicated_worker_forwards_host_payload_digests_to_physical_worker() {
+        let agent = create_test_agent(&format!("replicated-digest-{}", uuid::Uuid::new_v4()));
+        let layout = create_fc_layout(agent.clone(), StorageKind::System, 2);
+        fill_blocks(&layout, &[0], FillPattern::Constant(53)).unwrap();
+        let manager = create_transfer_manager(agent, None).unwrap();
+        let g2 = manager.register_layout(layout).unwrap();
+        let inner = Arc::new(
+            PhysicalWorker::builder()
+                .manager(manager)
+                .g2_handle(g2)
+                .rank(0)
+                .build()
+                .unwrap(),
+        );
+
+        let messenger = create_messenger_tcp().await.unwrap();
+        let runtime = Arc::new(
+            KvbmRuntime::builder(KvbmConfig::default())
+                .with_runtime_handle(tokio::runtime::Handle::current())
+                .with_messenger(messenger)
+                .build_leader()
+                .await
+                .unwrap(),
+        );
+        let collective = Arc::new(StubCollectiveOps::single_worker(
+            runtime.event_system().as_ref().clone(),
+        ));
+        let worker = ReplicatedDataWorker::new(Arc::clone(&inner), runtime, collective).unwrap();
+
+        let expected = inner
+            .compute_host_payload_digests(LogicalResourceId::default(), vec![0])
+            .await
+            .unwrap();
+        let actual = worker
+            .compute_host_payload_digests(LogicalResourceId::default(), vec![0])
+            .await
+            .unwrap();
+
+        assert_eq!(actual, expected);
+    }
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+    use std::time::Duration;
+
+    use anyhow::{Result, anyhow};
+    use velo::EventManager;
+
+    use super::{
+        TransferCompleteNotification, drain_all_replica_steps, execute_owner_copy_then_broadcast,
+    };
+
+    #[tokio::test]
+    async fn root_copy_dispatch_error_still_enters_and_drains_broadcast() -> Result<()> {
+        let events = Arc::new(EventManager::local());
+        let broadcast_event = events.new_event()?;
+        let broadcast_notification =
+            TransferCompleteNotification::from_awaiter(events.awaiter(broadcast_event.handle())?);
+        let broadcast_entered = AtomicBool::new(false);
+
+        let mut completion = Box::pin(execute_owner_copy_then_broadcast(
+            true,
+            || Err(anyhow!("injected owner copy dispatch failure")),
+            || {
+                broadcast_entered.store(true, Ordering::SeqCst);
+                Ok(broadcast_notification)
+            },
+        ));
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut completion)
+                .await
+                .is_err(),
+            "root must remain in the collective until its broadcast notification settles"
+        );
+        assert!(
+            broadcast_entered.load(Ordering::SeqCst),
+            "a root copy dispatch failure must not skip the collective"
+        );
+
+        broadcast_event.trigger()?;
+        let failure = tokio::time::timeout(Duration::from_secs(1), completion)
+            .await?
+            .expect_err("the retained root copy failure must fail the replica step");
+        assert!(
+            failure
+                .to_string()
+                .contains("injected owner copy dispatch failure")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn first_plan_failure_still_enters_and_drains_every_later_broadcast() -> Result<()> {
+        let events = Arc::new(EventManager::local());
+        let second_event = events.new_event()?;
+        let second_notification =
+            TransferCompleteNotification::from_awaiter(events.awaiter(second_event.handle())?);
+        let delayed = Arc::new(Mutex::new(Some(second_notification)));
+        let broadcasts = Arc::new(AtomicUsize::new(0));
+
+        let completion = tokio::spawn(drain_all_replica_steps(0..2, {
+            let delayed = Arc::clone(&delayed);
+            let broadcasts = Arc::clone(&broadcasts);
+            move |step| {
+                let delayed = Arc::clone(&delayed);
+                let broadcasts = Arc::clone(&broadcasts);
+                async move {
+                    execute_owner_copy_then_broadcast(
+                        true,
+                        move || {
+                            if step == 0 {
+                                Err(anyhow!("first-plan owner copy failed"))
+                            } else {
+                                Ok(TransferCompleteNotification::completed())
+                            }
+                        },
+                        move || {
+                            broadcasts.fetch_add(1, Ordering::SeqCst);
+                            if step == 1 {
+                                Ok(delayed.lock().unwrap().take().unwrap())
+                            } else {
+                                Ok(TransferCompleteNotification::completed())
+                            }
+                        },
+                    )
+                    .await
+                }
+            }
+        }));
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while broadcasts.load(Ordering::SeqCst) != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert!(
+            !completion.is_finished(),
+            "second broadcast must still drain"
+        );
+        second_event.trigger()?;
+        let failure = tokio::time::timeout(Duration::from_secs(1), completion)
+            .await??
+            .expect_err("first plan failure must surface after every plan drains");
+        assert!(failure.to_string().contains("first-plan owner copy failed"));
+        Ok(())
     }
 }

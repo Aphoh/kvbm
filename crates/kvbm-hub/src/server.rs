@@ -17,6 +17,8 @@
 //! builds an internal `velo::Velo`, self-registers in the registry, and can
 //! push active messages (heartbeats, probes) to registered clients.
 
+mod heartbeat;
+
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -26,7 +28,7 @@ use anyhow::{Context, Result};
 use axum::{
     Json, Router,
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
@@ -40,9 +42,13 @@ use crate::handlers::{HEARTBEAT_HANDLER, HeartbeatAck, HeartbeatRequest};
 use crate::protocol::{
     self, ErrorBody, ErrorCode, FeatureDescriptor, FeatureKey, HeartbeatResponse,
     HubConfigResponse, ListInstancesResponse, PeerLookupResponse, PrimaryConfig, ProbeResponse,
-    RegisterRequest, RegisterResponse, RuntimeConfigSummary,
 };
-use crate::registry::{InMemoryRegistry, PeerRegistry, RegistryError};
+use crate::registration::{
+    RegistrationCredentialError, RegistrationLifecycle, mutation_credential_from_headers,
+    register_instance, unregister_instance,
+};
+use crate::registry::{InMemoryRegistry, PeerRegistry, RegistryError, RegistryIncarnation};
+use heartbeat::spawn_heartbeat_task;
 
 /// Default liveness TTL used by the in-memory registry.
 pub const DEFAULT_REGISTRATION_TTL: Duration = Duration::from_secs(30);
@@ -63,6 +69,7 @@ pub struct HubServerState {
     registry: Arc<dyn PeerRegistry>,
     velo: Option<Arc<velo::Velo>>,
     managers: Arc<HashMap<FeatureKey, Arc<dyn FeatureManager>>>,
+    registration_lifecycle: Arc<RegistrationLifecycle>,
     /// Hub-wide shared config served by `GET /v1/config` and used for
     /// must-match validation at registration.
     primary: Arc<PrimaryConfig>,
@@ -93,10 +100,20 @@ impl HubServerState {
     /// [`InMemoryRegistry`] and no velo participant.
     pub fn new() -> Self {
         let mem: Arc<InMemoryRegistry> = Arc::new(InMemoryRegistry::builder().build());
+        let registry: Arc<dyn PeerRegistry> = mem;
+        let managers = Arc::new(HashMap::new());
+        let registration_lifecycle = RegistrationLifecycle::new(&managers);
+        let registrations = registry
+            .install_removal_hook(registration_lifecycle.removal_callback())
+            .expect("fresh in-memory registry accepts its lifecycle hook");
+        registration_lifecycle
+            .synchronize_reservations(registrations)
+            .expect("fresh registration state accepts an empty reservation snapshot");
         Self {
-            registry: mem,
+            registry,
             velo: None,
-            managers: Arc::new(HashMap::new()),
+            managers,
+            registration_lifecycle,
             primary: Arc::new(PrimaryConfig::default()),
             base_config: Arc::new(serde_json::json!({})),
         }
@@ -117,10 +134,16 @@ impl HubServerState {
         self.velo.as_ref()
     }
 
-    fn fan_out_unregister(&self, id: InstanceId) {
-        for mgr in self.managers.values() {
-            mgr.on_unregister(id);
-        }
+    pub(crate) fn managers(&self) -> &HashMap<FeatureKey, Arc<dyn FeatureManager>> {
+        &self.managers
+    }
+
+    pub(crate) fn registration_lifecycle(&self) -> &RegistrationLifecycle {
+        &self.registration_lifecycle
+    }
+
+    pub(crate) fn primary_config(&self) -> &PrimaryConfig {
+        &self.primary
     }
 }
 
@@ -292,7 +315,7 @@ impl HubServerBuilder {
         // feature but no `primary_config` would leave the must-match check
         // with nothing to validate against (a registration bypass).
         let mut primary = self.primary;
-        for (key, mgr) in &managers {
+        for (key, mgr) in managers.iter() {
             let Some(block_size) = mgr.authoritative_block_size() else {
                 continue;
             };
@@ -307,10 +330,9 @@ impl HubServerBuilder {
             }
         }
 
-        // Two-phase registry construction: keep a concrete handle to
-        // `InMemoryRegistry` (if we built one) until after we've called
-        // `.protect()` with the hub's own id and installed the eviction
-        // callback. After that we only need the trait object.
+        // Keep a concrete handle to `InMemoryRegistry` only long enough to
+        // protect the hub's own Velo entry. Lifecycle revocation is installed
+        // uniformly through the `PeerRegistry` trait below.
         let (registry, mem_concrete): (Arc<dyn PeerRegistry>, Option<Arc<InMemoryRegistry>>) =
             match self.registry {
                 Some(r) => (r, None),
@@ -326,8 +348,26 @@ impl HubServerBuilder {
                 }
             };
 
+        // Bind both public sockets before creating Velo, registering the hub,
+        // or starting feature work. A bad address is a configuration error and
+        // must leave injected registries and managers untouched.
+        let discovery_addr = SocketAddr::new(self.bind_addr, self.discovery_port);
+        let control_addr = SocketAddr::new(self.bind_addr, self.control_port);
+        let discovery_listener = TcpListener::bind(discovery_addr)
+            .await
+            .with_context(|| format!("binding discovery port {discovery_addr}"))?;
+        let control_listener = TcpListener::bind(control_addr)
+            .await
+            .with_context(|| format!("binding control port {control_addr}"))?;
+        let discovery_local = discovery_listener
+            .local_addr()
+            .context("discovery local_addr")?;
+        let control_local = control_listener
+            .local_addr()
+            .context("control local_addr")?;
+
         // Build the hub's own Velo if any transports were supplied.
-        let velo = if !self.transports.is_empty() {
+        let (velo, self_registration) = if !self.transports.is_empty() {
             let discovery: Arc<dyn velo::discovery::PeerDiscovery> = registry.clone();
             let mut vb = velo::Velo::builder().discovery(discovery);
             for t in self.transports {
@@ -336,22 +376,26 @@ impl HubServerBuilder {
             let v = vb.build().await.context("building hub velo")?;
             // Self-register so clients can discover the hub via
             // `GET /v1/peers/instance/{hub_id}`.
-            registry
+            let incarnation = registry
                 .register(v.peer_info())
                 .await
                 .map_err(|e| anyhow::anyhow!("hub self-register: {e}"))?;
             if let Some(mem) = &mem_concrete {
                 mem.protect(v.instance_id());
             }
-            Some(v)
+            let self_registration = Some((v.instance_id(), incarnation));
+            (Some(v), self_registration)
         } else {
-            None
+            (None, None)
         };
 
         // Create the master shutdown token *before* attaching managers so
         // they can fork child tokens for any background work they spawn
         // during attach (refresh tasks, watchers).
         let cancel = CancellationToken::new();
+
+        let managers = Arc::new(managers);
+        let registration_lifecycle = RegistrationLifecycle::new(&managers);
 
         // Attach every manager now that the registry and (optional) Velo
         // are ready.
@@ -360,41 +404,28 @@ impl HubServerBuilder {
             registry: registry.clone(),
             cancel: cancel.child_token(),
         };
-        for (key, mgr) in &managers {
-            mgr.attach(ctx.clone())
-                .await
-                .map_err(|e| anyhow::anyhow!("FeatureManager({key:?}) attach: {e}"))?;
+        for (key, mgr) in managers.iter() {
+            if let Err(error) = mgr.attach(ctx.clone()).await {
+                let error = anyhow::anyhow!("FeatureManager({key:?}) attach: {error}");
+                return Err(abort_startup(&registry, self_registration, &cancel, error).await);
+            }
         }
 
-        let managers = Arc::new(managers);
-
-        // Wire eviction fan-out when we own the concrete in-memory registry.
-        // Custom backends manage their own eviction semantics.
-        if let Some(mem) = &mem_concrete {
-            let managers_for_cb = Arc::clone(&managers);
-            mem.set_eviction_callback(Arc::new(move |id: InstanceId| {
-                for mgr in managers_for_cb.values() {
-                    mgr.on_unregister(id);
+        // Installing a custom registry's authoritative hook is irreversible.
+        // Defer it until every fallible startup step has succeeded so a caller
+        // can correct a bind or manager-attach failure and reuse the registry.
+        let registrations =
+            match registry.install_removal_hook(registration_lifecycle.removal_callback()) {
+                Ok(registrations) => registrations,
+                Err(error) => {
+                    let error = anyhow::anyhow!("installing registry removal hook: {error}");
+                    return Err(abort_startup(&registry, self_registration, &cancel, error).await);
                 }
-            }));
+            };
+        if let Err(error) = registration_lifecycle.synchronize_reservations(registrations) {
+            let error = anyhow::anyhow!("reserving existing registry occupants: {error}");
+            return Err(abort_startup(&registry, self_registration, &cancel, error).await);
         }
-
-        let discovery_addr = SocketAddr::new(self.bind_addr, self.discovery_port);
-        let control_addr = SocketAddr::new(self.bind_addr, self.control_port);
-
-        let discovery_listener = TcpListener::bind(discovery_addr)
-            .await
-            .with_context(|| format!("binding discovery port {discovery_addr}"))?;
-        let control_listener = TcpListener::bind(control_addr)
-            .await
-            .with_context(|| format!("binding control port {control_addr}"))?;
-
-        let discovery_local = discovery_listener
-            .local_addr()
-            .context("discovery local_addr")?;
-        let control_local = control_listener
-            .local_addr()
-            .context("control local_addr")?;
 
         let reaper_task = registry.clone().spawn_liveness_task(cancel.child_token());
 
@@ -415,6 +446,7 @@ impl HubServerBuilder {
             registry: registry.clone(),
             velo,
             managers: Arc::clone(&managers),
+            registration_lifecycle,
             primary: Arc::new(primary),
             base_config: Arc::new(self.base_config),
         };
@@ -466,7 +498,28 @@ impl HubServerBuilder {
             control_task: Some(control_task),
             reaper_task,
             heartbeat_task,
+            self_registration,
         })
+    }
+}
+
+async fn abort_startup(
+    registry: &Arc<dyn PeerRegistry>,
+    self_registration: Option<(InstanceId, RegistryIncarnation)>,
+    cancel: &CancellationToken,
+    startup_error: anyhow::Error,
+) -> anyhow::Error {
+    cancel.cancel();
+    let Some((instance_id, incarnation)) = self_registration else {
+        return startup_error;
+    };
+    match registry.unregister(instance_id, incarnation).await {
+        Ok(()) | Err(RegistryError::NotFound(_)) | Err(RegistryError::StaleIncarnation { .. }) => {
+            startup_error
+        }
+        Err(cleanup_error) => anyhow::anyhow!(
+            "{startup_error}; additionally failed to remove hub self-registration: {cleanup_error}"
+        ),
     }
 }
 
@@ -483,6 +536,7 @@ pub struct HubServer {
     control_task: Option<JoinHandle<()>>,
     reaper_task: Option<JoinHandle<()>>,
     heartbeat_task: Option<JoinHandle<()>>,
+    self_registration: Option<(InstanceId, RegistryIncarnation)>,
 }
 
 impl std::fmt::Debug for HubServer {
@@ -530,187 +584,40 @@ impl HubServer {
         if let Some(t) = self.heartbeat_task.take() {
             let _ = t.await;
         }
-        Ok(())
+        self.remove_self_registration().await
+    }
+
+    async fn remove_self_registration(&mut self) -> Result<()> {
+        let Some((instance_id, incarnation)) = self.self_registration.take() else {
+            return Ok(());
+        };
+        match self
+            .state
+            .registry
+            .unregister(instance_id, incarnation)
+            .await
+        {
+            Ok(())
+            | Err(RegistryError::NotFound(_))
+            | Err(RegistryError::StaleIncarnation { .. }) => Ok(()),
+            Err(error) => Err(anyhow::anyhow!(
+                "removing hub self-registration {instance_id}: {error}"
+            )),
+        }
     }
 }
 
 impl Drop for HubServer {
     fn drop(&mut self) {
         self.cancel.cancel();
-    }
-}
-
-/// Outcome of a single hub→peer heartbeat probe, sent from the
-/// per-probe task back to the heartbeat manager.
-#[derive(Debug)]
-enum ProbeOutcome {
-    /// Probe acked. Manager refreshes the registry's `last_heartbeat_at`.
-    Ok { id: InstanceId, ack_seq: u64 },
-    /// Probe failed (timeout, transport error, deserialize error).
-    /// Manager increments the per-instance failure counter and
-    /// unregisters after `max_failures` consecutive failures.
-    Failed { id: InstanceId, reason: String },
-}
-
-/// Spawn the hub-driven heartbeat task.
-///
-/// **Architecture:** the heartbeat is split into a *manager* task and
-/// per-tick fan-out *probe* tasks. The manager:
-/// 1. Wakes every `interval`, snapshots `registry.list()`.
-/// 2. For each peer (skipping the hub's own `self_id`) it spawns a
-///    detached probe task that bounds itself by `tokio::time::timeout`
-///    and reports its outcome back over a `mpsc` channel. **The
-///    manager never awaits a probe directly** — a single hung peer
-///    cannot wedge the loop.
-/// 3. Drains outcomes from the channel between ticks. On `Ok` it
-///    `registry.touch(id)`s the entry; on `Failed` it increments a
-///    per-instance failure counter and `registry.unregister(id)`s
-///    after `max_failures` consecutive failures.
-///
-/// Probe tasks own no state beyond the channel sender; failure
-/// counting lives only in the manager. A peer that recovers (`Ok`
-/// after a `Failed`) has its counter cleared.
-fn spawn_heartbeat_task(
-    velo: Arc<velo::Velo>,
-    registry: Arc<dyn PeerRegistry>,
-    self_id: InstanceId,
-    interval: Duration,
-    max_failures: u32,
-    cancel: CancellationToken,
-) -> JoinHandle<()> {
-    // Channel capacity is generous — at most one `tick`-worth of
-    // outcomes is in flight at any moment, but bursts (slow drain
-    // followed by a fast tick) are fine.
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ProbeOutcome>();
-
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(interval);
-        // Wait one interval before the first probe so freshly
-        // registered instances have time to install their handler.
-        tick.tick().await;
-        let mut failures: HashMap<InstanceId, u32> = HashMap::new();
-        let mut seq: u64 = 0;
-
-        loop {
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => {
-                    tracing::debug!("heartbeat task: shutdown requested");
-                    return;
-                }
-                _ = tick.tick() => {
-                    seq = seq.wrapping_add(1);
-                    fan_out_probes(
-                        &velo,
-                        &registry,
-                        self_id,
-                        seq,
-                        interval,
-                        tx.clone(),
-                    );
-                }
-                Some(outcome) = rx.recv() => {
-                    handle_outcome(
-                        outcome,
-                        &registry,
-                        &mut failures,
-                        max_failures,
-                    ).await;
-                }
-            }
-        }
-    })
-}
-
-/// For every peer in the registry except `self_id`, spawn a detached
-/// probe task that times itself out at `interval` and posts one
-/// [`ProbeOutcome`] to `tx`.
-fn fan_out_probes(
-    velo: &Arc<velo::Velo>,
-    registry: &Arc<dyn PeerRegistry>,
-    self_id: InstanceId,
-    seq: u64,
-    interval: Duration,
-    tx: tokio::sync::mpsc::UnboundedSender<ProbeOutcome>,
-) {
-    let peers = registry.list();
-    for peer in peers {
-        let id = peer.instance_id();
-        if id == self_id {
-            continue;
-        }
-        let velo = Arc::clone(velo);
-        let tx = tx.clone();
-        tokio::spawn(async move {
-            let req = HeartbeatRequest { seq };
-            let probe = async {
-                let unary = velo.typed_unary(HEARTBEAT_HANDLER)?;
-                let ack: HeartbeatAck = unary.payload(&req)?.instance(id).send().await?;
-                Ok::<HeartbeatAck, anyhow::Error>(ack)
-            };
-            let outcome = match tokio::time::timeout(interval, probe).await {
-                Ok(Ok(ack)) => ProbeOutcome::Ok {
-                    id,
-                    ack_seq: ack.seq,
-                },
-                Ok(Err(e)) => ProbeOutcome::Failed {
-                    id,
-                    reason: format!("{e:#}"),
-                },
-                Err(_) => ProbeOutcome::Failed {
-                    id,
-                    reason: format!("heartbeat probe timed out after {:?}", interval),
-                },
-            };
-            // Receiver dropped only on shutdown — drop the outcome
-            // silently in that case.
-            let _ = tx.send(outcome);
-        });
-    }
-}
-
-/// Drain a single [`ProbeOutcome`] from the channel and apply its
-/// effect to the registry / failure map.
-async fn handle_outcome(
-    outcome: ProbeOutcome,
-    registry: &Arc<dyn PeerRegistry>,
-    failures: &mut HashMap<InstanceId, u32>,
-    max_failures: u32,
-) {
-    match outcome {
-        ProbeOutcome::Ok { id, ack_seq } => {
-            failures.remove(&id);
-            if let Err(e) = registry.touch(id).await {
-                tracing::trace!(
-                    instance = %id, error = %e,
-                    "heartbeat: touch returned non-fatal error"
-                );
-            } else {
-                tracing::trace!(
-                    instance = %id, ack_seq,
-                    "heartbeat: refreshed TTL"
-                );
-            }
-        }
-        ProbeOutcome::Failed { id, reason } => {
-            let n = failures.entry(id).and_modify(|c| *c += 1).or_insert(1);
-            tracing::warn!(
-                instance = %id, failures = *n, error = %reason,
-                "heartbeat: probe failed"
-            );
-            if *n >= max_failures {
-                tracing::warn!(
-                    instance = %id, failures = *n,
-                    "heartbeat: unregistering after consecutive failures"
-                );
-                failures.remove(&id);
-                if let Err(e) = registry.unregister(id).await {
-                    tracing::warn!(
-                        instance = %id, error = %e,
-                        "heartbeat: unregister failed"
-                    );
-                }
-            }
+        let Some((instance_id, incarnation)) = self.self_registration.take() else {
+            return;
+        };
+        let registry = Arc::clone(&self.state.registry);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = registry.unregister(instance_id, incarnation).await;
+            });
         }
     }
 }
@@ -801,70 +708,6 @@ async fn list_instances(State(state): State<HubServerState>) -> Json<ListInstanc
     })
 }
 
-async fn register_instance(
-    State(state): State<HubServerState>,
-    Json(req): Json<RegisterRequest>,
-) -> Result<Json<RegisterResponse>, HubError> {
-    let peer = req.peer_info;
-    let instance_id = peer.instance_id();
-
-    // Validate feature dependencies + must-match consistency *pre-dispatch* —
-    // cheaper than rolling back base registration. This is the ONLY site where
-    // these rules are enforced; individual managers do not duplicate them.
-    validate_register(&req.features, req.runtime.as_ref(), &state)?;
-
-    state
-        .registry
-        .register(peer.clone())
-        .await
-        .map_err(HubError::from_registry)?;
-
-    // Feature dispatch. All-or-nothing: if any feature rejects the payload
-    // (unknown manager, invalid config, role conflict, ...) we roll back the
-    // base registration so the client sees a single consistent outcome.
-    for feature in &req.features {
-        let dispatch: Result<(), HubError> = match state.managers.get(&feature.key()) {
-            None => Err(HubError::bad_request(format!(
-                "no feature manager registered for {:?}",
-                feature.key()
-            ))),
-            Some(mgr) => mgr
-                .on_register(instance_id, feature)
-                .await
-                .map_err(HubError::from_feature),
-        };
-        if let Err(err) = dispatch {
-            // Roll back: remove base entry and every manager notification we
-            // already emitted (for features dispatched earlier in this loop).
-            let _ = state.registry.unregister(instance_id).await;
-            state.fan_out_unregister(instance_id);
-            return Err(err);
-        }
-    }
-
-    // Notify every manager that an instance has fully registered. Unlike the
-    // feature-keyed `on_register` loop above, this fan-out fires for every
-    // manager regardless of declared features — it is the discovery hook
-    // (e.g. control-plane manager queries `list_modules` from here). Errors
-    // here MUST NOT roll back registration; managers handle their own
-    // retry/backoff internally.
-    for mgr in state.managers.values() {
-        mgr.on_register_any(instance_id, &peer).await;
-    }
-
-    // Proactively inform the hub's Velo about this peer so outbound sends
-    // don't need to round-trip through discovery. Matches pre-trait behavior.
-    if let Some(velo) = state.velo.as_ref() {
-        velo.register_peer(peer)
-            .map_err(|e| HubError::internal(format!("velo register_peer: {e}")))?;
-    }
-
-    Ok(Json(RegisterResponse {
-        instance_id,
-        hub_instance_id: state.velo.as_ref().map(|v| v.instance_id()),
-    }))
-}
-
 async fn probe_instance(
     State(state): State<HubServerState>,
     Path(instance_id): Path<InstanceId>,
@@ -896,34 +739,24 @@ async fn probe_instance(
     }))
 }
 
-async fn unregister_instance(
-    State(state): State<HubServerState>,
-    Path(instance_id): Path<InstanceId>,
-) -> Result<StatusCode, HubError> {
-    state
-        .registry
-        .unregister(instance_id)
-        .await
-        .map_err(HubError::from_registry)?;
-    // In-memory registry's eviction callback already notifies managers; the
-    // explicit fan-out here covers custom registry backends that don't wire
-    // a callback. The call is cheap and manager `on_unregister` is required
-    // to be idempotent.
-    state.fan_out_unregister(instance_id);
-    Ok(StatusCode::NO_CONTENT)
-}
-
 async fn heartbeat(
     State(state): State<HubServerState>,
     Path(instance_id): Path<InstanceId>,
+    headers: HeaderMap,
 ) -> Result<Json<HeartbeatResponse>, HubError> {
-    match state.registry.touch(instance_id).await {
-        Ok(()) => Ok(Json(HeartbeatResponse { acknowledged: true })),
-        Err(RegistryError::NotFound(_)) => Ok(Json(HeartbeatResponse {
-            acknowledged: false,
-        })),
-        Err(e) => Err(HubError::from_registry(e)),
-    }
+    let presented_credential = mutation_credential_from_headers(&headers)
+        .map_err(|error| HubError::bad_request(error.to_string()))?;
+    let incarnation = state
+        .registration_lifecycle
+        .credentials()
+        .authorize(instance_id, presented_credential.as_ref())
+        .map_err(HubError::from_registration_credential)?;
+    state
+        .registry
+        .touch(instance_id, incarnation)
+        .await
+        .map_err(HubError::from_registry)?;
+    Ok(Json(HeartbeatResponse { acknowledged: true }))
 }
 
 async fn get_peer_by_instance(
@@ -951,120 +784,44 @@ async fn get_peer_by_worker(
         .map_err(|_| HubError::not_found(format!("worker {worker_id} not found")))
 }
 
-/// Pre-dispatch validation for `POST /v1/instances`:
-///
-/// 1. **Dependency closure** — every declared feature's `dependencies()` must
-///    also be declared in the same request (e.g. CD requires P2P).
-/// 2. **Must-match consistency** — the union of `config_requirements()` across
-///    declared features defines which [`PrimaryConfig`] fields the registrant
-///    must match. When the request carries a [`RuntimeConfigSummary`], each
-///    required field for which the hub is authoritative (`primary.* == Some`,
-///    and `block_layout` always) must be declared and equal. A request with no
-///    summary skips must-match (legacy clients).
-fn validate_register(
-    features: &[crate::protocol::Feature],
-    runtime: Option<&RuntimeConfigSummary>,
-    state: &HubServerState,
-) -> Result<(), HubError> {
-    use std::collections::HashSet;
-
-    let declared: HashSet<FeatureKey> = features.iter().map(|f| f.key()).collect();
-
-    // 1. Dependency closure.
-    let mut required = crate::features::FeatureConfigRequirements::default();
-    for feature in features {
-        let key = feature.key();
-        let Some(mgr) = state.managers.get(&key) else {
-            // Unknown manager surfaces in the dispatch loop with a clear
-            // per-feature error; nothing to validate here.
-            continue;
-        };
-        for dep in mgr.dependencies() {
-            if !declared.contains(dep) {
-                return Err(HubError::bad_request(format!(
-                    "Feature::{key} requires Feature::{dep} to also be declared \
-                     in the same register request",
-                )));
-            }
-        }
-        let r = mgr.config_requirements();
-        required.block_size |= r.block_size;
-        required.block_layout |= r.block_layout;
-    }
-
-    // 2. Must-match consistency.
-    let Some(summary) = runtime else {
-        // No summary. Reject if any declared feature mandates one (features
-        // introduced with the runtime summary, e.g. KV-index); tolerate for
-        // legacy features (P2P / CD predate the field).
-        for feature in features {
-            let key = feature.key();
-            if let Some(mgr) = state.managers.get(&key)
-                && mgr.requires_runtime_summary()
-            {
-                return Err(HubError::bad_request(format!(
-                    "Feature::{key} requires a runtime config summary \
-                     (block_size / max_seq_len / block_layout) in the register request"
-                )));
-            }
-        }
-        return Ok(());
-    };
-    let primary = &state.primary;
-
-    if required.block_size
-        && let Some(want) = primary.block_size
-    {
-        check_match("block_size", want, summary.block_size)?;
-    }
-    if required.block_layout {
-        // `block_layout` is always authoritative on the hub (non-Option).
-        check_match("block_layout", primary.block_layout, summary.block_layout)?;
-    }
-    Ok(())
-}
-
-/// One must-match field check: the client must declare `got == Some(want)`.
-fn check_match<T: PartialEq + std::fmt::Debug>(
-    field: &str,
-    want: T,
-    got: Option<T>,
-) -> Result<(), HubError> {
-    match got {
-        Some(got) if got == want => Ok(()),
-        Some(got) => Err(HubError::bad_request(format!(
-            "{field} mismatch: hub requires {want:?}, registrant declared {got:?}"
-        ))),
-        None => Err(HubError::bad_request(format!(
-            "{field} must be declared in the register runtime summary (hub requires {want:?})"
-        ))),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Error plumbing
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
-struct HubError {
+pub(crate) struct HubError {
     status: StatusCode,
     body: ErrorBody,
 }
 
 impl HubError {
-    fn from_registry(e: RegistryError) -> Self {
+    pub(crate) fn from_registry(e: RegistryError) -> Self {
         match e {
             RegistryError::Conflict { .. } => Self::conflict(e.to_string()),
             RegistryError::NotFound(_) => Self::not_found(e.to_string()),
             RegistryError::Backend(err) => Self::internal(format!("registry backend: {err}")),
+            RegistryError::RemovalHookAlreadyInstalled => {
+                Self::internal("peer-removal hook is already installed".to_string())
+            }
+            RegistryError::StaleIncarnation { .. } => Self::conflict(e.to_string()),
         }
     }
 
-    fn from_feature(e: FeatureError) -> Self {
+    pub(crate) fn from_feature(e: FeatureError) -> Self {
         match e {
             FeatureError::InvalidConfig(m) => Self::bad_request(m),
             FeatureError::KeyMismatch { .. } => Self::internal(e.to_string()),
             FeatureError::Other(err) => Self::internal(err.to_string()),
+        }
+    }
+
+    pub(crate) fn from_registration_credential(e: RegistrationCredentialError) -> Self {
+        match e {
+            RegistrationCredentialError::Unauthorized { .. } => Self::unauthorized(e.to_string()),
+            RegistrationCredentialError::Busy { .. } => Self::conflict(e.to_string()),
+            RegistrationCredentialError::NotFound { .. } => Self::not_found(e.to_string()),
+            RegistrationCredentialError::StateChanged { .. }
+            | RegistrationCredentialError::Unavailable => Self::internal(e.to_string()),
         }
     }
 
@@ -1078,11 +835,21 @@ impl HubError {
         }
     }
 
-    fn bad_request(message: String) -> Self {
+    pub(crate) fn bad_request(message: String) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
             body: ErrorBody {
                 code: ErrorCode::BadRequest,
+                message,
+            },
+        }
+    }
+
+    fn unauthorized(message: String) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            body: ErrorBody {
+                code: ErrorCode::Unauthorized,
                 message,
             },
         }
@@ -1098,7 +865,7 @@ impl HubError {
         }
     }
 
-    fn internal(message: String) -> Self {
+    pub(crate) fn internal(message: String) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             body: ErrorBody {

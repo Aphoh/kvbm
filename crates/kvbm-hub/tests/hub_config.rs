@@ -392,6 +392,7 @@ async fn indexer_unregister_sweeps_index() {
         "register status {}",
         resp.status()
     );
+    let registration: kvbm_hub::protocol::RegisterResponse = resp.json().await.unwrap();
 
     // The instance now appears in the registered-instances set — this is
     // driven by registration (declaring `Feature::Indexer`), distinct from the
@@ -413,6 +414,10 @@ async fn indexer_unregister_sweeps_index() {
     // Unregister → on_unregister sweeps the index entries for this instance.
     let del = http
         .delete(format!("{ctrl}/v1/instances/{id}"))
+        .header(
+            kvbm_hub::protocol::MUTATION_CREDENTIAL_HEADER,
+            registration.mutation_credential.unwrap().to_header_value(),
+        )
         .send()
         .await
         .unwrap();

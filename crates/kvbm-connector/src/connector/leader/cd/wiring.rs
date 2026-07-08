@@ -166,6 +166,14 @@ pub(in super::super) async fn wire_hub(
             )
         })?;
 
+    if let Some(registration_epoch) = hub.registration_epoch() {
+        anyhow::ensure!(
+            engine_leader.set_registration_epoch(registration_epoch)
+                || engine_leader.registration_epoch() == registration_epoch,
+            "engine leader registration epoch was initialized before hub registration"
+        );
+    }
+
     // One hub-backed peer resolver shared by the session factory and the
     // engine's disagg ops, so its registration de-dup works across both
     // paths. MUST be the velo-level resolver: `velo.register_peer` populates

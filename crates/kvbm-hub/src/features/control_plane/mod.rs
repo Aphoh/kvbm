@@ -15,5 +15,6 @@
 //! [`ControlError::http_status`]: kvbm_protocols::control::ControlError::http_status
 
 mod manager;
+mod module_refresh;
 
 pub use manager::ControlPlaneManager;

@@ -6,7 +6,9 @@
 use std::sync::Arc;
 
 use kvbm_common::{BlockId, LogicalResourceId};
-use kvbm_protocols::cache_manifest::{BundleKey, CacheIdentity, ResourceRole};
+use kvbm_protocols::cache_manifest::{
+    BundleKey, BundleResourceLineage, CacheIdentity, ResourceRole,
+};
 use kvbm_protocols::connector::{BundleOffloadPlan, OffloadMode, ResourceOffload};
 
 use super::super::slot::RequestSlot;
@@ -19,6 +21,17 @@ impl LeaderState {
         desired_tokens: usize,
         identity: CacheIdentity,
     ) -> bool {
+        if !identity.resources().iter().any(|requirement| {
+            requirement.role() == ResourceRole::PrefixHistory
+                && usize::try_from(requirement.native_block_tokens().get()) == Ok(self.block_size)
+        }) {
+            tracing::warn!(
+                request_id,
+                connector_block_size = self.block_size,
+                "bundle contract has no prefix-history anchor at the connector block size"
+            );
+            return false;
+        }
         let (plan, boundary) = {
             let Some(slot) = self.slots.get_mut(request_id) else {
                 return false;
@@ -47,8 +60,12 @@ impl LeaderState {
             if boundary == 0 || boundary <= slot.evaluated_tokens {
                 return false;
             }
-            let hash_index = boundary / self.block_size - 1;
-            let boundary_hash = slot.sequence_hash(hash_index);
+            let canonical_hashes = (0..boundary / self.block_size)
+                .map(|index| slot.sequence_hash(index))
+                .collect::<Vec<_>>();
+            let boundary_hash = *canonical_hashes
+                .last()
+                .expect("a nonzero aligned boundary has a canonical history hash");
             let key = match BundleKey::new(&identity, boundary_hash, boundary as u64) {
                 Ok(key) => key,
                 Err(error) => {
@@ -73,13 +90,30 @@ impl LeaderState {
                     .get(&requirement.resource())
                     .expect("allocation boundary checked above");
                 let blocks = match requirement.role() {
-                    ResourceRole::PrefixHistory => (0..boundary / native)
-                        .map(|index| {
-                            let end_token = (index + 1) * native;
-                            let hash = slot.sequence_hash(end_token / self.block_size - 1);
-                            (hash, ids[index])
-                        })
-                        .collect(),
+                    ResourceRole::PrefixHistory => {
+                        let lineage = match BundleResourceLineage::project_from_canonical(
+                            requirement.resource(),
+                            &canonical_hashes,
+                            native / self.block_size,
+                        ) {
+                            Ok(lineage) => lineage,
+                            Err(error) => {
+                                tracing::warn!(
+                                    request_id,
+                                    resource = ?requirement.resource(),
+                                    %error,
+                                    "resource lineage cannot be projected from the connector history"
+                                );
+                                return false;
+                            }
+                        };
+                        lineage
+                            .hashes()
+                            .iter()
+                            .copied()
+                            .zip(ids.iter().copied())
+                            .collect()
+                    }
                     ResourceRole::BoundaryCapsule => {
                         vec![(boundary_hash, ids[boundary / native - 1])]
                     }
@@ -93,7 +127,6 @@ impl LeaderState {
                 BundleOffloadPlan {
                     identity,
                     key,
-                    generation: boundary as u64,
                     mode: OffloadMode::Mirror,
                     resources,
                 },

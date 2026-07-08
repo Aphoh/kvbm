@@ -16,10 +16,16 @@
 
 pub mod control;
 pub mod dispatch;
+mod integrity;
 pub mod parallelism;
+mod pull_transaction;
 pub mod service;
 pub mod session;
 pub(crate) mod transport;
+
+pub(crate) use integrity::PayloadBlock;
+pub use integrity::PayloadChecksum;
+pub(crate) use pull_transaction::{StagedPull, stage_from_session};
 
 use kvbm_logical::SequenceHash;
 use serde::{Deserialize, Serialize};

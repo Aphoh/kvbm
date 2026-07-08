@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use super::{ManifestError, ResourceRequirement};
+use super::{ManifestError, ResourceRequirement, ResourceRole};
 
 /// Stable digest that namespaces otherwise-identical token lineage hashes.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -117,6 +117,18 @@ impl CacheIdentity {
 
     pub const fn alignment_tokens(&self) -> NonZeroU64 {
         self.alignment_tokens
+    }
+
+    /// Deterministic fine-grained lineage anchor for bundle keys.
+    ///
+    /// Mixed-native histories are projected from the smallest native block
+    /// size. Resource id breaks equal-size ties so physical registration order
+    /// cannot change the canonical anchor.
+    pub fn canonical_history(&self) -> Option<&ResourceRequirement> {
+        self.resources
+            .iter()
+            .filter(|requirement| requirement.role() == ResourceRole::PrefixHistory)
+            .min_by_key(|requirement| (requirement.native_block_tokens(), requirement.resource()))
     }
 }
 

@@ -32,6 +32,7 @@ use kvbm_common::LogicalResourceId;
 use kvbm_logical::blocks::{ImmutableBlock, MutableBlock};
 
 use super::SessionEndpoint;
+use crate::p2p::PayloadChecksum;
 use crate::{BlockId, G2, InstanceId, SequenceHash};
 
 /// Session correlation id. Re-export of the existing alias so
@@ -49,6 +50,21 @@ pub struct CommittedBlock {
     pub peer_block_id: BlockId,
 }
 
+/// One availability record whose actual payload bytes were checksummed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifiedCommittedBlock {
+    pub block: CommittedBlock,
+    pub ordinal: u32,
+    pub checksum: PayloadChecksum,
+}
+
+/// Verified metadata paired with one block passed to `make_available_verified`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VerifiedPayload {
+    pub ordinal: u32,
+    pub checksum: PayloadChecksum,
+}
+
 /// Delta on the peer's committed-set stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommitDelta {
@@ -64,6 +80,8 @@ pub enum CommitDelta {
 pub enum AvailabilityDelta {
     /// Blocks newly available on peer (pulled-ready).
     Available(Vec<CommittedBlock>),
+    /// Blocks with receiver-verifiable actual-byte checksums.
+    Verified(Vec<VerifiedCommittedBlock>),
     /// Peer's available set will receive no more additions.
     /// Stream ends after this item.
     Drained,
@@ -177,6 +195,8 @@ pub enum Frame {
     /// Holder→puller. Adds blocks to peer's available set
     /// (each block's hash must already be in committed).
     Available { blocks: Vec<CommittedBlock> },
+    /// Holder→puller. Adds checksummed blocks to the available set.
+    VerifiedAvailable { blocks: Vec<VerifiedCommittedBlock> },
     /// Holder→puller. Terminator for the availability stream.
     Drained,
     /// Puller→holder. Request the holder authorize a pull
@@ -245,6 +265,16 @@ pub trait Session: Send + Sync {
     /// puller's `pull` for that hash completes (PullAck), then
     /// dropped automatically.
     fn make_available(&self, blocks: Vec<ImmutableBlock<G2>>) -> Result<()>;
+
+    /// Publish blocks with payload checksums. Remote bundle acquisition uses
+    /// this path and requires the peer to preserve the verification metadata.
+    fn make_available_verified(
+        &self,
+        _blocks: Vec<ImmutableBlock<G2>>,
+        _payloads: Vec<VerifiedPayload>,
+    ) -> Result<()> {
+        anyhow::bail!("verified availability is not supported by this session")
+    }
 
     /// Mark the availability set complete. No more
     /// `make_available` calls will follow; peer sees
@@ -327,6 +357,13 @@ pub trait Session: Send + Sync {
     /// stream-only sessions are unaffected.
     fn wait_attached(&self) -> BoxFuture<'static, Result<()>> {
         Box::pin(async { Ok(()) })
+    }
+
+    /// Whether the holder has authorized physical pulls that have not yet
+    /// reached their `PullAck` terminal. Watchdogs must retain the session
+    /// while this is true so source pins cannot be recycled during DMA.
+    fn has_inflight_pulls(&self) -> bool {
+        false
     }
 
     /// Declare this side is finished — symmetric cooperative shutdown.
@@ -469,5 +506,23 @@ mod tests {
     #[test]
     fn commit_delta_variants_are_distinct() {
         assert_ne!(CommitDelta::Added(vec![]), CommitDelta::Closed,);
+    }
+
+    #[test]
+    fn verified_availability_round_trips_without_becoming_unverified() {
+        let hash = SequenceHash::new(7, None, 0);
+        let frame = Frame::VerifiedAvailable {
+            blocks: vec![VerifiedCommittedBlock {
+                block: CommittedBlock {
+                    hash,
+                    peer_block_id: 9,
+                },
+                ordinal: 0,
+                checksum: PayloadChecksum::from_test_bytes([5; 32]),
+            }],
+        };
+        let encoded = rmp_serde::to_vec(&frame).unwrap();
+        let decoded: Frame = rmp_serde::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, frame);
     }
 }

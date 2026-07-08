@@ -31,7 +31,7 @@
 //! wire won't generate this; tests that do it have a bug.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
 use dashmap::DashMap;
@@ -49,7 +49,7 @@ use crate::{BlockId, G2, InstanceId, SequenceHash};
 use super::{
     AvailabilityDelta, AvailabilityStream, CommitDelta, CommitStream, CommittedBlock,
     LifecycleEvent, LifecycleStream, PeerAvailable, PeerCommitted, Session, SessionFactory,
-    SessionId,
+    SessionId, VerifiedCommittedBlock, VerifiedPayload,
 };
 
 // ============================================================================
@@ -160,6 +160,7 @@ struct MockSessionInner {
     // ---- holder-side local state ----
     committed: BTreeSet<SequenceHash>,
     available_pins: BTreeMap<SequenceHash, ImmutableBlock<G2>>,
+    verified_payloads: BTreeMap<SequenceHash, VerifiedPayload>,
 
     // ---- recorders ----
     commit_calls: Vec<Vec<SequenceHash>>,
@@ -191,6 +192,7 @@ impl MockSessionInner {
             peer_avail_drained: false,
             committed: BTreeSet::new(),
             available_pins: BTreeMap::new(),
+            verified_payloads: BTreeMap::new(),
             commit_calls: Vec::new(),
             make_available_calls: Vec::new(),
             finish_commits_called: false,
@@ -223,6 +225,7 @@ pub struct MockSession {
     peer_instance_id: Mutex<Option<InstanceId>>,
     inner: Mutex<MockSessionInner>,
     pull_index: AtomicU64,
+    inflight_pulls: AtomicUsize,
     /// Cross-wired partner session (paired-mode). When set,
     /// every holder-side action (`commit`, `make_available`,
     /// `finish_*`, `close`) pushes the equivalent peer-side
@@ -265,6 +268,7 @@ impl MockSession {
             peer_instance_id: Mutex::new(peer_instance_id),
             inner: Mutex::new(MockSessionInner::new()),
             pull_index: AtomicU64::new(0),
+            inflight_pulls: AtomicUsize::new(0),
             partner: Mutex::new(None),
             active_count,
         })
@@ -293,6 +297,11 @@ impl MockSession {
     /// via `inject_peer_attached`).
     pub fn peer_instance_id(&self) -> Option<InstanceId> {
         *self.peer_instance_id.lock()
+    }
+
+    /// Override holder-side in-flight pull state for watchdog tests.
+    pub fn set_inflight_pulls_for_test(&self, count: usize) {
+        self.inflight_pulls.store(count, Ordering::Release);
     }
 
     // ---- subscribe helpers ----
@@ -409,6 +418,21 @@ impl MockSession {
             .push(AvailabilityDelta::Available(blocks));
     }
 
+    pub fn inject_peer_verified_available(&self, blocks: Vec<VerifiedCommittedBlock>) {
+        let mut inner = self.inner.lock();
+        if inner.availability_state.is_terminated() {
+            return;
+        }
+        for record in &blocks {
+            inner
+                .peer_available
+                .insert(record.block.hash, record.block.peer_block_id);
+        }
+        inner
+            .availability_state
+            .push(AvailabilityDelta::Verified(blocks));
+    }
+
     pub fn inject_peer_drained(&self) {
         let mut inner = self.inner.lock();
         if inner.availability_state.is_terminated() {
@@ -421,6 +445,10 @@ impl MockSession {
 
     pub fn inject_lifecycle(&self, event: LifecycleEvent) {
         self.inner.lock().lifecycle_state.push(event);
+    }
+
+    pub fn end_lifecycle_for_test(&self) {
+        self.inner.lock().lifecycle_state.terminate();
     }
 
     /// Resolve the Nth `pull` call (0-indexed).
@@ -560,20 +588,29 @@ impl MockSession {
 /// observes the holder's pre-attach commits/availability — same
 /// semantics velo's replay-on-subscribe gives us on the wire.
 fn replay_to_partner(holder: &Arc<MockSession>, puller: &Arc<MockSession>) {
-    let (committed, available, finish_commits, finish_avail, closed_reason) = {
+    let (committed, available, verified, finish_commits, finish_avail, closed_reason) = {
         let h = holder.inner.lock();
         let committed: Vec<SequenceHash> = h.committed.iter().copied().collect();
-        let available: Vec<CommittedBlock> = h
-            .available_pins
-            .iter()
-            .map(|(hash, block)| CommittedBlock {
+        let mut available = Vec::new();
+        let mut verified = Vec::new();
+        for (hash, block) in &h.available_pins {
+            let block = CommittedBlock {
                 hash: *hash,
                 peer_block_id: block.block_id(),
-            })
-            .collect();
+            };
+            match h.verified_payloads.get(hash) {
+                Some(payload) => verified.push(VerifiedCommittedBlock {
+                    block,
+                    ordinal: payload.ordinal,
+                    checksum: payload.checksum,
+                }),
+                None => available.push(block),
+            }
+        }
         (
             committed,
             available,
+            verified,
             h.finish_commits_called,
             h.finish_availability_called,
             h.closed_reason.clone(),
@@ -587,6 +624,9 @@ fn replay_to_partner(holder: &Arc<MockSession>, puller: &Arc<MockSession>) {
     }
     if !available.is_empty() {
         puller.inject_peer_available(available);
+    }
+    if !verified.is_empty() {
+        puller.inject_peer_verified_available(verified);
     }
     if finish_avail {
         puller.inject_peer_drained();
@@ -622,6 +662,10 @@ fn drain_availability_buffer(buf: Vec<AvailabilityDelta>) -> Vec<AvailabilityDel
                 Some(AvailabilityDelta::Available(prev)) => prev.extend(blocks),
                 _ => out.push(AvailabilityDelta::Available(blocks)),
             },
+            AvailabilityDelta::Verified(blocks) => match out.last_mut() {
+                Some(AvailabilityDelta::Verified(prev)) => prev.extend(blocks),
+                _ => out.push(AvailabilityDelta::Verified(blocks)),
+            },
             AvailabilityDelta::Drained => out.push(AvailabilityDelta::Drained),
         }
     }
@@ -639,6 +683,10 @@ impl Session for MockSession {
 
     fn endpoint(&self) -> Option<SessionEndpoint> {
         self.endpoint.clone()
+    }
+
+    fn has_inflight_pulls(&self) -> bool {
+        self.inflight_pulls.load(Ordering::Acquire) != 0
     }
 
     fn commit(&self, hashes: Vec<SequenceHash>) -> Result<()> {
@@ -667,39 +715,15 @@ impl Session for MockSession {
     }
 
     fn make_available(&self, blocks: Vec<ImmutableBlock<G2>>) -> Result<()> {
-        // Validate and mutate under a single lock guard (no TOCTOU gap).
-        let mut peer_committed_blocks: Vec<CommittedBlock> = Vec::with_capacity(blocks.len());
-        {
-            let mut inner = self.inner.lock();
-            if inner.finish_availability_called {
-                return Err(anyhow!(
-                    "make_available: cannot make_available after finish_availability"
-                ));
-            }
-            for block in &blocks {
-                let hash = block.sequence_hash();
-                if !inner.committed.contains(&hash) {
-                    return Err(anyhow!(
-                        "make_available: hash {hash:?} not in committed set"
-                    ));
-                }
-            }
-            let hashes: Vec<SequenceHash> = blocks.iter().map(|b| b.sequence_hash()).collect();
-            inner.make_available_calls.push(hashes);
-            for block in blocks {
-                let hash = block.sequence_hash();
-                let block_id = block.block_id();
-                inner.available_pins.insert(hash, block);
-                peer_committed_blocks.push(CommittedBlock {
-                    hash,
-                    peer_block_id: block_id,
-                });
-            }
-        }
-        if let Some(partner) = self.partner() {
-            partner.inject_peer_available(peer_committed_blocks);
-        }
-        Ok(())
+        self.publish_available(blocks, None)
+    }
+
+    fn make_available_verified(
+        &self,
+        blocks: Vec<ImmutableBlock<G2>>,
+        payloads: Vec<VerifiedPayload>,
+    ) -> Result<()> {
+        self.publish_available(blocks, Some(payloads))
     }
 
     fn finish_availability(&self) -> Result<()> {
@@ -730,7 +754,7 @@ impl Session for MockSession {
 
     fn peer_available(&self) -> PeerAvailable {
         let inner = self.inner.lock();
-        let v: Vec<CommittedBlock> = inner
+        let v = inner
             .peer_available
             .iter()
             .map(|(&hash, &peer_block_id)| CommittedBlock {
@@ -746,6 +770,103 @@ impl Session for MockSession {
     }
 
     fn pull(
+        &self,
+        hashes: Vec<SequenceHash>,
+        dst: Vec<MutableBlock<G2>>,
+    ) -> BoxFuture<'static, Result<Vec<MutableBlock<G2>>>> {
+        self.pull_blocks(hashes, dst)
+    }
+
+    fn pull_resource(
+        &self,
+        _resource: kvbm_common::LogicalResourceId,
+        hashes: Vec<SequenceHash>,
+        dst: Vec<MutableBlock<G2>>,
+    ) -> BoxFuture<'static, Result<Vec<MutableBlock<G2>>>> {
+        self.pull_blocks(hashes, dst)
+    }
+
+    fn lifecycle(&self) -> LifecycleStream {
+        self.take_lifecycle_stream()
+    }
+
+    fn finalize(&self, reason: Option<String>) {
+        self.finalize_inner(reason)
+    }
+
+    fn close(&self, reason: Option<String>) {
+        self.close_inner(reason)
+    }
+}
+
+impl MockSession {
+    fn publish_available(
+        &self,
+        blocks: Vec<ImmutableBlock<G2>>,
+        payloads: Option<Vec<VerifiedPayload>>,
+    ) -> Result<()> {
+        if let Some(values) = &payloads {
+            anyhow::ensure!(
+                values.len() == blocks.len(),
+                "verified availability has {} payload records for {} blocks",
+                values.len(),
+                blocks.len()
+            );
+        }
+        // Validate and mutate under a single lock guard (no TOCTOU gap).
+        let mut available = Vec::with_capacity(blocks.len());
+        {
+            let mut inner = self.inner.lock();
+            if inner.finish_availability_called {
+                return Err(anyhow!(
+                    "make_available: cannot make_available after finish_availability"
+                ));
+            }
+            for block in &blocks {
+                let hash = block.sequence_hash();
+                if !inner.committed.contains(&hash) {
+                    return Err(anyhow!(
+                        "make_available: hash {hash:?} not in committed set"
+                    ));
+                }
+            }
+            let hashes: Vec<SequenceHash> = blocks.iter().map(|b| b.sequence_hash()).collect();
+            inner.make_available_calls.push(hashes);
+            for (index, block) in blocks.into_iter().enumerate() {
+                let hash = block.sequence_hash();
+                let block_id = block.block_id();
+                inner.available_pins.insert(hash, block);
+                if let Some(payloads) = &payloads {
+                    inner.verified_payloads.insert(hash, payloads[index]);
+                } else {
+                    inner.verified_payloads.remove(&hash);
+                }
+                available.push(CommittedBlock {
+                    hash,
+                    peer_block_id: block_id,
+                });
+            }
+        }
+        if let Some(partner) = self.partner() {
+            match payloads {
+                Some(payloads) => partner.inject_peer_verified_available(
+                    available
+                        .into_iter()
+                        .zip(payloads)
+                        .map(|(block, payload)| VerifiedCommittedBlock {
+                            block,
+                            ordinal: payload.ordinal,
+                            checksum: payload.checksum,
+                        })
+                        .collect(),
+                ),
+                None => partner.inject_peer_available(available),
+            }
+        }
+        Ok(())
+    }
+
+    fn pull_blocks(
         &self,
         hashes: Vec<SequenceHash>,
         dst: Vec<MutableBlock<G2>>,
@@ -784,6 +905,7 @@ impl Session for MockSession {
                 let mut p_inner = partner.inner.lock();
                 for h in &hashes {
                     p_inner.available_pins.remove(h);
+                    p_inner.verified_payloads.remove(h);
                 }
             }
             return async move { Ok(dst) }.boxed();
@@ -817,20 +939,7 @@ impl Session for MockSession {
         .boxed()
     }
 
-    fn pull_resource(
-        &self,
-        _resource: kvbm_common::LogicalResourceId,
-        hashes: Vec<SequenceHash>,
-        dst: Vec<MutableBlock<G2>>,
-    ) -> BoxFuture<'static, Result<Vec<MutableBlock<G2>>>> {
-        self.pull(hashes, dst)
-    }
-
-    fn lifecycle(&self) -> LifecycleStream {
-        self.take_lifecycle_stream()
-    }
-
-    fn finalize(&self, reason: Option<String>) {
+    fn finalize_inner(&self, reason: Option<String>) {
         let need_signal = {
             let mut inner = self.inner.lock();
             inner.finished_reason = Some(reason);
@@ -856,7 +965,7 @@ impl Session for MockSession {
         self.maybe_finalize_paired();
     }
 
-    fn close(&self, reason: Option<String>) {
+    fn close_inner(&self, reason: Option<String>) {
         let reason_str = reason
             .clone()
             .unwrap_or_else(|| "session closed".to_string());

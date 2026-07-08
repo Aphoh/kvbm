@@ -75,10 +75,9 @@ pub(crate) struct OnboardingComposer {
     /// staging re-matched prefix (`current_prefix`) instead, which can be
     /// longer when staging bridges a hole.
     pub local_g2_count: usize,
-    /// When true, the composer issues a hub-indexer discovery + remote pull.
+    /// When true, the leader's canonical eligibility policy admitted a
+    /// hub-indexer discovery + remote pull for this request.
     pub use_remote_search: bool,
-    /// Threshold (in blocks) under which the remote pull is skipped.
-    pub min_remote_blocks: usize,
     pub status_tx: watch::Sender<OnboardingStatus>,
     pub all_g2_blocks: Arc<Mutex<Option<Vec<ImmutableBlock<G2>>>>>,
     pub match_breakdown: Arc<Mutex<MatchBreakdown>>,
@@ -199,12 +198,11 @@ impl OnboardingComposer {
         // the post-staging re-match below corrects via `current_prefix`.
         let expected_remaining_start = self.local_g2_count + self.matched_g3_blocks.len();
         let plan = plan::DiscoveryPlan::new(&self.sequence_hashes, expected_remaining_start);
-        if plan.is_empty() || plan.remaining_len() < self.min_remote_blocks {
+        if plan.is_empty() {
             crate::engine_audit!(
                 "remote_pull_skipped_plan",
                 session_id = %self.session_id,
                 remaining_len = plan.remaining_len(),
-                min_remote_blocks = self.min_remote_blocks,
                 empty = plan.is_empty()
             );
             return;

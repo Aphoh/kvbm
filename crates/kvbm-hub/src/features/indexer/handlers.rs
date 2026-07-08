@@ -71,7 +71,7 @@ pub fn create_bundle_handlers(directory: Arc<BundleDirectory>) -> [Handler; 3] {
         BUNDLE_INVALIDATE_HANDLER,
         move |ctx| {
             let directory = Arc::clone(&invalidate_directory);
-            async move { Ok(directory.invalidate(ctx.input)) }
+            async move { directory.invalidate(ctx.input).map_err(anyhow::Error::from) }
         },
     )
     .build();

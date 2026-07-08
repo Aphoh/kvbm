@@ -4,12 +4,12 @@
 use std::num::NonZeroU64;
 
 use kvbm_common::SequenceHash;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use super::{CacheIdentity, CacheManifestId};
 
 /// Manifest-scoped identity for one complete reusable prefix boundary.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
 pub struct BundleKey {
     manifest: CacheManifestId,
     boundary_hash: SequenceHash,
@@ -27,6 +27,7 @@ impl BundleKey {
     ) -> Result<Self, BundleKeyError> {
         let boundary_tokens =
             NonZeroU64::new(boundary_tokens).ok_or(BundleKeyError::ZeroBoundary)?;
+        validate_hash_encoding(boundary_hash)?;
         Ok(Self {
             manifest,
             boundary_hash,
@@ -41,6 +42,7 @@ impl BundleKey {
     ) -> Result<Self, BundleKeyError> {
         let boundary_tokens =
             NonZeroU64::new(boundary_tokens).ok_or(BundleKeyError::ZeroBoundary)?;
+        validate_hash_encoding(boundary_hash)?;
         let alignment = identity.alignment_tokens().get();
         if !boundary_tokens.get().is_multiple_of(alignment) {
             return Err(BundleKeyError::UnalignedBoundary {
@@ -75,10 +77,38 @@ impl BundleKey {
     }
 }
 
+impl<'de> Deserialize<'de> for BundleKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = BundleKeyWire::deserialize(deserializer)?;
+        Self::from_parts(wire.manifest, wire.boundary_hash, wire.boundary_tokens)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Deserialize)]
+struct BundleKeyWire {
+    manifest: CacheManifestId,
+    boundary_hash: SequenceHash,
+    boundary_tokens: u64,
+}
+
+fn validate_hash_encoding(boundary_hash: SequenceHash) -> Result<(), BundleKeyError> {
+    let mode = boundary_hash.mode();
+    if mode > 2 {
+        return Err(BundleKeyError::InvalidHashEncoding { mode });
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum BundleKeyError {
     #[error("bundle boundary must be greater than zero")]
     ZeroBoundary,
+    #[error("bundle boundary hash has invalid encoding mode {mode}")]
+    InvalidHashEncoding { mode: u8 },
     #[error("bundle boundary {boundary_tokens} is not aligned to {alignment_tokens} native tokens")]
     UnalignedBoundary {
         boundary_tokens: u64,

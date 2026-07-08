@@ -5,7 +5,8 @@ use std::collections::BTreeMap;
 use kvbm_common::{LogicalResourceId, SequenceHash};
 
 use super::{
-    BundleKey, CacheManifest, ManifestError, ModelIdentity, ResourceRequirement, ResourceRole,
+    BundleKey, CacheManifest, CacheManifestId, ManifestError, ModelIdentity, ResourceRequirement,
+    ResourceRole,
 };
 
 fn model() -> ModelIdentity {
@@ -67,6 +68,27 @@ fn manifest_digest_is_canonical_across_input_order() {
             LogicalResourceId(2)
         ]
     );
+}
+
+#[test]
+fn canonical_history_is_the_finest_resource_with_a_stable_tie_break() {
+    let manifest = manifest(
+        vec![
+            requirement(9, ResourceRole::PrefixHistory, 256),
+            requirement(7, ResourceRole::PrefixHistory, 128),
+            requirement(3, ResourceRole::PrefixHistory, 128),
+            requirement(1, ResourceRole::BoundaryCapsule, 256),
+        ],
+        [],
+    );
+
+    let identity = manifest.identity();
+    let canonical = identity
+        .canonical_history()
+        .expect("manifest has prefix history");
+
+    assert_eq!(canonical.resource(), LogicalResourceId(3));
+    assert_eq!(canonical.native_block_tokens().get(), 128);
 }
 
 #[test]
@@ -133,4 +155,24 @@ fn bundle_key_requires_a_manifest_aligned_nonzero_boundary() {
     assert!(BundleKey::new(&identity, hash, 256).is_ok());
     assert!(BundleKey::new(&identity, hash, 0).is_err());
     assert!(BundleKey::new(&identity, hash, 128).is_err());
+}
+
+#[test]
+fn bundle_key_wire_rejects_an_invalid_hash_mode_without_panicking() {
+    let mut invalid_hash = [0u8; 16];
+    invalid_hash[0] = 0b1100_0000;
+    let bytes = rmp_serde::to_vec_named(&serde_json::json!({
+        "manifest": CacheManifestId::from_bytes([1; 32]),
+        "boundary_hash": invalid_hash,
+        "boundary_tokens": 8,
+    }))
+    .unwrap();
+
+    let decoded = std::panic::catch_unwind(|| rmp_serde::from_slice::<BundleKey>(&bytes));
+
+    assert!(decoded.is_ok(), "malformed wire data must not panic");
+    assert!(
+        decoded.unwrap().is_err(),
+        "invalid bundle-boundary hash mode must be rejected"
+    );
 }

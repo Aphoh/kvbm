@@ -1,18 +1,38 @@
 #![allow(clippy::disallowed_macros)]
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use kvbm_common::{LogicalResourceId, SequenceHash};
 use kvbm_protocols::cache_manifest::{
     BundleKey, CacheManifest, ModelIdentity, ResourceRequirement, ResourceRole,
 };
 
-use super::{BundleIndex, BundleIndexError};
+use super::{BundleIndex, BundleIndexError, BundleResourcePin, BundleResourceReference};
 use crate::tiering::policy::{BundleDependencyIndex, ResourceLineage};
 
 const CSA: LogicalResourceId = LogicalResourceId(10);
 const HCA: LogicalResourceId = LogicalResourceId(11);
 const CAPSULE: LogicalResourceId = LogicalResourceId(12);
+
+struct EphemeralPin(Arc<str>);
+
+struct EphemeralReference(Weak<str>);
+
+impl BundleResourcePin for EphemeralPin {
+    type Reference = EphemeralReference;
+
+    fn make_reference(&self) -> Self::Reference {
+        EphemeralReference(Arc::downgrade(&self.0))
+    }
+}
+
+impl BundleResourceReference for EphemeralReference {
+    type Pin = EphemeralPin;
+
+    fn reacquire(&self) -> Option<Self::Pin> {
+        self.0.upgrade().map(EphemeralPin)
+    }
+}
 
 fn requirement(resource: LogicalResourceId, role: ResourceRole) -> ResourceRequirement {
     ResourceRequirement::new(resource, role, 256).expect("valid requirement")
@@ -41,11 +61,15 @@ fn key(manifest: &CacheManifest, token: u64) -> BundleKey {
     .expect("aligned key")
 }
 
-fn complete_pins() -> Vec<(LogicalResourceId, Arc<&'static str>)> {
+fn text(value: &'static str) -> Arc<str> {
+    Arc::from(value)
+}
+
+fn complete_pins() -> Vec<(LogicalResourceId, Arc<str>)> {
     vec![
-        (CSA, Arc::new("csa")),
-        (HCA, Arc::new("hca")),
-        (CAPSULE, Arc::new("capsule")),
+        (CSA, text("csa")),
+        (HCA, text("hca")),
+        (CAPSULE, text("capsule")),
     ]
 }
 
@@ -56,12 +80,7 @@ fn incomplete_candidates_never_enter_the_committed_index() {
     let mut index = BundleIndex::new();
 
     let error = index
-        .commit(
-            &identity,
-            key(&manifest, 256),
-            1,
-            vec![(CSA, Arc::new("csa"))],
-        )
+        .commit(&identity, key(&manifest, 256), 1, vec![(CSA, text("csa"))])
         .expect_err("CSA alone is not a complete bundle");
     assert_eq!(
         error,
@@ -71,7 +90,7 @@ fn incomplete_candidates_never_enter_the_committed_index() {
     );
     assert!(
         index
-            .find_longest(&identity, &[(SequenceHash::new(256, None, 256), 256)])
+            .find_longest(&identity, [(SequenceHash::new(256, None, 256), 256)])
             .is_none()
     );
 
@@ -80,7 +99,7 @@ fn incomplete_candidates_never_enter_the_committed_index() {
             &identity,
             key(&manifest, 256),
             1,
-            vec![(CSA, Arc::new("csa")), (HCA, Arc::new("hca"))],
+            vec![(CSA, text("csa")), (HCA, text("hca"))],
         )
         .expect_err("histories without a capsule are incomplete");
     assert_eq!(
@@ -106,7 +125,7 @@ fn complete_bundle_returns_the_longest_matching_boundary() {
     let lease = index
         .find_longest(
             &identity,
-            &[
+            [
                 (SequenceHash::new(512, None, 512), 512),
                 (SequenceHash::new(256, None, 256), 256),
             ],
@@ -131,7 +150,7 @@ fn manifest_and_boundary_hash_mismatches_are_misses() {
         index
             .find_longest(
                 &incompatible.identity(),
-                &[(SequenceHash::new(256, None, 256), 256)],
+                [(SequenceHash::new(256, None, 256), 256)],
             )
             .is_none()
     );
@@ -139,7 +158,7 @@ fn manifest_and_boundary_hash_mismatches_are_misses() {
         index
             .find_longest(
                 &stored.identity(),
-                &[(SequenceHash::new(999, None, 256), 256)],
+                [(SequenceHash::new(999, None, 256), 256)],
             )
             .is_none()
     );
@@ -149,9 +168,9 @@ fn manifest_and_boundary_hash_mismatches_are_misses() {
 fn bundle_lease_clones_every_resource_pin() {
     let manifest = manifest("revision-a");
     let identity = manifest.identity();
-    let csa = Arc::new("csa");
-    let hca = Arc::new("hca");
-    let capsule = Arc::new("capsule");
+    let csa = text("csa");
+    let hca = text("hca");
+    let capsule = text("capsule");
     let mut index = BundleIndex::new();
     index
         .commit(
@@ -168,7 +187,7 @@ fn bundle_lease_clones_every_resource_pin() {
 
     assert_eq!(Arc::strong_count(&csa), 2);
     let lease = index
-        .find_longest(&identity, &[(SequenceHash::new(256, None, 256), 256)])
+        .find_longest(&identity, [(SequenceHash::new(256, None, 256), 256)])
         .expect("complete bundle match");
     assert_eq!(Arc::strong_count(&csa), 3);
     assert_eq!(Arc::strong_count(&hca), 3);
@@ -178,11 +197,78 @@ fn bundle_lease_clones_every_resource_pin() {
 }
 
 #[test]
+fn missing_child_fails_closed_and_drops_every_partial_reacquisition() {
+    let manifest = manifest("revision-a");
+    let identity = manifest.identity();
+    let csa = text("csa");
+    let hca = text("hca");
+    let capsule = text("capsule");
+    let bundle_key = key(&manifest, 256);
+    let mut index = BundleIndex::new();
+    index
+        .commit(
+            &identity,
+            bundle_key,
+            1,
+            vec![
+                (CSA, EphemeralPin(Arc::clone(&csa))),
+                (HCA, EphemeralPin(Arc::clone(&hca))),
+                (CAPSULE, EphemeralPin(Arc::clone(&capsule))),
+            ],
+        )
+        .unwrap();
+    assert_eq!(Arc::strong_count(&csa), 1, "the index must not pin CSA");
+    drop(hca);
+
+    assert!(index.lease_exact(&identity, &bundle_key).is_none());
+    assert_eq!(
+        Arc::strong_count(&csa),
+        1,
+        "a failed all-resource lookup must drop earlier reacquisitions"
+    );
+    assert_eq!(Arc::strong_count(&capsule), 1);
+}
+
+#[test]
+fn returned_lease_survives_index_invalidation_and_source_eviction() {
+    let manifest = manifest("revision-a");
+    let identity = manifest.identity();
+    let csa = text("csa");
+    let hca = text("hca");
+    let capsule = text("capsule");
+    let bundle_key = key(&manifest, 256);
+    let mut index = BundleIndex::new();
+    index
+        .commit(
+            &identity,
+            bundle_key,
+            1,
+            vec![
+                (CSA, EphemeralPin(Arc::clone(&csa))),
+                (HCA, EphemeralPin(Arc::clone(&hca))),
+                (CAPSULE, EphemeralPin(Arc::clone(&capsule))),
+            ],
+        )
+        .unwrap();
+    let lease = index.lease_exact(&identity, &bundle_key).unwrap();
+    drop((csa, hca, capsule));
+    assert!(index.invalidate(bundle_key));
+
+    assert_eq!(lease.resources().len(), 3);
+    assert!(
+        lease
+            .resources()
+            .values()
+            .all(|pin| Arc::strong_count(&pin.0) == 1)
+    );
+}
+
+#[test]
 fn older_generation_cannot_overwrite_a_newer_capsule_bundle() {
     let manifest = manifest("revision-a");
     let identity = manifest.identity();
     let bundle_key = key(&manifest, 256);
-    let original = Arc::new("new-generation");
+    let original = text("new-generation");
     let mut index = BundleIndex::new();
     index
         .commit(
@@ -191,8 +277,8 @@ fn older_generation_cannot_overwrite_a_newer_capsule_bundle() {
             8,
             vec![
                 (CSA, Arc::clone(&original)),
-                (HCA, Arc::new("hca")),
-                (CAPSULE, Arc::new("capsule")),
+                (HCA, text("hca")),
+                (CAPSULE, text("capsule")),
             ],
         )
         .unwrap();
@@ -208,7 +294,7 @@ fn older_generation_cannot_overwrite_a_newer_capsule_bundle() {
         .commit(&identity, bundle_key, 8, complete_pins())
         .expect("same-generation retry is idempotent");
     let lease = index
-        .find_longest(&identity, &[(SequenceHash::new(256, None, 256), 256)])
+        .find_longest(&identity, [(SequenceHash::new(256, None, 256), 256)])
         .unwrap();
     assert_eq!(lease.generation(), 8);
     assert_eq!(Arc::strong_count(&original), 3);

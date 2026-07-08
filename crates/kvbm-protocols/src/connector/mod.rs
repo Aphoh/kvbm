@@ -37,6 +37,6 @@ pub use noop::{NoopBlockEngine, NoopWorkerSink};
 pub use protocol::{
     AcceptId, ActionFailure, ActionId, ActionStatus, BlockId, BundleOffloadPlan, BundleOnboardPlan,
     CacheScope, EvictionFence, EvictionOutcome, FenceToken, FindBlocksOutcome, FindBlocksRequest,
-    FinishedStatus, LeaderEngineError, OffloadMode, RequestId, ResourceDestination,
-    ResourceOffload, ResourceOnboard, SearchId, SequenceHash, WorkerRank,
+    FinishedStatus, LeaderEngineError, LocalPrefillEstimate, OffloadMode, RequestId,
+    ResourceDestination, ResourceOffload, ResourceOnboard, SearchId, SequenceHash, WorkerRank,
 };

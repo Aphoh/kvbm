@@ -4,13 +4,14 @@
 //! Bundle-wide candidate generation and all-resource lease acquisition.
 
 mod driver;
+mod remote;
 
 use std::num::NonZeroUsize;
 
 use kvbm_common::SequenceHash;
 use kvbm_protocols::cache_manifest::{BundleKey, CacheIdentity};
 
-use super::{BundleIndex, BundleLease};
+use super::{BundleIndex, BundleLease, BundleResourcePin};
 
 /// One request's eligible manifest-aligned boundaries in native-token space.
 pub(in crate::tiering::engine) struct BundleFindQuery<'a> {
@@ -19,6 +20,7 @@ pub(in crate::tiering::engine) struct BundleFindQuery<'a> {
     computed_tokens: usize,
     eligible_blocks: usize,
     base_block_tokens: NonZeroUsize,
+    minimum_boundary_tokens: usize,
 }
 
 impl<'a> BundleFindQuery<'a> {
@@ -35,11 +37,21 @@ impl<'a> BundleFindQuery<'a> {
             computed_tokens,
             eligible_blocks,
             base_block_tokens,
+            minimum_boundary_tokens: 0,
         }
     }
 
-    /// Find the greatest complete boundary and clone its all-resource lease.
-    pub(in crate::tiering::engine) fn find<P: Clone>(
+    /// Ignore cache entries before a dispatched prefiller's required seed.
+    pub(in crate::tiering::engine) const fn with_minimum_boundary(
+        mut self,
+        minimum_boundary_tokens: usize,
+    ) -> Self {
+        self.minimum_boundary_tokens = minimum_boundary_tokens;
+        self
+    }
+
+    /// Find the greatest complete boundary and reacquire its all-resource lease.
+    pub(in crate::tiering::engine) fn find<P: BundleResourcePin>(
         &self,
         index: &BundleIndex<P>,
     ) -> Option<BundleFindMatch<P>> {
@@ -59,7 +71,10 @@ impl<'a> BundleFindQuery<'a> {
         let Ok(boundary) = usize::try_from(key.boundary_tokens()) else {
             return false;
         };
-        if boundary <= self.computed_tokens || !boundary.is_multiple_of(block_tokens) {
+        if boundary <= self.computed_tokens
+            || boundary < self.minimum_boundary_tokens
+            || !boundary.is_multiple_of(block_tokens)
+        {
             return false;
         }
         let Some(index) = boundary
@@ -97,8 +112,11 @@ impl<'a> BundleFindQuery<'a> {
             let computed_tokens = computed_tokens?;
             let boundary = (index + 1).checked_mul(block_tokens)?;
             let boundary = u64::try_from(boundary).ok()?;
-            (boundary > computed_tokens && boundary.is_multiple_of(alignment))
-                .then_some((self.sequence_hashes[index], boundary))
+            (boundary > computed_tokens
+                && usize::try_from(boundary)
+                    .is_ok_and(|boundary| boundary >= self.minimum_boundary_tokens)
+                && boundary.is_multiple_of(alignment))
+            .then_some((self.sequence_hashes[index], boundary))
         })
     }
 }
@@ -113,6 +131,10 @@ impl<P> BundleFindMatch<P> {
     #[cfg(test)]
     pub(in crate::tiering::engine) const fn lease(&self) -> &BundleLease<P> {
         &self.lease
+    }
+
+    pub(in crate::tiering::engine) const fn key(&self) -> &BundleKey {
+        self.lease.key()
     }
 
     pub(in crate::tiering::engine) const fn matched_tokens(&self) -> usize {

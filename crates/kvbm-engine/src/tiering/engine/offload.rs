@@ -21,6 +21,7 @@ use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use futures::future::BoxFuture;
@@ -145,8 +146,30 @@ pub(super) struct BufferedOffload {
     pub(super) request_id: RequestId,
     pub(super) resource: Option<LogicalResourceId>,
     pub(super) pairs: Vec<(SequenceHash, BlockId)>,
+    pub(super) planned_bytes: Option<u64>,
     pub(super) iteration: usize,
     pub(super) completion: BufferedOffloadCompletion,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct BundleTransferObservation {
+    resource: LogicalResourceId,
+    planned_bytes: u64,
+    started_at: Instant,
+}
+
+impl BundleTransferObservation {
+    pub(super) fn start(resource: LogicalResourceId, planned_bytes: u64) -> Self {
+        Self {
+            resource,
+            planned_bytes,
+            started_at: Instant::now(),
+        }
+    }
+
+    fn duration(self) -> Duration {
+        self.started_at.elapsed()
+    }
 }
 
 /// The offload-submission seam over [`OffloadEngine`].
@@ -364,6 +387,7 @@ impl LocalConnectorEngine {
         request_id: &RequestId,
         resource: Option<LogicalResourceId>,
         pairs: Vec<(SequenceHash, BlockId)>,
+        observation: Option<BundleTransferObservation>,
         completion: BufferedOffloadCompletion,
         outcome: ActionStatus,
     ) {
@@ -380,7 +404,7 @@ impl LocalConnectorEngine {
             return;
         };
 
-        let completion = match outcome {
+        let completion = match &outcome {
             ActionStatus::Complete => {
                 let hashes = pairs.iter().map(|(hash, _)| *hash).collect::<Vec<_>>();
                 let pins = self
@@ -394,10 +418,15 @@ impl LocalConnectorEngine {
                     Err(Some(pairs.iter().map(|(_, block_id)| *block_id).collect()))
                 }
             }
-            ActionStatus::Failed(ActionFailure::Partial { block_ids }) => Err(Some(block_ids)),
-            ActionStatus::Failed(ActionFailure::Resource { block_ids, .. }) => Err(block_ids),
+            ActionStatus::Failed(ActionFailure::Partial { block_ids }) => {
+                Err(Some(block_ids.clone()))
+            }
+            ActionStatus::Failed(ActionFailure::Resource { block_ids, .. }) => {
+                Err(block_ids.clone())
+            }
             ActionStatus::Failed(ActionFailure::AllBlocks) | ActionStatus::Pending => Err(None),
         };
+        self.record_bundle_transfer(observation, &outcome, completion.is_ok());
         let transition = {
             let mut transaction = runtime.transaction();
             match completion {
@@ -406,10 +435,10 @@ impl LocalConnectorEngine {
             }
         };
 
-        let mut advertisement = None;
         let terminal = match transition {
             Ok(OffloadTransition::Pending | OffloadTransition::Settled(_)) => None,
             Ok(OffloadTransition::Abort(abort)) => {
+                self.record_bundle_transaction("abort");
                 Some(ActionStatus::Failed(ActionFailure::Resource {
                     resource: abort.failure().resource(),
                     block_ids: abort.failure().failed_blocks().map(<[usize]>::to_vec),
@@ -419,57 +448,115 @@ impl LocalConnectorEngine {
                 let (publication, _retained_sources) = commit.into_publication();
                 match runtime.take_lineages() {
                     Some(lineages) => {
-                        let mut bundles = self
-                            .bundle_index
-                            .lock()
-                            .expect("bundle-index mutex poisoned");
-                        let mut dependencies = self
-                            .bundle_dependencies
-                            .lock()
-                            .expect("bundle-dependencies mutex poisoned");
-                        let published = match publication.commit_into(&mut bundles) {
-                            Ok(metadata) => {
-                                let tracked = dependencies.track(metadata.key, lineages);
-                                if let Err(error) = tracked {
-                                    bundles.invalidate(metadata.key);
-                                    tracing::error!(%error, "bundle dependency publication failed");
-                                    false
-                                } else {
-                                    advertisement = Some(metadata);
-                                    true
-                                }
+                        let (identity, key, generation, resources) = publication.into_parts();
+                        match self.commit_bundle(identity, key, generation, resources, lineages) {
+                            Ok(()) => {
+                                self.record_bundle_transaction("commit");
+                                Some(ActionStatus::Complete)
                             }
                             Err(error) => {
-                                tracing::error!(%error, "bundle index publication failed");
-                                false
+                                tracing::error!(%error, "bundle catalog publication failed");
+                                self.record_bundle_transaction("abort");
+                                Some(ActionStatus::Failed(ActionFailure::AllBlocks))
                             }
-                        };
-                        Some(if published {
-                            ActionStatus::Complete
-                        } else {
-                            ActionStatus::Failed(ActionFailure::AllBlocks)
-                        })
+                        }
                     }
                     None => {
                         tracing::error!("bundle lineage was already consumed before publication");
+                        self.record_bundle_transaction("abort");
                         Some(ActionStatus::Failed(ActionFailure::AllBlocks))
                     }
                 }
             }
             Err(error) => {
                 tracing::error!(%error, ?resource, "bundle offload completion fold failed");
+                self.record_bundle_transaction("abort");
                 Some(ActionStatus::Failed(ActionFailure::Resource {
                     resource,
                     block_ids: None,
                 }))
             }
         };
-        if let Some(metadata) = advertisement {
-            self.advertise_committed_bundle(metadata);
-        }
         if let Some(outcome) = runtime.finish_child(terminal) {
             self.finish_save_action(action_id, request_id, outcome);
         }
+    }
+
+    fn record_bundle_transaction(&self, outcome: &'static str) {
+        if let Some(observability) = self.leader.observability() {
+            observability
+                .bundle_metrics()
+                .record_transaction("offload", outcome);
+        }
+    }
+
+    pub(super) fn record_bundle_transfer_start(
+        &self,
+        observation: Option<BundleTransferObservation>,
+    ) {
+        let Some(observation) = observation else {
+            return;
+        };
+        if let Some(observability) = self.leader.observability() {
+            observability
+                .bundle_metrics()
+                .record_resource_planned_bytes(
+                    "offload_transfer",
+                    observation.resource,
+                    observation.planned_bytes,
+                );
+        }
+    }
+
+    fn record_bundle_transfer(
+        &self,
+        observation: Option<BundleTransferObservation>,
+        status: &ActionStatus,
+        resource_committed: bool,
+    ) {
+        let Some(observation) = observation else {
+            return;
+        };
+        let Some(observability) = self.leader.observability() else {
+            return;
+        };
+        let (outcome, reason, actual_safe_bytes) =
+            transfer_metric_outcome(status, observation, resource_committed);
+        let metrics = observability.bundle_metrics();
+        let resource = observation.resource.0.to_string();
+        let duration = observation.duration();
+        metrics.record_transfer_bytes(&resource, "g1", "g2", actual_safe_bytes);
+        metrics.observe_transfer(&resource, "offload", duration);
+        metrics.record_resource_outcome(
+            "offload_transfer",
+            observation.resource,
+            outcome,
+            reason,
+            actual_safe_bytes,
+        );
+        metrics.observe_resource_duration(
+            "offload_transfer",
+            observation.resource,
+            outcome,
+            duration,
+        );
+    }
+}
+
+fn transfer_metric_outcome(
+    status: &ActionStatus,
+    observation: BundleTransferObservation,
+    resource_committed: bool,
+) -> (&'static str, &'static str, u64) {
+    if !resource_committed && matches!(status, ActionStatus::Complete) {
+        return ("failed", "incomplete_registration", 0);
+    }
+    match status {
+        ActionStatus::Complete => ("complete", "complete", observation.planned_bytes),
+        ActionStatus::Failed(ActionFailure::Partial { .. }) => ("failed", "partial_failure", 0),
+        ActionStatus::Failed(ActionFailure::Resource { .. }) => ("failed", "resource_failure", 0),
+        ActionStatus::Failed(ActionFailure::AllBlocks) => ("failed", "all_blocks", 0),
+        ActionStatus::Pending => ("failed", "nonterminal", 0),
     }
 }
 

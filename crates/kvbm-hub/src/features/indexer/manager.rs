@@ -17,6 +17,7 @@ use axum::{
     routing::{get, post},
 };
 use futures::future::BoxFuture;
+use kvbm_protocols::cache_manifest::RegistrationEpoch;
 use tokio::task::JoinHandle;
 use velo_ext::{InstanceId, PeerInfo};
 
@@ -28,7 +29,7 @@ use super::protocol::{
 };
 use super::zmq::{bind_sub_socket, bound_endpoint, port_of};
 use crate::features::{FeatureError, FeatureManager, HubContext};
-use crate::protocol::{Feature, FeatureKey};
+use crate::protocol::{Feature, FeatureKey, MutationCredential};
 
 /// Default host advertised in `GET /config`'s `zmq_endpoint` when none is
 /// configured. Single-host / loopback deployments work out of the box;
@@ -111,6 +112,15 @@ impl IndexerManager {
     /// Resolved advertised ZMQ endpoint, once `attach` has bound it.
     pub fn endpoint(&self) -> Option<&String> {
         self.endpoint.get()
+    }
+
+    /// Returns the current complete-bundle advertisement count for test gates.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn bundle_advertisement_count(&self) -> anyhow::Result<usize> {
+        self.bundle_directory
+            .advertisement_count()
+            .map_err(anyhow::Error::from)
     }
 
     fn config_response(&self) -> IndexerConfigResponse {
@@ -232,7 +242,6 @@ impl FeatureManager for IndexerManager {
                     if let Ok(mut set) = self.instances.write() {
                         set.insert(instance_id);
                     }
-                    self.bundle_directory.register_owner(instance_id);
                     tracing::debug!(
                         instance = %instance_id,
                         max_seq_len = ?cfg.max_seq_len,
@@ -249,6 +258,37 @@ impl FeatureManager for IndexerManager {
         })
     }
 
+    fn stage_registration(
+        &self,
+        instance_id: InstanceId,
+        credential: &MutationCredential,
+        registration_epoch: RegistrationEpoch,
+        participates: bool,
+    ) -> Result<(), FeatureError> {
+        self.bundle_directory
+            .stage_owner_transition(
+                instance_id,
+                participates.then(|| credential.clone()),
+                registration_epoch,
+            )
+            .map_err(anyhow::Error::from)?;
+        Ok(())
+    }
+
+    fn commit_registration(
+        &self,
+        instance_id: InstanceId,
+        _credential: &MutationCredential,
+        registration_epoch: RegistrationEpoch,
+        incarnation: crate::registry::RegistryIncarnation,
+        _participates: bool,
+    ) -> Result<(), FeatureError> {
+        self.bundle_directory
+            .bind_owner_registration(instance_id, registration_epoch, incarnation)
+            .map_err(anyhow::Error::from)?;
+        Ok(())
+    }
+
     fn on_unregister(&self, instance_id: InstanceId) {
         // Bridge the registry's velo InstanceId to the u128 the events wire
         // format carries (publishers stamp `velo_id.as_u128()`).
@@ -261,10 +301,23 @@ impl FeatureManager for IndexerManager {
 
     fn on_register_any<'a>(
         &'a self,
-        _instance_id: InstanceId,
+        instance_id: InstanceId,
         _peer: &'a PeerInfo,
+        incarnation: crate::registry::RegistryIncarnation,
     ) -> BoxFuture<'a, ()> {
-        Box::pin(async {})
+        Box::pin(async move {
+            if let Err(error) = self
+                .bundle_directory
+                .finalize_owner_registration(instance_id, incarnation)
+            {
+                tracing::error!(
+                    instance = %instance_id,
+                    %incarnation,
+                    %error,
+                    "indexer owner registration could not be finalized"
+                );
+            }
+        })
     }
 
     fn control_router(self: Arc<Self>) -> Router {
@@ -307,4 +360,95 @@ async fn post_query(
     Json(QueryResponse {
         hit: mgr.index.query(&req.hashes),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use kvbm_common::{LogicalResourceId, SequenceHash};
+    use kvbm_protocols::cache_manifest::{
+        BundleKey, BundleResourceLineage, CacheManifestId, ResourceRequirement, ResourceRole,
+    };
+
+    use super::*;
+    use crate::features::indexer::protocol::{
+        BundleAdvertisementRecord, BundlePublishRequest, BundleQueryMissReason, BundleQueryOutcome,
+        BundleQueryRequest,
+    };
+
+    #[tokio::test]
+    async fn reregister_without_indexer_removes_owner_and_old_mutation_authority() {
+        let manager = IndexerManager::new(128, 4, None, None).unwrap();
+        #[cfg(feature = "test-support")]
+        assert_eq!(manager.bundle_advertisement_count().unwrap(), 0);
+        let owner = InstanceId::new_v4();
+        let feature = Feature::Indexer(Default::default());
+        manager.on_register(owner, &feature).await.unwrap();
+
+        let old_credential = MutationCredential::generate();
+        let registration_epoch = crate::features::indexer::bundle::test_registration_epoch(owner);
+        manager
+            .bundle_directory
+            .register_owner(owner, old_credential.clone())
+            .unwrap();
+        let resource = LogicalResourceId(1);
+        let requirements =
+            vec![ResourceRequirement::new(resource, ResourceRole::PrefixHistory, 4).unwrap()];
+        let hashes = vec![SequenceHash::root(1), SequenceHash::root(1).extend(2)];
+        let manifest = CacheManifestId::from_bytes([41; 32]);
+        let key = BundleKey::from_parts(manifest, hashes[1], 8).unwrap();
+        let publish = BundlePublishRequest {
+            credential: old_credential.clone(),
+            advertisement: BundleAdvertisementRecord {
+                key,
+                generation: 1,
+                owner,
+                registration_epoch: Some(registration_epoch),
+                requirements: requirements.clone(),
+                lineages: vec![BundleResourceLineage::new(resource, hashes).unwrap()],
+                expires_at_unix_ms: 10_000,
+            },
+        };
+        manager.bundle_directory.publish(publish.clone()).unwrap();
+        #[cfg(feature = "test-support")]
+        assert_eq!(manager.bundle_advertisement_count().unwrap(), 1);
+
+        let replacement_epoch = RegistrationEpoch::new();
+        manager
+            .stage_registration(
+                owner,
+                &MutationCredential::generate(),
+                replacement_epoch,
+                false,
+            )
+            .unwrap();
+        manager
+            .commit_registration(
+                owner,
+                &MutationCredential::generate(),
+                replacement_epoch,
+                crate::registry::RegistryIncarnation::from_u64(2),
+                false,
+            )
+            .unwrap();
+        manager
+            .bundle_directory
+            .finalize_owner_registration(owner, crate::registry::RegistryIncarnation::from_u64(2))
+            .unwrap();
+        manager.on_unregister(owner);
+
+        assert!(matches!(
+            manager.bundle_directory.publish(publish),
+            Err(super::super::bundle::BundleDirectoryError::UnknownOwner { .. })
+        ));
+        assert_eq!(
+            manager.bundle_directory.query(BundleQueryRequest {
+                manifest,
+                requirements,
+                candidates: vec![key],
+                now_unix_ms: 1_000,
+            }),
+            BundleQueryOutcome::Miss(BundleQueryMissReason::NotFound)
+        );
+        assert!(manager.instances_response().instances.is_empty());
+    }
 }

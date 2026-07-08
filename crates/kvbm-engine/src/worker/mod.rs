@@ -17,6 +17,7 @@ pub use physical::{ReplicatedDataWorker, ResourceDispatchWorker};
 pub use physical::PhysicalWorker as DirectWorker;
 
 use anyhow::Result;
+use futures::future::BoxFuture;
 use std::{pin::Pin, sync::Arc};
 
 use crate::object::ObjectBlockOps;
@@ -24,7 +25,7 @@ pub use crate::{BlockId, InstanceId, SequenceHash};
 pub use kvbm_common::{LogicalLayoutHandle, LogicalResourceId};
 pub use kvbm_physical::{
     manager::{LayoutHandle, SerializedLayout},
-    transfer::TransferCompleteNotification,
+    transfer::{PayloadDigest, TransferCompleteNotification},
 };
 
 pub use velo::{VeloWorkerClient, VeloWorkerService, VeloWorkerServiceBuilder};
@@ -231,6 +232,22 @@ pub trait WorkerTransfers: Send + Sync {
 }
 
 pub trait Worker: WorkerTransfers + ObjectBlockOps + Send + Sync {
+    /// Compute actual-byte digests for local host-tier blocks in caller order.
+    ///
+    /// The default fails closed. Physical workers implement the host/pinned G2
+    /// path and remote worker clients forward it through the worker RPC plane.
+    fn compute_host_payload_digests(
+        &self,
+        resource: LogicalResourceId,
+        block_ids: Vec<BlockId>,
+    ) -> BoxFuture<'static, Result<Vec<PayloadDigest>>> {
+        Box::pin(async move {
+            anyhow::bail!(
+                "host payload digest is not implemented for resource {resource:?} blocks {block_ids:?}"
+            )
+        })
+    }
+
     /// Get the G1 layout handle for this worker (if configured).
     ///
     /// Returns None if no G1 layout has been registered with this worker.

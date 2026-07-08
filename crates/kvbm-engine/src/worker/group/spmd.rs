@@ -225,9 +225,9 @@ impl WorkerTransfers for SpmdParallelWorkers {
                     options.clone(),
                 )
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Vec<_>>();
 
-        TransferCompleteNotification::aggregate(notifications, &self.events, &self.runtime)
+        TransferCompleteNotification::aggregate_results(notifications, &self.events, &self.runtime)
     }
 
     fn execute_local_transfer_for_resource(
@@ -252,9 +252,9 @@ impl WorkerTransfers for SpmdParallelWorkers {
                     options.clone(),
                 )
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Vec<_>>();
 
-        TransferCompleteNotification::aggregate(notifications, &self.events, &self.runtime)
+        TransferCompleteNotification::aggregate_results(notifications, &self.events, &self.runtime)
     }
 
     fn execute_remote_onboard(
@@ -275,9 +275,9 @@ impl WorkerTransfers for SpmdParallelWorkers {
                     options.clone(),
                 )
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Vec<_>>();
 
-        TransferCompleteNotification::aggregate(notifications, &self.events, &self.runtime)
+        TransferCompleteNotification::aggregate_results(notifications, &self.events, &self.runtime)
     }
 
     fn execute_remote_offload(
@@ -298,9 +298,9 @@ impl WorkerTransfers for SpmdParallelWorkers {
                     options.clone(),
                 )
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Vec<_>>();
 
-        TransferCompleteNotification::aggregate(notifications, &self.events, &self.runtime)
+        TransferCompleteNotification::aggregate_results(notifications, &self.events, &self.runtime)
     }
 
     fn connect_remote(
@@ -706,33 +706,34 @@ impl WorkerTransfers for SpmdParallelWorkers {
         // worker. Stays in place until AB-4 hoists every pull through
         // `plan_pull` (locked decision #5).
         let handles = self.remote_handles.read().unwrap();
-        let mut notifications = Vec::with_capacity(self.workers.len());
-        for (worker_idx, worker) in self.workers.iter().enumerate() {
-            let remote_handle = handles
-                .get(&(instance_id, worker_idx, remote_logical_type))
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "No remote {:?} handle for instance {} worker {}",
-                        remote_logical_type,
-                        instance_id,
-                        worker_idx
-                    )
-                })?;
+        let notifications = self
+            .workers
+            .iter()
+            .enumerate()
+            .map(|(worker_idx, worker)| {
+                let remote_handle = handles
+                    .get(&(instance_id, worker_idx, remote_logical_type))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "No remote {:?} handle for instance {} worker {}",
+                            remote_logical_type,
+                            instance_id,
+                            worker_idx
+                        )
+                    })?;
+                worker.execute_remote_onboard(
+                    RemoteDescriptor::Layout {
+                        handle: *remote_handle,
+                        block_ids: src_block_ids.clone(),
+                    },
+                    dst,
+                    dst_block_ids.clone(),
+                    options.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
 
-            let descriptor = RemoteDescriptor::Layout {
-                handle: *remote_handle,
-                block_ids: src_block_ids.clone(),
-            };
-
-            notifications.push(worker.execute_remote_onboard(
-                descriptor,
-                dst,
-                dst_block_ids.clone(),
-                options.clone(),
-            )?);
-        }
-
-        TransferCompleteNotification::aggregate(notifications, &self.events, &self.runtime)
+        TransferCompleteNotification::aggregate_results(notifications, &self.events, &self.runtime)
     }
 }
 
@@ -829,19 +830,21 @@ impl SpmdParallelWorkers {
             return Ok(TransferCompleteNotification::completed());
         }
 
-        let mut notifications = Vec::with_capacity(plans.len());
-        for (local_rank, plan) in plans {
-            let worker = self.workers.get(local_rank).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "plan_pull produced a plan for local_rank {local_rank} but only {} \
-                     local workers are registered",
-                    self.workers.len()
-                )
-            })?;
-            notifications.push(worker.execute_remote_pull_plan(plan)?);
-        }
+        let notifications = plans
+            .into_iter()
+            .map(|(local_rank, plan)| {
+                let worker = self.workers.get(local_rank).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "plan_pull produced a plan for local_rank {local_rank} but only {} \
+                         local workers are registered",
+                        self.workers.len()
+                    )
+                })?;
+                worker.execute_remote_pull_plan(plan)
+            })
+            .collect::<Vec<_>>();
 
-        TransferCompleteNotification::aggregate(notifications, &self.events, &self.runtime)
+        TransferCompleteNotification::aggregate_results(notifications, &self.events, &self.runtime)
     }
 }
 

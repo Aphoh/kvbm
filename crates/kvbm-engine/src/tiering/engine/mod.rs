@@ -41,6 +41,7 @@ mod local;
 mod offload;
 mod onboard;
 mod prefill;
+mod prefill_validation;
 mod worker;
 
 pub use config::{ConnectorEngineConfig, RemoteOps};
@@ -53,8 +54,11 @@ use kvbm_protocols::connector::{EngineWorkerSink, LeaderEngine, WorkerEngineDriv
 
 use crate::leader::InstanceLeader;
 use crate::offload::OffloadEngine;
-use local::{CdRuntime, LocalConnectorEngine};
+use bundle::BundleAdmissionConfig;
+use local::CdRuntime;
 use offload::{DisabledOffloadSubmit, OffloadEngineSubmit};
+
+pub(crate) use local::LocalConnectorEngine;
 
 /// Build the in-process connector engine the connector drives, returned as BOTH of
 /// its seam faces over the same object: the [`LeaderEngine`] the connector's
@@ -64,8 +68,8 @@ use offload::{DisabledOffloadSubmit, OffloadEngineSubmit};
 ///
 /// This is the engine crate's construction entry point: the connector passes a
 /// worker handshake's `Arc<InstanceLeader>`, the worker-delegate `sink`, a
-/// [`ConnectorEngineConfig`] (the layout `block_size` plus the [`RemoteOps`]
-/// selection), and — when offload is enabled — a real [`OffloadEngine`]. The
+/// [`ConnectorEngineConfig`] (layout, remote selection, and resource admission
+/// contract), and — when offload is enabled — a real [`OffloadEngine`]. The
 /// connector never names `LocalConnectorEngine` or the offload-submit seam;
 /// this factory keeps both crate-internal. `offload: None` yields an
 /// onboard-only engine (its offload submit refuses, folding each flush to
@@ -124,6 +128,7 @@ fn build_local_connector_engine_inner(
         block_size,
         remote,
         resource_policies,
+        resource_component_bytes,
     } = config;
     let RemoteOps { search, disagg } = remote;
 
@@ -175,14 +180,14 @@ fn build_local_connector_engine_inner(
         }
     }
 
-    let engine = LocalConnectorEngine::with_offload_submit_and_policies(
+    let engine = LocalConnectorEngine::with_offload_submit_and_admission(
         leader,
         sink,
         block_size,
         search_remote,
         offload_submit,
         cd,
-        resource_policies,
+        BundleAdmissionConfig::new(resource_policies, resource_component_bytes),
     );
     (
         Arc::clone(&engine) as Arc<dyn LeaderEngine>,

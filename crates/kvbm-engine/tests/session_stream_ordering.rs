@@ -107,6 +107,9 @@ where
             .ok_or_else(|| anyhow::anyhow!("availability stream ended before Drained"))?;
         match next {
             AvailabilityDelta::Available(bs) => out.extend(bs),
+            AvailabilityDelta::Verified(records) => {
+                out.extend(records.into_iter().map(|record| record.block));
+            }
             AvailabilityDelta::Drained => return Ok(out),
         }
     }

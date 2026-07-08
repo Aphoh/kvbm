@@ -396,6 +396,32 @@ impl WorkerTransfers for VeloWorkerClient {
 }
 
 impl Worker for VeloWorkerClient {
+    fn compute_host_payload_digests(
+        &self,
+        resource: LogicalResourceId,
+        block_ids: Vec<BlockId>,
+    ) -> BoxFuture<'static, Result<Vec<PayloadDigest>>> {
+        let message = HostPayloadDigestsMessage {
+            resource,
+            block_ids,
+        };
+        let bytes = match serde_json::to_vec(&message) {
+            Ok(bytes) => Bytes::from(bytes),
+            Err(error) => return Box::pin(async move { Err(error.into()) }),
+        };
+        let messenger = Arc::clone(&self.messenger);
+        let remote = self.remote;
+        Box::pin(async move {
+            let response = messenger
+                .unary(handler_names::HOST_PAYLOAD_DIGESTS)?
+                .raw_payload(bytes)
+                .instance(remote)
+                .send()
+                .await?;
+            serde_json::from_slice(&response).map_err(Into::into)
+        })
+    }
+
     fn g1_handle(&self) -> Option<LayoutHandle> {
         self.g1_handle.get().copied()
     }

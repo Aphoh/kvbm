@@ -44,6 +44,7 @@ pub mod context;
 pub(crate) mod executor;
 pub(crate) mod fill;
 pub(crate) mod graph_cache;
+mod integrity;
 pub(crate) mod kernel_catalog;
 pub(crate) mod lower;
 pub(crate) mod notifications;
@@ -65,6 +66,7 @@ pub use checksum::{BlockChecksum, compute_block_checksums, compute_layer_checksu
 pub use context::{TransferCompleteNotification, TransferConfig};
 pub use dynamo_memory::nixl::NixlAgent;
 pub use fill::{FillPattern, fill_blocks, fill_layers};
+pub use integrity::{PayloadDigest, compute_host_block_digests};
 pub use options::{TransferOptions, TransferOptionsBuilder};
 // AB-1d: TransferSelection is the input shape for sliced cross-leader
 // transfers. Exposed for the cross-parallelism dispatcher (AB-2) which

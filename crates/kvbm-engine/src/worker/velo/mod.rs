@@ -60,6 +60,7 @@ pub(crate) mod handler_names {
     /// `crate::leader::dispatch::WorkerPullPlan` whose `shards` list
     /// drives one or more sliced reads from rank-aware remote handles.
     pub const REMOTE_PULL_PLAN: &str = "kvbm.worker.remote_pull_plan";
+    pub const HOST_PAYLOAD_DIGESTS: &str = "kvbm.worker.host_payload_digests";
     pub const OBJECT_HAS_BLOCKS: &str = "kvbm.worker.object_has_blocks";
     pub const OBJECT_PUT_BLOCKS: &str = "kvbm.worker.object_put_blocks";
     pub const OBJECT_GET_BLOCKS: &str = "kvbm.worker.object_get_blocks";
@@ -151,6 +152,12 @@ struct LocalTransferMessage {
     src_block_ids: Vec<BlockId>,
     dst_block_ids: Vec<BlockId>,
     options: SerializableTransferOptions,
+}
+
+#[derive(Serialize, Deserialize)]
+struct HostPayloadDigestsMessage {
+    resource: LogicalResourceId,
+    block_ids: Vec<BlockId>,
 }
 
 #[cfg(test)]

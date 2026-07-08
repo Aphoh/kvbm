@@ -29,6 +29,7 @@ use kvbm_common::{LogicalResourceId, SequenceHash};
 use serde::{Deserialize, Serialize};
 use velo_ext::InstanceId;
 
+use crate::cache_manifest::RegistrationEpoch;
 use crate::disagg::{SessionEndpoint, SessionId};
 
 // ---------------------------------------------------------------------------
@@ -170,6 +171,16 @@ pub struct OpenTransferSessionRequest {
     /// `Duration` to keep the JSON shape unambiguous.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watchdog_ms: Option<u64>,
+
+    /// Registration lifecycle expected of the holder. Complete-bundle pulls
+    /// always set this from their directory hit; ordinary legacy transfer
+    /// callers may omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_epoch: Option<RegistrationEpoch>,
+
+    /// Require the holder to publish actual-byte payload checksums.
+    #[serde(default)]
+    pub require_payload_integrity: bool,
 }
 
 impl OpenTransferSessionRequest {
@@ -247,6 +258,10 @@ pub struct PullFromSessionRequest {
     /// `None` selects the puller's primary resource for legacy callers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource: Option<LogicalResourceId>,
+
+    /// Reject unverified availability and compare payload bytes before staging.
+    #[serde(default)]
+    pub require_payload_integrity: bool,
 }
 
 /// Response for [`PULL_FROM_SESSION_HANDLER`].
@@ -455,6 +470,7 @@ mod tests {
             endpoint: None,
             selector: None,
             resource: Some(LogicalResourceId(7)),
+            require_payload_integrity: true,
         };
         let s = serde_json::to_string(&req).unwrap();
         let back: PullFromSessionRequest = serde_json::from_str(&s).unwrap();
@@ -463,6 +479,7 @@ mod tests {
         assert!(back.endpoint.is_none());
         assert!(back.selector.is_none());
         assert_eq!(back.resource, Some(LogicalResourceId(7)));
+        assert!(back.require_payload_integrity);
     }
 
     #[test]
@@ -473,6 +490,7 @@ mod tests {
         });
         let decoded: PullFromSessionRequest = serde_json::from_value(wire).unwrap();
         assert!(decoded.resource.is_none());
+        assert!(!decoded.require_payload_integrity);
     }
 
     #[test]

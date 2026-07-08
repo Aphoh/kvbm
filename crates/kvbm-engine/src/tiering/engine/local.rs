@@ -45,7 +45,7 @@
 // consumers; one module-level allow covers that gap.
 #![allow(dead_code)]
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use anyhow::Result;
@@ -64,7 +64,10 @@ use kvbm_protocols::connector::{BlockId, RequestId, SequenceHash};
 use kvbm_logical::BlockEvictionObserver;
 use kvbm_logical::blocks::ImmutableBlock;
 
-use super::bundle::{BundleIndex, BundleLease};
+use super::bundle::{
+    BundleAdmissionConfig, BundleCatalog, BundleDirectoryOrder, BundleLease,
+    BundlePublicationRuntime,
+};
 use super::driver::{ActionRecord, FenceBarrier};
 use super::inflight::{InflightKey, InflightOnboards};
 use super::offload::{
@@ -85,7 +88,6 @@ use crate::remote::cd::output::PrefillOutputObserver;
 use crate::remote::cd::prefill::PrefillRequests;
 use crate::remote::cd::state::{CdRequestState, CdRequests};
 use crate::remote::cd::wire::{PrefillDispatch, PrefillPlane};
-use crate::tiering::policy::{BundleDependencyIndex, ResourcePolicies};
 
 /// Per-search engine state, keyed by [`SearchId`] in `searches`.
 pub(super) struct SearchState {
@@ -115,14 +117,67 @@ pub(super) struct BundleSearchState {
 /// and `Some`/`Some` combinations.
 pub(super) enum BundleSearchSource {
     Local(BundleLease<Vec<ImmutableBlock<G2>>>),
-    Remote(tokio::sync::oneshot::Receiver<Result<Option<BundleKey>, String>>),
+    Remote(RemoteBundleSearch),
+}
+
+/// Terminal ownership returned by a remote search task. A selected lease is
+/// moved through the channel so no eviction gap exists between pull/dispatch
+/// completion and the connector's next poll.
+pub(super) enum RemoteBundleResolution {
+    Selected(BundleLease<Vec<ImmutableBlock<G2>>>),
+    Fallback,
+    Miss,
+}
+
+/// Pending remote lookup ownership. Dropping the opaque connector search
+/// handle removes this state, which cancels discovery/pull before it can
+/// publish a late result.
+pub(super) struct RemoteBundleSearch {
+    result: tokio::sync::oneshot::Receiver<Result<RemoteBundleResolution, String>>,
+    cancel: tokio_util::sync::CancellationToken,
+    fallback: Option<BundleLease<Vec<ImmutableBlock<G2>>>>,
+}
+
+impl RemoteBundleSearch {
+    pub(super) fn new(
+        result: tokio::sync::oneshot::Receiver<Result<RemoteBundleResolution, String>>,
+        cancel: tokio_util::sync::CancellationToken,
+        fallback: Option<BundleLease<Vec<ImmutableBlock<G2>>>>,
+    ) -> Self {
+        Self {
+            result,
+            cancel,
+            fallback,
+        }
+    }
+
+    pub(super) fn try_recv(
+        &mut self,
+    ) -> Result<Result<RemoteBundleResolution, String>, tokio::sync::oneshot::error::TryRecvError>
+    {
+        self.result.try_recv()
+    }
+
+    pub(super) fn fallback(&self) -> Option<&BundleLease<Vec<ImmutableBlock<G2>>>> {
+        self.fallback.as_ref()
+    }
+
+    pub(super) fn take_fallback(&mut self) -> Option<BundleLease<Vec<ImmutableBlock<G2>>>> {
+        self.fallback.take()
+    }
+}
+
+impl Drop for RemoteBundleSearch {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
 }
 
 impl BundleSearchState {
-    pub(super) const fn lease(&self) -> Option<&BundleLease<Vec<ImmutableBlock<G2>>>> {
+    pub(super) fn lease(&self) -> Option<&BundleLease<Vec<ImmutableBlock<G2>>>> {
         match &self.source {
             BundleSearchSource::Local(lease) => Some(lease),
-            BundleSearchSource::Remote(_) => None,
+            BundleSearchSource::Remote(remote) => remote.fallback(),
         }
     }
 }
@@ -132,8 +187,15 @@ pub(crate) struct LocalConnectorEngine {
     pub(super) leader: Arc<InstanceLeader>,
     pub(super) sink: Arc<dyn EngineWorkerSink>,
     pub(super) block_size: usize,
-    /// Model-configured resource policy, kept out of connector/model branches.
-    pub(super) resource_policies: ResourcePolicies,
+    /// Internal fail-safe for exact bundle G2-to-G1 onboards. This bounds the
+    /// logical action only; launched transfer work remains quarantined behind
+    /// its physical-drain fence until every completion notification settles.
+    pub(super) bundle_onboard_watchdog_ms: AtomicU64,
+    /// Serializes collective-bearing G2-to-G1 resource onboards across every
+    /// request sharing the leader's rank-local collective communicator.
+    pub(super) resource_onboard_admission: tokio::sync::Mutex<()>,
+    /// Immutable whole-bundle admission policy and physical byte geometry.
+    pub(super) bundle_admission: BundleAdmissionConfig,
     /// Whether shard finds request the leader's remote-search path. Set from
     /// the [`RemoteOps`](super::RemoteOps) selection at construction; threaded
     /// into every `FindMatchesOptions` the engine issues.
@@ -150,10 +212,14 @@ pub(crate) struct LocalConnectorEngine {
     /// Pairs buffered by `offload`, flushed by `finish_forward_pass` (Decision A:
     /// never enqueue a G1 read mid-forward-pass).
     pub(super) offload_buffer: Mutex<Vec<BufferedOffload>>,
-    /// Only complete, manifest-scoped multi-resource bundles are visible here.
-    pub(super) bundle_index: Mutex<BundleIndex<Vec<ImmutableBlock<G2>>>>,
-    /// Reverse resource-block lineage for every committed bundle.
-    pub(super) bundle_dependencies: Mutex<BundleDependencyIndex>,
+    /// Complete bundle visibility, reverse lineage, and retired generations.
+    /// One mutex makes publication and eviction callbacks atomic.
+    pub(super) bundle_catalog: Mutex<BundleCatalog<Vec<ImmutableBlock<G2>>>>,
+    /// Orders same-key remote directory updates across async
+    /// advertise/invalidate calls without serializing independent bundles.
+    pub(super) bundle_directory_order: BundleDirectoryOrder,
+    /// Owner-local timing and lifecycle for remote bundle publications.
+    pub(super) bundle_publications: BundlePublicationRuntime,
     /// Keeps manager-installed weak eviction callbacks live with this engine.
     bundle_eviction_observers: Vec<Arc<dyn BlockEvictionObserver>>,
     /// Requests with at least one offload — the once-only source for
@@ -360,6 +426,15 @@ impl CdRuntime {
 }
 
 impl LocalConnectorEngine {
+    #[cfg(feature = "testing")]
+    pub(crate) fn testing_bundle_visible(&self, identity: &CacheIdentity, key: &BundleKey) -> bool {
+        self.bundle_catalog
+            .lock()
+            .expect("bundle-catalog mutex poisoned")
+            .lease_exact(identity, key)
+            .is_some()
+    }
+
     /// Build the engine over a concrete leader, a worker sink, and the layout
     /// block size (carried here because `InstanceLeader` exposes no block-size
     /// accessor). Returns `Arc<Self>` — callers coerce to `Arc<dyn LeaderEngine>`.
@@ -397,25 +472,25 @@ impl LocalConnectorEngine {
         offload_submit: Arc<dyn OffloadSubmit>,
         cd: Option<CdRuntime>,
     ) -> Arc<Self> {
-        Self::with_offload_submit_and_policies(
+        Self::with_offload_submit_and_admission(
             leader,
             sink,
             block_size,
             search_remote,
             offload_submit,
             cd,
-            ResourcePolicies::default(),
+            BundleAdmissionConfig::default(),
         )
     }
 
-    pub(super) fn with_offload_submit_and_policies(
+    pub(super) fn with_offload_submit_and_admission(
         leader: Arc<InstanceLeader>,
         sink: Arc<dyn EngineWorkerSink>,
         block_size: usize,
         search_remote: bool,
         offload_submit: Arc<dyn OffloadSubmit>,
         cd: Option<CdRuntime>,
-        resource_policies: ResourcePolicies,
+        bundle_admission: BundleAdmissionConfig,
     ) -> Arc<Self> {
         // Source the in-flight-onboard gauge from the leader's observability
         // BEFORE `leader` moves into the cyclic closure. Bare test leaders have
@@ -441,7 +516,9 @@ impl LocalConnectorEngine {
                 leader,
                 sink,
                 block_size,
-                resource_policies,
+                bundle_onboard_watchdog_ms: AtomicU64::new(30_000),
+                resource_onboard_admission: tokio::sync::Mutex::new(()),
+                bundle_admission,
                 search_remote,
                 searches: DashMap::new(),
                 bundle_searches: DashMap::new(),
@@ -449,8 +526,9 @@ impl LocalConnectorEngine {
                 by_request: DashMap::new(),
                 offload_submit,
                 offload_buffer: Mutex::new(Vec::new()),
-                bundle_index: Mutex::new(BundleIndex::new()),
-                bundle_dependencies: Mutex::new(BundleDependencyIndex::new()),
+                bundle_catalog: Mutex::new(BundleCatalog::new()),
+                bundle_directory_order: BundleDirectoryOrder::new(),
+                bundle_publications: BundlePublicationRuntime::new(),
                 bundle_eviction_observers,
                 offload_drains: DashMap::new(),
                 current_iteration: AtomicUsize::new(0),
@@ -459,6 +537,29 @@ impl LocalConnectorEngine {
                 inflight: Mutex::new(InflightOnboards::with_gauge(inflight_gauge)),
             }
         })
+    }
+
+    pub(super) fn bundle_onboard_watchdog(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.bundle_onboard_watchdog_ms.load(Ordering::Relaxed))
+    }
+
+    #[cfg(test)]
+    pub(in crate::tiering::engine) fn set_bundle_onboard_watchdog_for_test(
+        &self,
+        watchdog: std::time::Duration,
+    ) {
+        self.bundle_onboard_watchdog_ms.store(
+            u64::try_from(watchdog.as_millis()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    #[cfg(test)]
+    pub(in crate::tiering::engine) fn set_bundle_publication_clock_for_test(
+        &self,
+        clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+    ) {
+        self.bundle_publications.set_clock(clock);
     }
 }
 
@@ -756,6 +857,7 @@ impl LocalConnectorEngine {
                 request_id: req.clone(),
                 resource,
                 pairs,
+                planned_bytes: None,
                 iteration: self.current_iteration.load(Ordering::Relaxed),
                 completion: BufferedOffloadCompletion::Single,
             });
@@ -812,6 +914,7 @@ impl LeaderEngine for LocalConnectorEngine {
         // worker reuses G1 blocks only after every in-flight-at-eviction action has
         // drained — never on the first.
         let mut barrier: Option<Arc<FenceBarrier>> = None;
+        let mut cancellations = Vec::new();
         for id in &action_ids {
             if let Some(mut record) = self.actions.get_mut(id) {
                 let still_pending = record.cell.upgrade().is_some_and(|cell| {
@@ -825,7 +928,7 @@ impl LeaderEngine for LocalConnectorEngine {
                 // `fence.is_none()` is a cheap strict improvement: it stops a second
                 // evict from reassigning a live barrier (which would drop the prior
                 // clone and complete that fence one drain early).
-                if still_pending && record.fence.is_none() {
+                if (still_pending || record.physical_pending) && record.fence.is_none() {
                     let shared = barrier.get_or_insert_with(|| {
                         let worker_count = self.leader.worker_count().max(1);
                         let tokens = (0..worker_count as u32).map(FenceToken::new).collect();
@@ -833,7 +936,15 @@ impl LeaderEngine for LocalConnectorEngine {
                     });
                     record.fence = Some(Arc::clone(shared));
                 }
+                if record.physical_pending
+                    && let Some(cancel) = record.cancel.as_ref()
+                {
+                    cancellations.push(cancel.clone());
+                }
             }
+        }
+        for cancel in cancellations {
+            cancel.cancel();
         }
 
         // Tokens (and the leader's observational handle) are returned IFF at least
@@ -960,7 +1071,7 @@ impl LeaderEngine for LocalConnectorEngine {
         // `dropped_by_handle` under the per-action guard; the driver's terminal
         // then removes the record. Legacy actions with no in-flight key retain
         // the original lock-free status path.
-        let defer = {
+        let (defer, cancel) = {
             if let Some(mut record) = self.actions.get_mut(id) {
                 let bundle_pending = record.inflight.is_some()
                     && record.cell.upgrade().is_some_and(|cell| {
@@ -969,15 +1080,25 @@ impl LeaderEngine for LocalConnectorEngine {
                             ActionStatus::Pending
                         )
                     });
-                let armed = record.fence.is_some() || record.drain.is_some() || bundle_pending;
+                let armed = record.fence.is_some()
+                    || record.drain.is_some()
+                    || bundle_pending
+                    || record.physical_pending;
                 if armed {
                     record.dropped_by_handle = true;
                 }
-                armed
+                let cancel = record
+                    .physical_pending
+                    .then(|| record.cancel.as_ref().cloned())
+                    .flatten();
+                (armed, cancel)
             } else {
-                false
+                (false, None)
             }
         };
+        if let Some(cancel) = cancel {
+            cancel.cancel();
+        }
         if !defer {
             self.remove_action_record(id);
         }
@@ -1959,9 +2080,16 @@ impl LocalConnectorEngine {
                 request_id,
                 resource,
                 pairs,
+                planned_bytes,
                 completion,
                 ..
             } = b;
+            let observation = resource
+                .zip(planned_bytes)
+                .map(|(resource, planned_bytes)| {
+                    offload::BundleTransferObservation::start(resource, planned_bytes)
+                });
+            self.record_bundle_transfer_start(observation);
             let blocks = offload::build_external_blocks(&pairs);
             match self
                 .offload_submit
@@ -1979,6 +2107,7 @@ impl LocalConnectorEngine {
                             &request_id,
                             resource,
                             pairs,
+                            observation,
                             completion,
                             outcome,
                         );
@@ -1995,6 +2124,7 @@ impl LocalConnectorEngine {
                         &request_id,
                         resource,
                         pairs,
+                        observation,
                         completion,
                         ActionStatus::Failed(ActionFailure::AllBlocks),
                     );
@@ -2056,11 +2186,21 @@ mod tests {
         OnboardingStatus, ReadyResult, SessionId,
     };
     use crate::offload::{ExternalBlock, TransferStatus};
+    use crate::{ConnectorEngineConfig, RemoteOps};
     use kvbm_protocols::connector::NoopWorkerSink;
     use kvbm_protocols::connector::{LoadOutcome, SaveOutcome};
     use std::sync::Mutex as StdMutex;
     use tokio::sync::{Mutex as TokioMutex, watch};
     use uuid::Uuid;
+
+    fn connector_config(block_size: usize, remote: RemoteOps) -> ConnectorEngineConfig {
+        ConnectorEngineConfig {
+            block_size,
+            remote,
+            resource_policies: Default::default(),
+            resource_component_bytes: Default::default(),
+        }
+    }
 
     // ----- offload-submission double (OffloadEngine needs GPU/velo) -----
 
@@ -3025,6 +3165,7 @@ mod tests {
             num_computed_tokens: 0,
             total_tokens,
             transfer_params: None,
+            local_prefill_estimate: None,
         }
     }
 
@@ -3852,7 +3993,7 @@ mod tests {
     /// nothing, so a subsequent `set_remote_discovery` succeeds (`true`).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn search_remoteops_installs_discovery_disabled_does_not() -> Result<()> {
-        use super::super::{ConnectorEngineConfig, RemoteOps, build_local_connector_engine};
+        use super::super::{RemoteOps, build_local_connector_engine};
         use crate::remote::search::discovery::{
             RemoteBlockDiscovery, RemoteCandidates, RemoteDiscoveryHandle,
         };
@@ -3876,11 +4017,7 @@ mod tests {
         let _engine = build_local_connector_engine(
             search_leader.clone(),
             NoopWorkerSink::new(),
-            ConnectorEngineConfig {
-                block_size: BS,
-                remote: RemoteOps::with_search(stub()),
-                resource_policies: Default::default(),
-            },
+            connector_config(BS, RemoteOps::with_search(stub())),
             None,
         );
         assert!(
@@ -3893,11 +4030,7 @@ mod tests {
         let _engine = build_local_connector_engine(
             disabled_leader.clone(),
             NoopWorkerSink::new(),
-            ConnectorEngineConfig {
-                block_size: BS,
-                remote: RemoteOps::default(),
-                resource_policies: Default::default(),
-            },
+            connector_config(BS, RemoteOps::default()),
             None,
         );
         assert!(
@@ -3943,7 +4076,7 @@ mod tests {
         use crate::remote::cd::policy::SelectionPolicy;
         use crate::testing::managers::{TestManagerBuilder, TestRegistryBuilder};
         use crate::testing::token_blocks::create_token_sequence;
-        use crate::{ConnectorEngineConfig, RemoteOps, build_local_connector_engine};
+        use crate::{RemoteOps, build_local_connector_engine};
 
         // ----- fixtures: real G2 immutable blocks + recording prefill plane -----
 
@@ -4186,9 +4319,9 @@ mod tests {
             let plane = RecordingPrefillPlane::ok();
 
             // Factory path: exercises with_disagg + mod.rs CdRuntime construction.
-            let config = ConnectorEngineConfig {
-                block_size: BS,
-                remote: RemoteOps::default().with_disagg(
+            let config = connector_config(
+                BS,
+                RemoteOps::default().with_disagg(
                     factory.clone(),
                     plane.clone(),
                     Arc::new(TierCell::default()),
@@ -4199,8 +4332,7 @@ mod tests {
                         ..DisaggConfig::default()
                     },
                 ),
-                resource_policies: Default::default(),
-            };
+            );
             let (engine, _driver) =
                 build_local_connector_engine(Arc::new(leader), NoopWorkerSink::new(), config, None);
 
@@ -5339,16 +5471,15 @@ mod tests {
             let leader = Arc::new(build_test_leader().await?);
             let factory = MockSessionFactory::new();
             let plane = RecordingPrefillPlane::ok();
-            let config = ConnectorEngineConfig {
-                block_size: BS,
-                remote: RemoteOps::default().with_disagg(
+            let config = connector_config(
+                BS,
+                RemoteOps::default().with_disagg(
                     factory,
                     plane,
                     Arc::new(TierCell::default()),
                     DisaggConfig::default(),
                 ),
-                resource_policies: Default::default(),
-            };
+            );
             let (_engine, _driver) =
                 build_local_connector_engine(leader, NoopWorkerSink::new(), config, None);
             Ok(())
@@ -9106,6 +9237,7 @@ mod tests {
                 num_computed_tokens,
                 total_tokens,
                 transfer_params: None,
+                local_prefill_estimate: None,
             }
         }
 
@@ -9130,6 +9262,7 @@ mod tests {
                 transfer_params: Some(kvbm_protocols::disagg::TransferParams::remote_prefill(
                     params,
                 )),
+                local_prefill_estimate: None,
             }
         }
 
@@ -9253,6 +9386,7 @@ mod tests {
         /// manager, invisible to its leader). Recording workers capture the
         /// delegation onboard's G2→G1 transfers.
         struct FallthroughRig {
+            holder_f: Arc<MockSessionFactory>,
             workers: Arc<RecordingWorkers>,
             engine: Arc<LocalConnectorEngine>,
             plhs: Vec<SequenceHash>,
@@ -9263,7 +9397,7 @@ mod tests {
             use crate::testing::messenger::create_messenger_tcp;
             use kvbm_logical::blocks::BlockRegistry;
 
-            let (_holder_f, puller_f) = MockSessionFactory::make_paired();
+            let (holder_f, puller_f) = MockSessionFactory::make_paired();
             let resolver = RecordingResolver::new();
             let workers = RecordingWorkers::new();
             let messenger = create_messenger_tcp().await?;
@@ -9299,11 +9433,17 @@ mod tests {
                 Some(cd),
             );
             Ok(FallthroughRig {
+                holder_f,
                 workers,
                 engine,
                 plhs,
                 _held: held,
             })
+        }
+
+        fn open_fallthrough_holder(rig: &FallthroughRig, session_id: Uuid) -> Arc<MockSession> {
+            rig.holder_f.open(session_id).expect("holder open");
+            rig.holder_f.last_opened().expect("holder recorded")
         }
 
         /// Fresh local hit: token-granular `hit_blocks × block_size`, a minted
@@ -9984,11 +10124,13 @@ mod tests {
                 SearchId::new(),
                 Arc::downgrade(&dyn_engine),
             );
+            let session_id = Uuid::new_v4();
+            let holder = open_fallthrough_holder(&rig, session_id);
             let req = fb_prefill_req(
                 &rig.plhs,
-                Uuid::new_v4(),
+                session_id,
                 Uuid::new_v4().into(),
-                None,
+                holder.endpoint(),
                 BS,
                 0,
                 3 * BS + 1,
@@ -10336,13 +10478,15 @@ mod tests {
         async fn find_blocks_prefill_fallthrough_local_hit_binds_internal_search() -> Result<()> {
             let rig = fallthrough_rig(4).await?;
             let cdr = rig.engine.cd.as_ref().unwrap();
+            let session_id = Uuid::new_v4();
+            let holder = open_fallthrough_holder(&rig, session_id);
 
             // provided == computed → zero external; chain[1..4] resident.
             let req = fb_prefill_req(
                 &rig.plhs,
-                Uuid::new_v4(),
+                session_id,
                 Uuid::new_v4().into(),
-                None,
+                holder.endpoint(),
                 BS,
                 BS,
                 4 * BS + 1,
@@ -10376,6 +10520,8 @@ mod tests {
         async fn find_blocks_prefill_fallthrough_internal_mint_exempt_from_deferral() -> Result<()>
         {
             let rig = fallthrough_rig(4).await?;
+            let session_id = Uuid::new_v4();
+            let holder = open_fallthrough_holder(&rig, session_id);
 
             // An in-flight onboard covers part of the eligible window.
             rig.engine
@@ -10394,9 +10540,9 @@ mod tests {
             // The dispatched prefill's fall-through mint proceeds.
             let req = fb_prefill_req(
                 &rig.plhs,
-                Uuid::new_v4(),
+                session_id,
                 Uuid::new_v4().into(),
-                None,
+                holder.endpoint(),
                 BS,
                 BS,
                 4 * BS + 1,
@@ -10413,12 +10559,14 @@ mod tests {
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn onboard_blocks_zero_stored_delegates_to_bound_search() -> Result<()> {
             let rig = fallthrough_rig(4).await?;
+            let session_id = Uuid::new_v4();
+            let holder = open_fallthrough_holder(&rig, session_id);
 
             let req = fb_prefill_req(
                 &rig.plhs,
-                Uuid::new_v4(),
+                session_id,
                 Uuid::new_v4().into(),
-                None,
+                holder.endpoint(),
                 BS,
                 BS,
                 4 * BS + 1,
@@ -10471,12 +10619,14 @@ mod tests {
         async fn find_blocks_handle_drop_releases_prefill_and_bound_search() -> Result<()> {
             let rig = fallthrough_rig(4).await?;
             let cdr = rig.engine.cd.as_ref().unwrap();
+            let session_id = Uuid::new_v4();
+            let holder = open_fallthrough_holder(&rig, session_id);
 
             let req = fb_prefill_req(
                 &rig.plhs,
-                Uuid::new_v4(),
+                session_id,
                 Uuid::new_v4().into(),
-                None,
+                holder.endpoint(),
                 BS,
                 BS,
                 4 * BS + 1,

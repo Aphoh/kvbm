@@ -619,52 +619,50 @@ impl LocalConnectorEngine {
             let mut filled: HashSet<SequenceHash> = HashSet::new();
             let mut avail = session.availability();
             while let Some(delta) = avail.next().await {
-                match delta {
-                    AvailabilityDelta::Available(blocks) => {
-                        for b in &blocks {
-                            if !slot_of.contains_key(&b.hash) {
-                                bail!(
-                                    "prefill pipeline: availability carried hash {:?} not in \
-                                     the expected provided window",
-                                    b.hash
-                                );
-                            }
-                        }
-                        let mut indexed: Vec<(usize, SequenceHash)> = blocks
-                            .into_iter()
-                            .filter(|b| !filled.contains(&b.hash))
-                            .map(|b| (slot_of[&b.hash], b.hash))
-                            .collect();
-                        if indexed.is_empty() {
-                            continue;
-                        }
-                        indexed.sort_by_key(|(slot, _)| *slot);
-                        // Within-delta duplicates (a peer double-publish, or
-                        // the replay coalescer merging pre-subscribe deltas)
-                        // would land the same slot twice — the `filled`
-                        // filter only dedups across deltas. See the decode
-                        // drain in `onboard::run_remote_onboard`.
-                        indexed.dedup_by_key(|(slot, _)| *slot);
-
-                        for run in onboard::group_contiguous_runs(indexed) {
-                            let hashes: Vec<SequenceHash> = run.iter().map(|(_, h)| *h).collect();
-                            let registered = onboard::pull_run_into_g2(
-                                &self.leader,
-                                &session,
-                                hashes,
-                                self.block_size,
-                            )
-                            .await?;
-                            for ((slot, hash), block) in run.iter().zip(registered) {
-                                state.push_registered(*slot, block);
-                                filled.insert(*hash);
-                            }
-                        }
-                        if filled.len() == expected_count {
-                            break;
-                        }
+                let blocks = match delta {
+                    AvailabilityDelta::Available(blocks) => blocks,
+                    AvailabilityDelta::Verified(records) => {
+                        records.into_iter().map(|record| record.block).collect()
                     }
                     AvailabilityDelta::Drained => break,
+                };
+                for b in &blocks {
+                    if !slot_of.contains_key(&b.hash) {
+                        bail!(
+                            "prefill pipeline: availability carried hash {:?} not in \
+                                     the expected provided window",
+                            b.hash
+                        );
+                    }
+                }
+                let mut indexed: Vec<(usize, SequenceHash)> = blocks
+                    .into_iter()
+                    .filter(|b| !filled.contains(&b.hash))
+                    .map(|b| (slot_of[&b.hash], b.hash))
+                    .collect();
+                if indexed.is_empty() {
+                    continue;
+                }
+                indexed.sort_by_key(|(slot, _)| *slot);
+                // Within-delta duplicates (a peer double-publish, or
+                // the replay coalescer merging pre-subscribe deltas)
+                // would land the same slot twice — the `filled`
+                // filter only dedups across deltas. See the decode
+                // drain in `onboard::run_remote_onboard`.
+                indexed.dedup_by_key(|(slot, _)| *slot);
+
+                for run in onboard::group_contiguous_runs(indexed) {
+                    let hashes: Vec<SequenceHash> = run.iter().map(|(_, h)| *h).collect();
+                    let registered =
+                        onboard::pull_run_into_g2(&self.leader, &session, hashes, self.block_size)
+                            .await?;
+                    for ((slot, hash), block) in run.iter().zip(registered) {
+                        state.push_registered(*slot, block);
+                        filled.insert(*hash);
+                    }
+                }
+                if filled.len() == expected_count {
+                    break;
                 }
             }
             drop(avail);

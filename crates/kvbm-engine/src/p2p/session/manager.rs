@@ -57,9 +57,22 @@ impl SessionManager {
     /// Park a session: insert it into the map and spawn a watcher that
     /// evicts it on `Detached` / `Failed` / watchdog timeout.
     pub fn register(self: &Arc<Self>, session: Arc<dyn Session>) {
+        self.register_with_watchdog(session, self.watchdog);
+    }
+
+    /// Park a session with a caller-requested watchdog, capped by the
+    /// manager's configured maximum. A zero-duration request is raised to one
+    /// millisecond so every parked session still receives a runnable cleanup
+    /// window.
+    pub fn register_with_watchdog(
+        self: &Arc<Self>,
+        session: Arc<dyn Session>,
+        requested: Duration,
+    ) {
         let session_id = session.session_id();
         self.sessions.insert(session_id, Arc::clone(&session));
-        self.spawn_watcher(session_id, session);
+        let watchdog = requested.min(self.watchdog).max(Duration::from_millis(1));
+        self.spawn_watcher(session_id, session, watchdog);
     }
 
     /// Look up a live session by id.
@@ -83,9 +96,13 @@ impl SessionManager {
         self.sessions.is_empty()
     }
 
-    fn spawn_watcher(self: &Arc<Self>, session_id: SessionId, session: Arc<dyn Session>) {
+    fn spawn_watcher(
+        self: &Arc<Self>,
+        session_id: SessionId,
+        session: Arc<dyn Session>,
+        watchdog: Duration,
+    ) {
         let manager = Arc::clone(self);
-        let watchdog = self.watchdog;
         self.runtime.spawn(async move {
             // Hold `session` for the watcher's lifetime so the map entry is
             // not the only thing keeping it alive while we watch.
@@ -94,15 +111,30 @@ impl SessionManager {
                 match tokio::time::timeout(watchdog, lifecycle.next()).await {
                     Ok(Some(LifecycleEvent::Attached { .. })) => continue,
                     Ok(Some(LifecycleEvent::Detached { reason })) => {
+                        session.close(Some(format!("session detached: {reason:?}")));
                         break format!("detached ({reason:?})");
                     }
                     Ok(Some(LifecycleEvent::Failed { reason })) => {
+                        session.close(Some(format!("session failed: {reason}")));
                         break format!("failed ({reason})");
                     }
-                    Ok(None) => break "lifecycle stream ended".to_string(),
-                    Err(_) => break "watchdog timeout".to_string(),
+                    Ok(None) => {
+                        session.close(Some("lifecycle stream ended".to_owned()));
+                        break "lifecycle stream ended".to_string();
+                    }
+                    Err(_) => {
+                        session.close(Some("session watchdog timeout".to_owned()));
+                        break "watchdog timeout".to_string();
+                    }
                 }
             };
+            while session.has_inflight_pulls() {
+                tracing::debug!(
+                    %session_id,
+                    "SessionManager teardown quarantined for an in-flight pull"
+                );
+                tokio::time::sleep(watchdog).await;
+            }
             manager.sessions.remove(&session_id);
             tracing::info!(%session_id, outcome, "SessionManager evicted session");
             drop(session);

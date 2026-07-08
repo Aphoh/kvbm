@@ -314,6 +314,7 @@ impl FlushGlue {
 struct Construction {
     runtime: Arc<KvbmRuntime>,
     manifest: Mutex<Option<kvbm_protocols::cache_manifest::CacheManifestId>>,
+    cache_identity: Mutex<Option<kvbm_protocols::cache_manifest::CacheIdentity>>,
     // Consumed by the engine-stack build (`InstanceLeader::with_consolidator`).
     consolidator_endpoints: Option<ConsolidatorEndpoints>,
     workers: Mutex<WorkerAccum>,
@@ -380,6 +381,7 @@ impl Leader {
             construction: Some(Construction {
                 runtime,
                 manifest: Mutex::new(None),
+                cache_identity: Mutex::new(None),
                 consolidator_endpoints,
                 workers: Mutex::new(WorkerAccum::default()),
             }),
@@ -438,6 +440,29 @@ impl Leader {
             "leader cache manifest is already registered with a different digest"
         );
         *installed = Some(manifest);
+        Ok(())
+    }
+
+    /// Bind the complete cache identity used to derive resource admission
+    /// defaults while preserving [`Self::register_manifest`] for digest-only
+    /// integrations.
+    pub fn register_cache_identity(
+        &self,
+        identity: kvbm_protocols::cache_manifest::CacheIdentity,
+    ) -> Result<()> {
+        self.register_manifest(identity.manifest())?;
+        let construction = self
+            .construction
+            .as_ref()
+            .ok_or_else(|| anyhow!("cache identity registration requires deferred construction"))?;
+        let mut installed = construction.cache_identity.lock();
+        anyhow::ensure!(
+            installed
+                .as_ref()
+                .is_none_or(|current| current == &identity),
+            "leader cache identity is already registered with a different resource contract"
+        );
+        *installed = Some(identity);
         Ok(())
     }
 
@@ -728,11 +753,7 @@ impl Leader {
         } else {
             kvbm_engine::RemoteOps::default()
         };
-        let config = kvbm_engine::ConnectorEngineConfig {
-            block_size,
-            remote,
-            resource_policies: Default::default(),
-        };
+        let config = stack.admission.into_engine_config(block_size, remote);
         let (engine, driver) = if stack.offloads.is_empty() {
             kvbm_engine::build_local_connector_engine(stack.instance_leader, sink, config, None)
         } else {
@@ -896,7 +917,8 @@ mod tests {
     use crate::connector::engine::noop_leader_engine;
     use kvbm_common::{BlockId, LogicalResourceId, SequenceHash};
     use kvbm_protocols::cache_manifest::{
-        CacheManifest, ModelIdentity, ResourceRequirement, ResourceRole,
+        BundleResourceLineage, CacheManifest, ModelIdentity, ResourceRequirement, ResourceRole,
+        validate_bundle_lineages,
     };
     use kvbm_protocols::connector::{ActionId, SearchId};
     use kvbm_protocols::connector::{
@@ -947,6 +969,27 @@ mod tests {
             None,
             None,
             Some(4),
+            Some(metadata),
+        )
+    }
+
+    fn manifested_request(request_id: &str, requirements: Vec<ResourceRequirement>) -> Request {
+        let manifest = CacheManifest::new(
+            ModelIdentity::new("hybrid-test", "v1", [9; 32]).unwrap(),
+            "hybrid-test-v1",
+            requirements,
+            Default::default(),
+        )
+        .unwrap();
+        let mut metadata = RequestMetadata::default();
+        metadata.set_cache(CacheScope::Manifest(manifest.identity()));
+        Request::with_token_limits(
+            request_id,
+            (0..12u32).collect::<Vec<_>>(),
+            None,
+            None,
+            None,
+            Some(BS),
             Some(metadata),
         )
     }
@@ -1460,6 +1503,137 @@ mod tests {
         assert_eq!(plan.resources[0].blocks.len(), 2);
         assert_eq!(plan.resources[1].blocks.len(), 1);
         assert_eq!(plan.resources[1].blocks[0].1, 21);
+    }
+
+    #[test]
+    fn manifest_scheduler_projects_mixed_native_histories_from_the_connector_lineage() {
+        let engine = recording_engine(Refresh::Lost);
+        let leader = Arc::new(Leader::with_engine(engine.dyn_clone(), BS));
+        let request_id = "mixed-native-bundle";
+        leader
+            .create_slot(manifested_request(
+                request_id,
+                vec![
+                    ResourceRequirement::new(LogicalResourceId(10), ResourceRole::PrefixHistory, 4)
+                        .unwrap(),
+                    ResourceRequirement::new(LogicalResourceId(11), ResourceRole::PrefixHistory, 8)
+                        .unwrap(),
+                    ResourceRequirement::new(
+                        LogicalResourceId(12),
+                        ResourceRole::BoundaryCapsule,
+                        4,
+                    )
+                    .unwrap(),
+                ],
+            ))
+            .unwrap();
+        leader
+            .update_state_after_alloc_all_groups(
+                request_id,
+                vec![
+                    ResourceDestination {
+                        resource: LogicalResourceId(10),
+                        block_ids: vec![1, 2, 3],
+                    },
+                    ResourceDestination {
+                        resource: LogicalResourceId(11),
+                        block_ids: vec![20, 21],
+                    },
+                    ResourceDestination {
+                        resource: LogicalResourceId(12),
+                        block_ids: vec![30, 31, 32],
+                    },
+                ],
+                0,
+            )
+            .unwrap();
+        let mut output = SchedulerOutput::new(1);
+        output.set_group_resources(vec![
+            LogicalResourceId(10),
+            LogicalResourceId(11),
+            LogicalResourceId(12),
+        ]);
+        output.add_new_request_all_groups(
+            request_id.to_owned(),
+            (0..12).collect(),
+            vec![vec![1, 2, 3], vec![20, 21], vec![30, 31, 32]],
+            0,
+        );
+        output.set_num_scheduled_tokens(HashMap::from([(request_id.to_owned(), 8)]));
+
+        leader.build_connector_meta(output).unwrap();
+
+        let calls = engine.bundle_offload_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let plan = &calls[0].1;
+        let lineages = plan
+            .resources
+            .iter()
+            .map(|resource| {
+                BundleResourceLineage::new(
+                    resource.resource,
+                    resource.blocks.iter().map(|(hash, _)| *hash).collect(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        validate_bundle_lineages(plan.key, plan.identity.resources(), &lineages).unwrap();
+        assert_eq!(plan.resources[0].blocks.len(), 2);
+        assert_eq!(plan.resources[1].blocks.len(), 1);
+        assert_eq!(plan.resources[1].blocks[0].0.position(), 0);
+        assert_eq!(plan.resources[1].blocks[0].1, 20);
+        assert_eq!(plan.resources[2].blocks[0].1, 31);
+    }
+
+    #[test]
+    fn manifest_scheduler_rejects_a_contract_without_connector_native_history_anchor() {
+        let engine = recording_engine(Refresh::Lost);
+        let leader = Arc::new(Leader::with_engine(engine.dyn_clone(), BS));
+        let request_id = "no-anchor-bundle";
+        leader
+            .create_slot(manifested_request(
+                request_id,
+                vec![
+                    ResourceRequirement::new(LogicalResourceId(10), ResourceRole::PrefixHistory, 8)
+                        .unwrap(),
+                    ResourceRequirement::new(
+                        LogicalResourceId(11),
+                        ResourceRole::BoundaryCapsule,
+                        8,
+                    )
+                    .unwrap(),
+                ],
+            ))
+            .unwrap();
+        leader
+            .update_state_after_alloc_all_groups(
+                request_id,
+                vec![
+                    ResourceDestination {
+                        resource: LogicalResourceId(10),
+                        block_ids: vec![1, 2],
+                    },
+                    ResourceDestination {
+                        resource: LogicalResourceId(11),
+                        block_ids: vec![20, 21],
+                    },
+                ],
+                0,
+            )
+            .unwrap();
+        let mut output = SchedulerOutput::new(1);
+        output.set_group_resources(vec![LogicalResourceId(10), LogicalResourceId(11)]);
+        output.add_new_request_all_groups(
+            request_id.to_owned(),
+            (0..12).collect(),
+            vec![vec![1, 2], vec![20, 21]],
+            0,
+        );
+        output.set_num_scheduled_tokens(HashMap::from([(request_id.to_owned(), 8)]));
+
+        leader.build_connector_meta(output).unwrap();
+
+        assert!(engine.bundle_offload_calls.lock().unwrap().is_empty());
     }
 
     #[test]

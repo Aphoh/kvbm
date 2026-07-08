@@ -299,47 +299,48 @@ pub(super) async fn run_remote_onboard(
     //    transaction per run.
     let mut avail = session.availability();
     while let Some(delta) = avail.next().await {
-        match delta {
-            AvailabilityDelta::Available(blocks) => {
-                let mut indexed: Vec<(usize, SequenceHash)> = blocks
-                    .into_iter()
-                    .filter_map(|b| match slot_of.get(&b.hash) {
-                        Some(slot) if !filled.contains(&b.hash) => Some((*slot, b.hash)),
-                        Some(_) => None,
-                        None => {
-                            tracing::warn!(
-                                hash = ?b.hash,
-                                "cd remote onboard: ignoring available hash outside the \
-                                 expected remote slice"
-                            );
-                            None
-                        }
-                    })
-                    .collect();
-                if indexed.is_empty() {
-                    continue;
-                }
-                indexed.sort_by_key(|(slot, _)| *slot);
-                // The `filled` filter only dedups ACROSS deltas; a hash
-                // duplicated WITHIN one delta (a peer double-publish, or the
-                // replay coalescer merging pre-subscribe deltas) would land
-                // the same slot twice — violating the strictly-increasing
-                // run contract and double-pulling a hash whose holder pin
-                // the first pull's ack already dropped.
-                indexed.dedup_by_key(|(slot, _)| *slot);
-
-                for run in group_contiguous_runs(indexed) {
-                    pull_register_onboard_run(leader, session, remote_pairs, &run, block_size)
-                        .await?;
-                    for (_, hash) in &run {
-                        filled.insert(*hash);
-                    }
-                }
-                if filled.len() == expected_count {
-                    break;
-                }
+        let blocks = match delta {
+            AvailabilityDelta::Available(blocks) => blocks,
+            AvailabilityDelta::Verified(records) => {
+                records.into_iter().map(|record| record.block).collect()
             }
             AvailabilityDelta::Drained => break,
+        };
+        let mut indexed: Vec<(usize, SequenceHash)> = blocks
+            .into_iter()
+            .filter_map(|b| match slot_of.get(&b.hash) {
+                Some(slot) if !filled.contains(&b.hash) => Some((*slot, b.hash)),
+                Some(_) => None,
+                None => {
+                    tracing::warn!(
+                        hash = ?b.hash,
+                        "cd remote onboard: ignoring available hash outside the \
+                         expected remote slice"
+                    );
+                    None
+                }
+            })
+            .collect();
+        if indexed.is_empty() {
+            continue;
+        }
+        indexed.sort_by_key(|(slot, _)| *slot);
+        // The `filled` filter only dedups ACROSS deltas; a hash
+        // duplicated WITHIN one delta (a peer double-publish, or the
+        // replay coalescer merging pre-subscribe deltas) would land
+        // the same slot twice — violating the strictly-increasing
+        // run contract and double-pulling a hash whose holder pin
+        // the first pull's ack already dropped.
+        indexed.dedup_by_key(|(slot, _)| *slot);
+
+        for run in group_contiguous_runs(indexed) {
+            pull_register_onboard_run(leader, session, remote_pairs, &run, block_size).await?;
+            for (_, hash) in &run {
+                filled.insert(*hash);
+            }
+        }
+        if filled.len() == expected_count {
+            break;
         }
     }
     drop(avail);

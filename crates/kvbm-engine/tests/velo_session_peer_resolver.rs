@@ -37,6 +37,7 @@
 //!    without needing a real bidi roundtrip.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -179,6 +180,26 @@ struct RecordingResolver {
     calls: Arc<Mutex<Vec<InstanceId>>>,
 }
 
+struct BlockingResolver {
+    started: Arc<tokio::sync::Semaphore>,
+    release: Arc<tokio::sync::Notify>,
+    completed: Arc<AtomicBool>,
+}
+
+impl PeerResolver for BlockingResolver {
+    fn resolve_and_register(&self, _instance_id: InstanceId) -> BoxFuture<'_, Result<()>> {
+        let started = Arc::clone(&self.started);
+        let release = Arc::clone(&self.release);
+        let completed = Arc::clone(&self.completed);
+        Box::pin(async move {
+            started.add_permits(1);
+            release.notified().await;
+            completed.store(true, Ordering::Release);
+            Ok(())
+        })
+    }
+}
+
 impl PeerResolver for RecordingResolver {
     fn resolve_and_register(&self, instance_id: InstanceId) -> BoxFuture<'_, Result<()>> {
         let calls = Arc::clone(&self.calls);
@@ -270,5 +291,63 @@ async fn resolver_is_invoked_on_frame_attach_path() -> Result<()> {
         recorded[0]
     );
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn close_cancels_inflight_attach_setup_without_publishing_attached() -> Result<()> {
+    let h = build_side().await;
+    let p = build_side().await;
+    p.velo.register_peer(h.velo.peer_info())?;
+    h.velo.register_peer(p.velo.peer_info())?;
+
+    let started = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let completed = Arc::new(AtomicBool::new(false));
+    let h_factory = VeloSessionFactory::with_peer_resolver(
+        Arc::clone(&h.velo),
+        Arc::clone(&h.leader),
+        tokio::runtime::Handle::current(),
+        Arc::new(BlockingResolver {
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+            completed: Arc::clone(&completed),
+        }),
+    );
+    let p_factory = VeloSessionFactory::new(
+        Arc::clone(&p.velo),
+        Arc::clone(&p.leader),
+        tokio::runtime::Handle::current(),
+    );
+
+    let session_id = uuid::Uuid::new_v4();
+    let h_session = h_factory.open(session_id)?;
+    let endpoint = h_session.endpoint().expect("holder endpoint");
+    let p_session = p_factory
+        .attach(session_id, h.velo.instance_id(), endpoint)
+        .await?;
+    started.acquire().await?.forget();
+
+    h_session.close(Some("cancel blocked attach".to_owned()));
+    let attach_failure = tokio::time::timeout(Duration::from_secs(1), h_session.wait_attached())
+        .await?
+        .expect_err("close must fail the attach gate");
+    assert!(attach_failure.to_string().contains("cancel blocked attach"));
+    release.notify_waiters();
+    tokio::task::yield_now().await;
+    assert!(
+        !completed.load(Ordering::Acquire),
+        "close must cancel the resolver future rather than resume attach setup"
+    );
+
+    p_session.close(Some("test cleanup".to_owned()));
+    drop(p_session);
+    drop(h_session);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while h_factory.active_session_count() != 0 || p_factory.active_session_count() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
     Ok(())
 }

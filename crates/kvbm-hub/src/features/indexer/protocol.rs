@@ -9,11 +9,14 @@
 //! Nothing here lives in the central [`crate::protocol::paths`]; the feature
 //! owns its whole namespace.
 
-use kvbm_common::LogicalResourceId;
 use kvbm_logical::SequenceHash;
-use kvbm_protocols::cache_manifest::{BundleKey, CacheManifestId};
+use kvbm_protocols::cache_manifest::{
+    BundleKey, BundleResourceLineage, CacheManifestId, RegistrationEpoch, ResourceRequirement,
+};
 use serde::{Deserialize, Serialize};
 use velo_ext::InstanceId;
+
+use crate::protocol::MutationCredential;
 
 /// URL segment the server nests this feature's routers under
 /// (`/v1/features/indexer/...`).
@@ -135,26 +138,51 @@ pub struct BundleAdvertisementRecord {
     pub key: BundleKey,
     pub generation: u64,
     pub owner: InstanceId,
-    pub resources: Vec<LogicalResourceId>,
+    /// Hub-minted lifecycle identity of `owner`. The wire field remains
+    /// optional for decode compatibility, but new hub publications reject
+    /// missing or mismatched values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_epoch: Option<RegistrationEpoch>,
+    pub requirements: Vec<ResourceRequirement>,
+    pub lineages: Vec<BundleResourceLineage>,
+    /// Publisher-requested expiry. The hub clamps this to its server-owned
+    /// maximum advertisement lifetime before storing or leasing the record.
     pub expires_at_unix_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BundlePublishRequest {
+    pub credential: MutationCredential,
     pub advertisement: BundleAdvertisementRecord,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BundleInvalidateRequest {
+    pub credential: MutationCredential,
     pub key: BundleKey,
     pub generation: u64,
     pub owner: InstanceId,
+    /// Publisher-requested replay-protection horizon. For absent keys the hub
+    /// clamps this to a server-owned duration and enforces bounded admission.
+    pub retain_until_unix_ms: u64,
+}
+
+/// Owner-scoped invalidation supplied by a connector. The indexer client adds
+/// its registration credential when constructing the wire request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BundleInvalidationRecord {
+    pub key: BundleKey,
+    pub generation: u64,
+    pub owner: InstanceId,
+    /// Requested replay-protection horizon; the hub treats this as an
+    /// untrusted hint and applies its own retention bound.
+    pub retain_until_unix_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BundleQueryRequest {
     pub manifest: CacheManifestId,
-    pub required_resources: Vec<LogicalResourceId>,
+    pub requirements: Vec<ResourceRequirement>,
     pub candidates: Vec<BundleKey>,
     pub now_unix_ms: u64,
 }
@@ -178,6 +206,7 @@ pub enum BundleQueryMissReason {
 
 /// Complete-bundle directory response, preserving actionable miss telemetry.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)] // keep the public wire model direct and allocation-free on hits.
 #[serde(rename_all = "snake_case")]
 pub enum BundleQueryOutcome {
     Hit(BundleQueryHit),

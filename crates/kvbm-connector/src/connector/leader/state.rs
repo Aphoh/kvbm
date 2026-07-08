@@ -184,6 +184,7 @@ impl LeaderState {
             num_computed_tokens,
             total_tokens: slot.total_tokens(),
             transfer_params: slot.transfer_params.clone(),
+            local_prefill_estimate: None,
         };
         let outcome = Arc::clone(&self.engine)
             .find_blocks(&request, slot.proposal.as_ref())

@@ -9,7 +9,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::cache_manifest::{BundleKey, CacheManifestId};
+use crate::cache_manifest::{BundleKey, CacheManifestId, CacheScope};
 use dynamo_tokens::{TokenBlockMmInfo, compute_hash_v2};
 use kvbm_common::{LogicalResourceId, SequenceHash};
 use serde::{Deserialize, Serialize};
@@ -120,7 +120,7 @@ pub struct SessionEndpoint {
 }
 
 /// Manifest-scoped input and target carried by a bundle prefill dispatch.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BundlePrefillContext {
     manifest: CacheManifestId,
     resources: BTreeSet<LogicalResourceId>,
@@ -128,6 +128,33 @@ pub struct BundlePrefillContext {
     initial_bundle: Option<BundleKey>,
     target_bundle: BundleKey,
     estimated_bundle_bytes: u64,
+}
+
+#[derive(Deserialize)]
+struct BundlePrefillContextWire {
+    manifest: CacheManifestId,
+    resources: BTreeSet<LogicalResourceId>,
+    #[serde(default)]
+    initial_bundle: Option<BundleKey>,
+    target_bundle: BundleKey,
+    estimated_bundle_bytes: u64,
+}
+
+impl<'de> Deserialize<'de> for BundlePrefillContext {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = BundlePrefillContextWire::deserialize(deserializer)?;
+        Self::new(
+            wire.manifest,
+            wire.resources,
+            wire.initial_bundle,
+            wire.target_bundle,
+            wire.estimated_bundle_bytes,
+        )
+        .map_err(serde::de::Error::custom)
+    }
 }
 
 impl BundlePrefillContext {
@@ -303,6 +330,314 @@ impl RemotePrefillParams {
             bundle: None,
         }
     }
+
+    /// Validate request-independent wire metadata against the prompt window.
+    ///
+    /// Model-specific manifest, resource, alignment, and hash-chain checks
+    /// remain the receiving worker's responsibility. This gate rejects wire
+    /// shapes that are invalid for every worker before they enter scheduling.
+    pub fn validate_for_prompt_len(
+        &self,
+        prompt_len: usize,
+    ) -> Result<(), RemotePrefillValidationError> {
+        if self.protocol_version != DISAGG_PROTOCOL_VERSION {
+            return Err(RemotePrefillValidationError::UnsupportedProtocolVersion {
+                actual: self.protocol_version,
+                expected: DISAGG_PROTOCOL_VERSION,
+            });
+        }
+        if prompt_len == 0 {
+            return Err(RemotePrefillValidationError::EmptyPrompt);
+        }
+        if self.num_provided_tokens > prompt_len {
+            return Err(RemotePrefillValidationError::ProvidedWindowOutOfBounds {
+                provided_tokens: self.num_provided_tokens,
+                prompt_tokens: prompt_len,
+            });
+        }
+        if !self.request.is_empty() {
+            return Err(RemotePrefillValidationError::UnsupportedHashingInputs);
+        }
+        let Some(bundle) = &self.bundle else {
+            return Ok(());
+        };
+        bundle.validate_wire_shape()?;
+        let target_tokens = bundle.target_bundle().boundary_tokens();
+        let prompt_tokens = u64::try_from(prompt_len).unwrap_or(u64::MAX);
+        if target_tokens >= prompt_tokens {
+            return Err(RemotePrefillValidationError::BundleTargetOutOfBounds {
+                target_tokens,
+                prompt_tokens: prompt_len,
+            });
+        }
+        if u64::try_from(self.num_provided_tokens).unwrap_or(u64::MAX) > target_tokens {
+            return Err(
+                RemotePrefillValidationError::ProvidedWindowPastBundleTarget {
+                    provided_tokens: self.num_provided_tokens,
+                    target_tokens,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// Validate the complete side-effect-free worker contract.
+    ///
+    /// Callers must run this before creating a search, prefill lifecycle, or
+    /// destination allocation. It binds wire metadata to the receiving cache
+    /// scope and the worker-recomputed sequence hash chain.
+    pub fn validate_for_worker(
+        &self,
+        request_id: &str,
+        cache: &CacheScope,
+        sequence_hashes: &[SequenceHash],
+        total_tokens: usize,
+        block_size: usize,
+    ) -> Result<(), RemotePrefillValidationError> {
+        if request_id.trim().is_empty() {
+            return Err(RemotePrefillValidationError::EmptyRequestId);
+        }
+        self.validate_for_prompt_len(total_tokens)?;
+        if self.num_provided_tokens >= total_tokens {
+            return Err(RemotePrefillValidationError::ProvidedWindowConsumesPrompt {
+                provided_tokens: self.num_provided_tokens,
+                prompt_tokens: total_tokens,
+            });
+        }
+        if block_size == 0 {
+            return Err(RemotePrefillValidationError::ZeroWorkerBlockSize);
+        }
+        if !self.num_provided_tokens.is_multiple_of(block_size) {
+            return Err(RemotePrefillValidationError::UnalignedProvidedWindow {
+                provided_tokens: self.num_provided_tokens,
+                block_tokens: block_size,
+            });
+        }
+        let provided_blocks = self.num_provided_tokens / block_size;
+        if provided_blocks > sequence_hashes.len() {
+            return Err(
+                RemotePrefillValidationError::ProvidedHashWindowOutOfBounds {
+                    provided_blocks,
+                    available_hashes: sequence_hashes.len(),
+                },
+            );
+        }
+        if let Some(expected) = self.expected_hash_digest {
+            let actual = digest_provided_hashes(&sequence_hashes[..provided_blocks]);
+            if actual != expected {
+                return Err(RemotePrefillValidationError::HashDigestMismatch { expected, actual });
+            }
+        }
+
+        match (cache, self.bundle.as_ref()) {
+            (CacheScope::Manifest(_), None) => {
+                Err(RemotePrefillValidationError::ManifestRequestMissingBundle)
+            }
+            (CacheScope::LegacyPrimary, Some(_)) => {
+                Err(RemotePrefillValidationError::BundleRequestRequiresManifest)
+            }
+            (CacheScope::LegacyPrimary, None) => {
+                if self.decode_endpoint.is_none() {
+                    return Err(RemotePrefillValidationError::MissingDecodeEndpoint);
+                }
+                Ok(())
+            }
+            (CacheScope::Manifest(identity), Some(bundle)) => {
+                if self.num_provided_tokens != 0 {
+                    return Err(RemotePrefillValidationError::BundleProvidedWindowNotEmpty {
+                        provided_tokens: self.num_provided_tokens,
+                    });
+                }
+                bundle.validate_for_worker(identity, sequence_hashes, total_tokens, block_size)
+            }
+        }
+    }
+}
+
+impl BundlePrefillContext {
+    fn validate_wire_shape(&self) -> Result<(), RemotePrefillValidationError> {
+        if self.resources.is_empty() {
+            return Err(RemotePrefillValidationError::EmptyBundleResources);
+        }
+        if self.target_bundle.manifest() != self.manifest
+            || self
+                .initial_bundle
+                .is_some_and(|initial| initial.manifest() != self.manifest)
+        {
+            return Err(RemotePrefillValidationError::BundleManifestMismatch);
+        }
+        if self.initial_bundle.is_some_and(|initial| {
+            initial.boundary_tokens() >= self.target_bundle.boundary_tokens()
+        }) {
+            return Err(RemotePrefillValidationError::InvalidBundleBoundaryOrder);
+        }
+        Ok(())
+    }
+
+    fn validate_for_worker(
+        &self,
+        identity: &crate::cache_manifest::CacheIdentity,
+        sequence_hashes: &[SequenceHash],
+        total_tokens: usize,
+        block_size: usize,
+    ) -> Result<(), RemotePrefillValidationError> {
+        if self.manifest != identity.manifest() {
+            return Err(RemotePrefillValidationError::BundleManifestMismatch);
+        }
+        let expected_resources = identity
+            .resources()
+            .iter()
+            .map(|requirement| requirement.resource())
+            .collect::<BTreeSet<_>>();
+        if self.resources != expected_resources {
+            return Err(RemotePrefillValidationError::BundleResourceSetMismatch);
+        }
+        if let Some(initial) = self.initial_bundle {
+            validate_bundle_key(
+                "initial",
+                initial,
+                identity,
+                sequence_hashes,
+                total_tokens,
+                block_size,
+            )?;
+        }
+        validate_bundle_key(
+            "target",
+            self.target_bundle,
+            identity,
+            sequence_hashes,
+            total_tokens,
+            block_size,
+        )
+    }
+}
+
+fn validate_bundle_key(
+    role: &'static str,
+    key: BundleKey,
+    identity: &crate::cache_manifest::CacheIdentity,
+    sequence_hashes: &[SequenceHash],
+    total_tokens: usize,
+    block_size: usize,
+) -> Result<(), RemotePrefillValidationError> {
+    if !key.is_compatible_with(identity) {
+        return Err(RemotePrefillValidationError::BundleKeyIncompatible { role });
+    }
+    let boundary_tokens = usize::try_from(key.boundary_tokens()).map_err(|_| {
+        RemotePrefillValidationError::BundleBoundaryOutOfBounds {
+            role,
+            boundary_tokens: key.boundary_tokens(),
+        }
+    })?;
+    let eligible_blocks = total_tokens.saturating_sub(1) / block_size;
+    let index = boundary_tokens
+        .checked_div(block_size)
+        .filter(|_| boundary_tokens.is_multiple_of(block_size))
+        .and_then(|blocks| blocks.checked_sub(1))
+        .filter(|index| *index < eligible_blocks.min(sequence_hashes.len()))
+        .ok_or(RemotePrefillValidationError::BundleBoundaryOutOfBounds {
+            role,
+            boundary_tokens: key.boundary_tokens(),
+        })?;
+    if sequence_hashes[index] != key.boundary_hash() {
+        return Err(RemotePrefillValidationError::BundleBoundaryHashMismatch {
+            role,
+            boundary_tokens: key.boundary_tokens(),
+        });
+    }
+    Ok(())
+}
+
+/// Worker-independent validation failures for remote-prefill wire metadata.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum RemotePrefillValidationError {
+    #[error("remote-prefill request id is empty")]
+    EmptyRequestId,
+    #[error("remote-prefill prompt is empty")]
+    EmptyPrompt,
+    #[error(
+        "remote-prefill protocol version {actual} is unsupported; this worker requires {expected}"
+    )]
+    UnsupportedProtocolVersion { actual: u16, expected: u16 },
+    #[error(
+        "remote-prefill provided window {provided_tokens} exceeds prompt length {prompt_tokens}"
+    )]
+    ProvidedWindowOutOfBounds {
+        provided_tokens: usize,
+        prompt_tokens: usize,
+    },
+    #[error("remote-prefill hashing inputs are not supported by this protocol revision")]
+    UnsupportedHashingInputs,
+    #[error("remote-prefill bundle context requires at least one logical resource")]
+    EmptyBundleResources,
+    #[error("remote-prefill bundle keys do not match the declared manifest")]
+    BundleManifestMismatch,
+    #[error("remote-prefill initial bundle must precede its target")]
+    InvalidBundleBoundaryOrder,
+    #[error(
+        "remote-prefill bundle target {target_tokens} must leave a token inside prompt length {prompt_tokens}"
+    )]
+    BundleTargetOutOfBounds {
+        target_tokens: u64,
+        prompt_tokens: usize,
+    },
+    #[error(
+        "remote-prefill provided window {provided_tokens} extends past bundle target {target_tokens}"
+    )]
+    ProvidedWindowPastBundleTarget {
+        provided_tokens: usize,
+        target_tokens: u64,
+    },
+    #[error(
+        "remote-prefill provided window {provided_tokens} must leave one prompt token out of {prompt_tokens}"
+    )]
+    ProvidedWindowConsumesPrompt {
+        provided_tokens: usize,
+        prompt_tokens: usize,
+    },
+    #[error("remote-prefill worker block size is zero")]
+    ZeroWorkerBlockSize,
+    #[error(
+        "remote-prefill provided window {provided_tokens} is not aligned to worker block size {block_tokens}"
+    )]
+    UnalignedProvidedWindow {
+        provided_tokens: usize,
+        block_tokens: usize,
+    },
+    #[error(
+        "remote-prefill provided window requires {provided_blocks} hashes but only {available_hashes} are available"
+    )]
+    ProvidedHashWindowOutOfBounds {
+        provided_blocks: usize,
+        available_hashes: usize,
+    },
+    #[error("remote-prefill hash digest mismatch: expected 0x{expected:016x}, got 0x{actual:016x}")]
+    HashDigestMismatch { expected: u64, actual: u64 },
+    #[error("manifest-scoped remote-prefill request requires bundle metadata")]
+    ManifestRequestMissingBundle,
+    #[error("bundle remote-prefill metadata requires a manifest-scoped cache")]
+    BundleRequestRequiresManifest,
+    #[error("unitary remote-prefill request is missing its decode endpoint")]
+    MissingDecodeEndpoint,
+    #[error("bundle remote-prefill provided window must be zero, got {provided_tokens}")]
+    BundleProvidedWindowNotEmpty { provided_tokens: usize },
+    #[error("remote-prefill bundle resources do not match the worker cache manifest")]
+    BundleResourceSetMismatch,
+    #[error("remote-prefill bundle {role} key is incompatible with the worker cache manifest")]
+    BundleKeyIncompatible { role: &'static str },
+    #[error("remote-prefill bundle {role} boundary {boundary_tokens} is outside the request chain")]
+    BundleBoundaryOutOfBounds {
+        role: &'static str,
+        boundary_tokens: u64,
+    },
+    #[error(
+        "remote-prefill bundle {role} boundary {boundary_tokens} hash does not match the request chain"
+    )]
+    BundleBoundaryHashMismatch {
+        role: &'static str,
+        boundary_tokens: u64,
+    },
 }
 
 /// Router-owned circuit-breaker tier for CD prefill-overload control.
@@ -358,6 +693,15 @@ pub struct RemotePrefillRequest {
 }
 
 impl RemotePrefillRequest {
+    /// Validate worker-independent wire invariants before scheduler admission.
+    pub fn validate(&self) -> Result<(), RemotePrefillValidationError> {
+        if self.request_id.trim().is_empty() {
+            return Err(RemotePrefillValidationError::EmptyRequestId);
+        }
+        self.remote_prefill_params()
+            .validate_for_prompt_len(self.token_ids.len())
+    }
+
     pub fn remote_prefill_params(&self) -> RemotePrefillParams {
         RemotePrefillParams {
             protocol_version: self.protocol_version,
@@ -392,7 +736,10 @@ pub enum ControlSignal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache_manifest::{BundleKey, CacheManifestId};
+    use crate::cache_manifest::{
+        BundleKey, CacheManifest, CacheManifestId, ModelIdentity, ResourceRequirement, ResourceRole,
+    };
+    use crate::connector::CacheScope;
 
     fn instance_id() -> InstanceId {
         uuid::Uuid::new_v4().into()
@@ -418,6 +765,28 @@ mod tests {
         assert_eq!(decoded.target_bundle(), target);
         assert_eq!(decoded.resources().collect::<Vec<_>>(), resources);
         assert_eq!(decoded.estimated_bundle_bytes(), 65_536);
+    }
+
+    #[test]
+    fn bundle_prefill_context_deserialization_reapplies_constructor_invariants() {
+        let manifest = CacheManifestId::from_bytes([7; 32]);
+        let initial = BundleKey::from_parts(manifest, fake_plh(1, 1), 8).unwrap();
+        let target = BundleKey::from_parts(manifest, fake_plh(2, 3), 16).unwrap();
+        let context = BundlePrefillContext::new(
+            manifest,
+            [kvbm_common::LogicalResourceId(3)],
+            Some(initial),
+            target,
+            1,
+        )
+        .unwrap();
+        let mut empty_resources = serde_json::to_value(&context).unwrap();
+        empty_resources["resources"] = serde_json::json!([]);
+        assert!(serde_json::from_value::<BundlePrefillContext>(empty_resources).is_err());
+
+        let mut invalid_order = serde_json::to_value(&context).unwrap();
+        invalid_order["initial_bundle"] = invalid_order["target_bundle"].clone();
+        assert!(serde_json::from_value::<BundlePrefillContext>(invalid_order).is_err());
     }
 
     #[test]
@@ -449,6 +818,166 @@ mod tests {
         assert_eq!(params.num_provided_tokens, request.num_provided_tokens);
         assert_eq!(params.request, request.request);
         assert_eq!(params.expected_hash_digest, request.expected_hash_digest);
+    }
+
+    fn valid_remote_prefill_request() -> RemotePrefillRequest {
+        RemotePrefillRequest {
+            protocol_version: DISAGG_PROTOCOL_VERSION,
+            request_id: "req-valid".to_owned(),
+            session_id: uuid::Uuid::new_v4(),
+            initiator_instance_id: instance_id(),
+            decode_endpoint: None,
+            token_ids: vec![1, 2, 3, 4, 5],
+            num_provided_tokens: 4,
+            request: KvHashingRequestEnvelope::default(),
+            expected_hash_digest: None,
+            bundle: None,
+        }
+    }
+
+    fn worker_identity() -> crate::cache_manifest::CacheIdentity {
+        CacheManifest::new(
+            ModelIdentity::new("dsv4", "revision", [3; 32]).unwrap(),
+            "worker-validation",
+            vec![
+                ResourceRequirement::new(
+                    kvbm_common::LogicalResourceId(3),
+                    ResourceRole::PrefixHistory,
+                    4,
+                )
+                .unwrap(),
+            ],
+            std::collections::BTreeMap::new(),
+        )
+        .unwrap()
+        .identity()
+    }
+
+    fn unitary_endpoint() -> SessionEndpoint {
+        SessionEndpoint {
+            kind: "test".to_owned(),
+            payload: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn worker_validation_requires_bundle_metadata_for_manifest_scope() {
+        let mut params = RemotePrefillParams::new(uuid::Uuid::new_v4(), instance_id());
+        params.decode_endpoint = Some(unitary_endpoint());
+        let hashes = [fake_plh(1, 0), fake_plh(2, 1)];
+
+        assert!(matches!(
+            params.validate_for_worker(
+                "manifest-without-bundle",
+                &CacheScope::Manifest(worker_identity()),
+                &hashes,
+                9,
+                4,
+            ),
+            Err(RemotePrefillValidationError::ManifestRequestMissingBundle)
+        ));
+    }
+
+    #[test]
+    fn worker_validation_rejects_a_unitary_window_covering_the_full_prompt() {
+        let mut params = RemotePrefillParams::new(uuid::Uuid::new_v4(), instance_id());
+        params.decode_endpoint = Some(unitary_endpoint());
+        params.num_provided_tokens = 8;
+        let hashes = [fake_plh(1, 0), fake_plh(2, 1)];
+
+        assert!(matches!(
+            params.validate_for_worker("full-window", &CacheScope::LegacyPrimary, &hashes, 8, 4,),
+            Err(RemotePrefillValidationError::ProvidedWindowConsumesPrompt { .. })
+        ));
+    }
+
+    #[test]
+    fn worker_validation_rejects_a_stale_bundle_hash() {
+        let identity = worker_identity();
+        let hashes = [fake_plh(1, 0), fake_plh(2, 1)];
+        let target = BundleKey::new(&identity, fake_plh(99, 1), 8).unwrap();
+        let bundle = BundlePrefillContext::new(
+            identity.manifest(),
+            [kvbm_common::LogicalResourceId(3)],
+            None,
+            target,
+            1,
+        )
+        .unwrap();
+        let mut params = RemotePrefillParams::new(uuid::Uuid::new_v4(), instance_id());
+        params.bundle = Some(bundle);
+
+        assert!(matches!(
+            params.validate_for_worker(
+                "stale-target",
+                &CacheScope::Manifest(identity),
+                &hashes,
+                9,
+                4,
+            ),
+            Err(RemotePrefillValidationError::BundleBoundaryHashMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn remote_prefill_wire_validation_rejects_unknown_protocol_version() {
+        let mut request = valid_remote_prefill_request();
+        request.protocol_version = DISAGG_PROTOCOL_VERSION + 1;
+
+        assert!(matches!(
+            request.validate(),
+            Err(RemotePrefillValidationError::UnsupportedProtocolVersion { .. })
+        ));
+    }
+
+    #[test]
+    fn remote_prefill_wire_validation_rejects_empty_identity_and_prompt() {
+        let mut request = valid_remote_prefill_request();
+        request.request_id.clear();
+        assert!(matches!(
+            request.validate(),
+            Err(RemotePrefillValidationError::EmptyRequestId)
+        ));
+
+        request.request_id = "req-empty-prompt".to_owned();
+        request.token_ids.clear();
+        assert!(matches!(
+            request.validate(),
+            Err(RemotePrefillValidationError::EmptyPrompt)
+        ));
+    }
+
+    #[test]
+    fn remote_prefill_wire_validation_rejects_provided_window_beyond_prompt() {
+        let mut request = valid_remote_prefill_request();
+        request.num_provided_tokens = request.token_ids.len() + 1;
+
+        assert!(matches!(
+            request.validate(),
+            Err(RemotePrefillValidationError::ProvidedWindowOutOfBounds { .. })
+        ));
+    }
+
+    #[test]
+    fn remote_prefill_wire_validation_requires_a_token_after_bundle_target() {
+        let manifest = CacheManifestId::from_bytes([9; 32]);
+        let target = BundleKey::from_parts(manifest, fake_plh(4, 3), 5).unwrap();
+        let mut request = valid_remote_prefill_request();
+        request.bundle = Some(
+            BundlePrefillContext::new(
+                manifest,
+                [kvbm_common::LogicalResourceId(3)],
+                None,
+                target,
+                1,
+            )
+            .unwrap(),
+        );
+
+        assert!(matches!(
+            request.validate(),
+            Err(RemotePrefillValidationError::BundleTargetOutOfBounds { .. })
+        ));
     }
 
     #[test]

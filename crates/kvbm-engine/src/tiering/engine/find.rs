@@ -81,8 +81,8 @@ use kvbm_protocols::disagg::RemotePrefillParams;
 
 use super::local::{LocalConnectorEngine, LocalSearchOutcome, MatchStatus, MatchWindow};
 use super::prefill::PrefillAcceptCore;
+use super::prefill_validation::validate_remote_prefill;
 use crate::remote::cd::prefill::PrefillRequestState;
-use crate::tiering::engine::bundle::validate_prefill_context;
 
 /// The engine-side projection of one poll's eligible match window — an index
 /// RANGE over the request's shared hash chain, never an owned copy.
@@ -147,6 +147,9 @@ impl LocalConnectorEngine {
             .transfer_params
             .as_ref()
             .and_then(|t| t.remote_prefill.as_ref());
+        if let Some(params) = prefill_params {
+            validate_remote_prefill(params, req, self.block_size)?;
+        }
         if let Some(params) = prefill_params.filter(|params| params.bundle.is_none()) {
             return self.find_blocks_prefill(req, params, live);
         }
@@ -157,9 +160,6 @@ impl LocalConnectorEngine {
         }
 
         let derived = derive_window(req, self.block_size);
-        if let Some(context) = prefill_params.and_then(|params| params.bundle.as_ref()) {
-            validate_prefill_context(context, req, self.block_size)?;
-        }
         if derived.is_empty() {
             // The local prefix covers everything eligible — nothing external is
             // fetchable, so the answer is a synchronous zero and the parked pin
@@ -526,6 +526,7 @@ mod tests {
             num_computed_tokens,
             total_tokens,
             transfer_params: None,
+            local_prefill_estimate: None,
         }
     }
 

@@ -15,6 +15,7 @@ use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result, anyhow};
 use futures::future::BoxFuture;
+use kvbm_protocols::cache_manifest::RegistrationEpoch;
 use reqwest::StatusCode;
 use url::Url;
 use velo::discovery::{PeerDiscovery, PeerRegistrationGuard};
@@ -22,8 +23,8 @@ use velo_ext::{InstanceId, PeerInfo, WorkerId};
 
 use crate::handlers;
 use crate::protocol::{
-    self, DEFAULT_CONTROL_PORT, DEFAULT_DISCOVERY_PORT, ErrorBody, Feature, PeerLookupResponse,
-    RegisterRequest, RegisterResponse,
+    self, DEFAULT_CONTROL_PORT, DEFAULT_DISCOVERY_PORT, ErrorBody, Feature, MutationCredential,
+    PeerLookupResponse, RegisterRequest, RegisterResponse,
 };
 
 /// HTTP client for a [`HubServer`](crate::HubServer).
@@ -46,6 +47,11 @@ pub struct HubClient {
     /// call returns it. Used to address hub-side velo handlers (e.g. the KV
     /// indexer lookup).
     hub_velo_id: OnceLock<InstanceId>,
+    /// Registration-scoped mutation authority. Deliberately omitted from
+    /// `Debug`; only mutation-specific clients receive a clone.
+    mutation_credential: OnceLock<MutationCredential>,
+    /// Hub-minted identity of this successful registration lifecycle.
+    registration_epoch: OnceLock<RegistrationEpoch>,
     /// Last hub-heartbeat sequence observed via the velo handler. `0` when
     /// no heartbeat has been received.
     pub(crate) last_heartbeat_seq: AtomicU64,
@@ -191,6 +197,8 @@ impl HubClientBuilder {
             http,
             guard: OnceLock::new(),
             hub_velo_id: OnceLock::new(),
+            mutation_credential: OnceLock::new(),
+            registration_epoch: OnceLock::new(),
             last_heartbeat_seq: AtomicU64::new(0),
             last_heartbeat_at_ms: AtomicU64::new(0),
         }))
@@ -300,15 +308,24 @@ impl HubClient {
             .await
             .context("POST /v1/instances")?;
         let parsed: RegisterResponse = parse_json(resp).await?;
+        let mutation_credential = parsed.mutation_credential.clone();
+        let registration_epoch = parsed.registration_epoch;
 
         let guard = HubRegistrationGuard::new(
             self.http.clone(),
             self.config.control_url.clone(),
             instance_id,
+            mutation_credential.clone(),
         );
         self.guard
             .set(guard)
             .map_err(|_| anyhow!("HubClient: instance already registered (race)"))?;
+        if let Some(credential) = mutation_credential {
+            let _ = self.mutation_credential.set(credential);
+        }
+        if let Some(epoch) = registration_epoch {
+            let _ = self.registration_epoch.set(epoch);
+        }
         if let Some(hub_id) = parsed.hub_instance_id {
             let _ = self.hub_velo_id.set(hub_id);
         }
@@ -320,6 +337,12 @@ impl HubClient {
     /// registration or against a discovery-only hub.
     pub fn hub_velo_id(&self) -> Option<InstanceId> {
         self.hub_velo_id.get().copied()
+    }
+
+    /// Epoch minted for the current successful registration, if supplied by
+    /// the hub. Older discovery-only hubs may omit it.
+    pub fn registration_epoch(&self) -> Option<RegistrationEpoch> {
+        self.registration_epoch.get().copied()
     }
 
     /// Explicitly unregister the current instance (if any).
@@ -385,8 +408,23 @@ impl HubClient {
                  register against a velo-enabled hub first"
             )
         })?;
+        let credential = self.mutation_credential.get().cloned().ok_or_else(|| {
+            anyhow!(
+                "indexer enabled but registration mutation credential is unavailable — \
+                 register against a current hub first"
+            )
+        })?;
+        let registration_epoch = self.registration_epoch().ok_or_else(|| {
+            anyhow!(
+                "indexer enabled but registration epoch is unavailable — \
+                 register against a current hub first"
+            )
+        })?;
         Ok(Some(crate::features::indexer::IndexerLookupClient::new(
-            messenger, hub_id,
+            messenger,
+            hub_id,
+            credential,
+            registration_epoch,
         )))
     }
 
@@ -466,14 +504,25 @@ impl HubClient {
             .get()
             .map(|g| g.instance_id)
             .ok_or_else(|| anyhow!("HubClient: no registered instance to heartbeat"))?;
+        let credential = self
+            .mutation_credential
+            .get()
+            .ok_or_else(|| anyhow!("HubClient: registered instance has no mutation credential"))?;
         let url = self.control_url(&protocol::instance_heartbeat(instance_id))?;
         let resp = self
             .http
             .post(url)
+            .header(
+                protocol::MUTATION_CREDENTIAL_HEADER,
+                credential.to_header_value(),
+            )
             .send()
             .await
             .context("POST /v1/instances/{id}/heartbeat")?;
-        let _: protocol::HeartbeatResponse = parse_json(resp).await?;
+        let heartbeat: protocol::HeartbeatResponse = parse_json(resp).await?;
+        if !heartbeat.acknowledged {
+            anyhow::bail!("hub did not acknowledge registered-instance heartbeat");
+        }
         Ok(())
     }
 
@@ -522,6 +571,7 @@ pub struct HubRegistrationGuard {
     http: reqwest::Client,
     control_url: Url,
     instance_id: InstanceId,
+    mutation_credential: Option<MutationCredential>,
     unregistered: std::sync::atomic::AtomicBool,
 }
 
@@ -535,36 +585,43 @@ impl std::fmt::Debug for HubRegistrationGuard {
 }
 
 impl HubRegistrationGuard {
-    fn new(http: reqwest::Client, control_url: Url, instance_id: InstanceId) -> Self {
+    fn new(
+        http: reqwest::Client,
+        control_url: Url,
+        instance_id: InstanceId,
+        mutation_credential: Option<MutationCredential>,
+    ) -> Self {
         Self {
             http,
             control_url,
             instance_id,
+            mutation_credential,
             unregistered: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
     async fn unregister_http(&self) -> Result<()> {
-        if self
-            .unregistered
-            .swap(true, std::sync::atomic::Ordering::AcqRel)
-        {
+        if self.unregistered.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(());
         }
         let url = self
             .control_url
             .join(&protocol::instance_by_id(self.instance_id))
             .context("joining instance delete path")?;
-        let resp = self
-            .http
-            .delete(url)
-            .send()
-            .await
-            .context("DELETE /v1/instances/{id}")?;
+        let mut request = self.http.delete(url);
+        if let Some(credential) = &self.mutation_credential {
+            request = request.header(
+                protocol::MUTATION_CREDENTIAL_HEADER,
+                credential.to_header_value(),
+            );
+        }
+        let resp = request.send().await.context("DELETE /v1/instances/{id}")?;
         if !resp.status().is_success() && resp.status() != StatusCode::NOT_FOUND {
             let body: ErrorBody = parse_json(resp).await?;
             return Err(anyhow!("hub returned error: {body}"));
         }
+        self.unregistered
+            .store(true, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 }
@@ -581,6 +638,7 @@ impl Drop for HubRegistrationGuard {
             return;
         }
         let http = self.http.clone();
+        let mutation_credential = self.mutation_credential.clone();
         let url = match self
             .control_url
             .join(&protocol::instance_by_id(self.instance_id))
@@ -590,7 +648,14 @@ impl Drop for HubRegistrationGuard {
         };
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                let _ = http.delete(url).send().await;
+                let mut request = http.delete(url);
+                if let Some(credential) = mutation_credential {
+                    request = request.header(
+                        protocol::MUTATION_CREDENTIAL_HEADER,
+                        credential.to_header_value(),
+                    );
+                }
+                let _ = request.send().await;
             });
         }
     }

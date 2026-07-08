@@ -1023,76 +1023,78 @@ impl WorkerTransfers for PhysicalWorker {
 
         let mut notifications = Vec::with_capacity(plan.shards.len());
         for shard in &plan.shards {
-            let remote_handle = {
-                let handles = self.remote_resource_handles_rank.read().unwrap();
-                handles
-                    .get(&(
-                        plan.remote_instance,
-                        shard.remote_rank,
-                        plan.source_resource,
-                        plan.source_layout,
-                    ))
-                    .copied()
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "execute_remote_pull_plan: no remote resource {:?} {:?} handle for \
-                             (instance={}, rank={}); peer must have stamped a \
-                             ParallelismDescriptor and connect_remote must have completed",
-                            plan.source_resource,
-                            plan.source_layout,
+            notifications.push((|| {
+                let remote_handle = {
+                    let handles = self.remote_resource_handles_rank.read().unwrap();
+                    handles
+                        .get(&(
                             plan.remote_instance,
                             shard.remote_rank,
+                            plan.source_resource,
+                            plan.source_layout,
+                        ))
+                        .copied()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "execute_remote_pull_plan: no remote resource {:?} {:?} handle for \
+                                 (instance={}, rank={}); peer must have stamped a \
+                                 ParallelismDescriptor and connect_remote must have completed",
+                                plan.source_resource,
+                                plan.source_layout,
+                                plan.remote_instance,
+                                shard.remote_rank,
+                            )
+                        })?
+                };
+
+                if shard.local_slice.is_full() && shard.remote_slice.is_full() {
+                    return self.manager.execute_transfer(
+                        remote_handle,
+                        &plan.src_block_ids,
+                        local_handle,
+                        &plan.dst_block_ids,
+                        options.clone(),
+                    );
+                }
+
+                let local_physical =
+                    self.manager
+                        .get_physical_layout(local_handle)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "execute_remote_pull_plan: local handle {local_handle:?} not in manager registry"
+                            )
+                        })?;
+                let local_view = local_physical.layout().layout_view()?;
+                let remote_physical = self
+                    .manager
+                    .get_physical_layout(remote_handle)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "execute_remote_pull_plan: remote handle {remote_handle:?} not in manager registry"
                         )
-                    })?
-            };
+                    })?;
+                let remote_view = remote_physical.layout().layout_view()?;
 
-            if shard.local_slice.is_full() && shard.remote_slice.is_full() {
-                notifications.push(self.manager.execute_transfer(
+                let axis_slices = crate::leader::dispatch::build_axis_intersections(
+                    shard,
+                    |d| local_view.local_layout().size_of(d),
+                    |d| remote_view.local_layout().size_of(d),
+                )?;
+
+                self.manager.execute_transfer_selection(
                     remote_handle,
-                    &plan.src_block_ids,
                     local_handle,
-                    &plan.dst_block_ids,
+                    TransferSelection {
+                        block_pairs: block_pairs.clone(),
+                        axis_slices,
+                    },
                     options.clone(),
-                )?);
-                continue;
-            }
-
-            let local_physical = self.manager.get_physical_layout(local_handle).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "execute_remote_pull_plan: local handle {local_handle:?} not in manager registry"
                 )
-            })?;
-            let local_view = local_physical.layout().layout_view()?;
-            let remote_physical = self
-                .manager
-                .get_physical_layout(remote_handle)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "execute_remote_pull_plan: remote handle {remote_handle:?} not in manager registry"
-                    )
-                })?;
-            let remote_view = remote_physical.layout().layout_view()?;
-
-            let axis_slices = crate::leader::dispatch::build_axis_intersections(
-                shard,
-                |d| local_view.local_layout().size_of(d),
-                |d| remote_view.local_layout().size_of(d),
-            )?;
-
-            let selection = TransferSelection {
-                block_pairs: block_pairs.clone(),
-                axis_slices,
-            };
-
-            notifications.push(self.manager.execute_transfer_selection(
-                remote_handle,
-                local_handle,
-                selection,
-                options.clone(),
-            )?);
+            })());
         }
 
-        TransferCompleteNotification::aggregate(
+        TransferCompleteNotification::aggregate_results(
             notifications,
             self.manager.context().event_system(),
             self.manager.context().tokio(),
@@ -1101,6 +1103,29 @@ impl WorkerTransfers for PhysicalWorker {
 }
 
 impl Worker for PhysicalWorker {
+    fn compute_host_payload_digests(
+        &self,
+        resource: LogicalResourceId,
+        block_ids: Vec<BlockId>,
+    ) -> BoxFuture<'static, Result<Vec<kvbm_physical::transfer::PayloadDigest>>> {
+        let layout = self
+            .layout_handle_for(resource, LogicalLayoutHandle::G2)
+            .ok_or_else(|| anyhow::anyhow!("no G2 layout for resource {resource:?}"))
+            .and_then(|handle| {
+                self.manager
+                    .get_physical_layout(handle)
+                    .ok_or_else(|| anyhow::anyhow!("G2 layout handle {handle:?} not found"))
+            });
+        Box::pin(async move {
+            let layout = layout?;
+            tokio::task::spawn_blocking(move || {
+                kvbm_physical::transfer::compute_host_block_digests(&layout, &block_ids)
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("host payload digest task failed: {error}"))?
+        })
+    }
+
     fn g1_handle(&self) -> Option<LayoutHandle> {
         PhysicalWorker::g1_handle(self)
     }

@@ -14,16 +14,14 @@
 //! in-process callers and avoids forcing every caller through the velo
 //! wire.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::Result;
-use futures::StreamExt;
 use kvbm_common::LogicalResourceId;
 use velo::{Handler, Messenger};
 
 use kvbm_logical::BlockManager;
-use kvbm_logical::blocks::{CompleteBlock, ImmutableBlock};
+use kvbm_logical::blocks::ImmutableBlock;
 
 use crate::G3;
 use crate::leader::BlockHolder;
@@ -39,7 +37,9 @@ use kvbm_protocols::control::{ControlError, ControlReply, ModuleId};
 
 use crate::leader::InstanceLeader;
 use crate::leader::control::ControlModule;
-use crate::p2p::session::{AvailabilityDelta, CommitDelta, Session};
+use crate::p2p::PayloadBlock;
+use crate::p2p::pull_transaction::resolve_g2_manager;
+use crate::p2p::session::{Session, VerifiedPayload};
 use crate::{G2, SequenceHash};
 
 // ---------------------------------------------------------------------------
@@ -171,6 +171,8 @@ fn register_search_shim(
                 tiers: TierSelection::default(),
                 resource: None,
                 watchdog_ms: None,
+                registration_epoch: None,
+                require_payload_integrity: false,
             };
             let reply: ControlReply<SearchResponse> = leader
                 .open_transfer_session(open_req)
@@ -320,6 +322,8 @@ async fn stage_phase(
     leader: Arc<InstanceLeader>,
     g2_manager: Arc<BlockManager<G2>>,
     session: Arc<dyn Session>,
+    resource: LogicalResourceId,
+    require_payload_integrity: bool,
     find: FindOutcome,
 ) -> Result<(), ControlError> {
     let FindOutcome {
@@ -330,13 +334,21 @@ async fn stage_phase(
         ..
     } = find;
 
+    let g2_count = g2_committed.len();
     if !g2_committed.is_empty() {
         session
             .commit(g2_committed)
             .map_err(|e| ControlError::Internal(format!("commit g2: {e:#}")))?;
-        session
-            .make_available(g2_blocks)
-            .map_err(|e| ControlError::Internal(format!("make_available g2: {e:#}")))?;
+        publish_available(
+            &leader,
+            &session,
+            resource,
+            g2_blocks,
+            0,
+            require_payload_integrity,
+        )
+        .await
+        .map_err(|e| ControlError::Internal(format!("make_available g2: {e:#}")))?;
     }
 
     if !g3_committed.is_empty() {
@@ -357,9 +369,16 @@ async fn stage_phase(
             .await
             .map_err(|e| ControlError::Internal(format!("stage_g3_to_g2: {e:#}")))?;
 
-        session
-            .make_available(staged.new_g2_blocks)
-            .map_err(|e| ControlError::Internal(format!("make_available staged: {e:#}")))?;
+        publish_available(
+            &leader,
+            &session,
+            resource,
+            staged.new_g2_blocks,
+            g2_count,
+            require_payload_integrity,
+        )
+        .await
+        .map_err(|e| ControlError::Internal(format!("make_available staged: {e:#}")))?;
     }
 
     session
@@ -371,6 +390,47 @@ async fn stage_phase(
     Ok(())
 }
 
+async fn publish_available(
+    leader: &Arc<InstanceLeader>,
+    session: &Arc<dyn Session>,
+    resource: LogicalResourceId,
+    blocks: Vec<ImmutableBlock<G2>>,
+    ordinal_offset: usize,
+    require_payload_integrity: bool,
+) -> Result<()> {
+    if !require_payload_integrity {
+        return session.make_available(blocks);
+    }
+    let payload_blocks = blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| {
+            let ordinal = u32::try_from(ordinal_offset + index)
+                .map_err(|_| anyhow::anyhow!("payload ordinal exceeds u32"))?;
+            Ok(PayloadBlock {
+                hash: block.sequence_hash(),
+                block_id: block.block_id(),
+                ordinal,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let checksums = leader
+        .payload_checksums(resource, &payload_blocks)
+        .await
+        .map_err(|error| anyhow::anyhow!("payload_checksum_unavailable: {error:#}"))?;
+    let payloads = payload_blocks
+        .into_iter()
+        .zip(checksums)
+        .map(|(block, checksum)| VerifiedPayload {
+            ordinal: block.ordinal,
+            checksum,
+        })
+        .collect();
+    session
+        .make_available_verified(blocks, payloads)
+        .map_err(|error| anyhow::anyhow!("payload_checksum_publish_failed: {error:#}"))
+}
+
 /// Engine-side implementation behind [`InstanceLeader::open_transfer_session`].
 ///
 /// G2 + G3 in v1; G4 in v1.1.
@@ -378,6 +438,18 @@ pub(crate) async fn open_transfer_session(
     leader: &Arc<InstanceLeader>,
     req: OpenTransferSessionRequest,
 ) -> Result<OpenTransferSessionResponse, ControlError> {
+    // Complete-bundle callers validate manifest/lineages before RPC. This
+    // holder-side check prevents that validated hit from crossing into a
+    // replacement lifecycle before any raw resource search or session open.
+    match req.registration_epoch {
+        Some(epoch) if leader.current_registration_epoch() != Some(epoch) => {
+            return Err(ControlError::RegistrationEpochMismatch);
+        }
+        None if req.require_payload_integrity => {
+            return Err(ControlError::RegistrationEpochMismatch);
+        }
+        _ => {}
+    }
     let (resource, g2_manager) = resolve_g2_manager(leader, req.resource)?;
     let find = find_phase(
         leader,
@@ -441,12 +513,16 @@ pub(crate) async fn open_transfer_session(
         resource,
     };
 
-    // Park the session before kicking off the populator. Per-session
-    // watchdog override is v1.1 (SessionManager currently has a single
-    // fixed watchdog at construction time); accept the field on the
-    // request now so the wire is stable.
-    let _ = req.watchdog_ms;
-    leader.session_manager().register(Arc::clone(&session));
+    // Park before launching the populator. The requester may shorten the
+    // holder-side watchdog; the manager caps it at its configured maximum.
+    if let Some(watchdog_ms) = req.watchdog_ms {
+        leader.session_manager().register_with_watchdog(
+            Arc::clone(&session),
+            std::time::Duration::from_millis(watchdog_ms),
+        );
+    } else {
+        leader.session_manager().register(Arc::clone(&session));
+    }
 
     crate::engine_audit!(
         "transfer_session_opened",
@@ -465,11 +541,15 @@ pub(crate) async fn open_transfer_session(
     let runtime = leader.runtime();
     let leader_for_task = Arc::clone(leader);
     let session_for_task = Arc::clone(&session);
+    let require_payload_integrity = req.require_payload_integrity;
+    let find_mode = req.find_mode;
     runtime.spawn(async move {
         match stage_phase(
             leader_for_task,
             g2_manager,
             Arc::clone(&session_for_task),
+            resource,
+            require_payload_integrity,
             find,
         )
         .await
@@ -492,7 +572,7 @@ pub(crate) async fn open_transfer_session(
         }
     });
 
-    match req.find_mode {
+    match find_mode {
         FindMode::Sync => Ok(OpenTransferSessionResponse::Sync {
             capability,
             committed,
@@ -535,197 +615,16 @@ pub(crate) async fn close_transfer_session(
 
 /// Engine-side implementation behind [`InstanceLeader::pull_from_session`].
 ///
-/// Attach to the holder's session, drain `commits()` to learn what's
-/// committed, then drain `availability()` and pull each batch into
-/// freshly-allocated G2 mutables on this side. Stage + register each
-/// pulled mutable so the blocks land in the local registry.
+/// The legacy one-resource endpoint publishes immediately after the shared
+/// staging transaction succeeds. Complete-bundle callers use
+/// [`crate::p2p::stage_from_session`] directly and defer publication until all
+/// resources have staged.
 pub(crate) async fn pull_from_session(
     leader: &Arc<InstanceLeader>,
     req: PullFromSessionRequest,
 ) -> Result<PullFromSessionResponse, ControlError> {
-    let (resource, g2_manager) = resolve_g2_manager(leader, req.resource)?;
-    let endpoint = req.endpoint.ok_or_else(|| {
-        ControlError::Internal(
-            "endpoint_required: pull_from_session requires an explicit endpoint in v1 \
-             (hub-registry resolution is v1.1)"
-                .into(),
-        )
-    })?;
-
-    let factory = leader
-        .session_factory_cell()
-        .get()
-        .ok_or(ControlError::NotInitialized)?
-        .clone();
-
-    crate::engine_audit!(
-        "transfer_pull_started",
-        session_id = %req.session_id,
-        source = %req.source_instance_id,
-        resource = ?resource,
-        selector_present = req.selector.is_some()
-    );
-
-    let session = factory
-        .attach(req.session_id, req.source_instance_id, endpoint)
-        .await
-        .map_err(|e| ControlError::Internal(format!("attach: {e:#}")))?;
-
-    // Drain commits to build the committed set. Replay-on-first-subscribe
-    // means anything that arrived before this subscribe is buffered and
-    // delivered as a single Added batch.
-    let mut commit_stream = session.commits();
-    let mut committed: HashSet<SequenceHash> = HashSet::new();
-    while let Some(delta) = commit_stream.next().await {
-        match delta {
-            CommitDelta::Added(hashes) => committed.extend(hashes),
-            CommitDelta::Closed => break,
-        }
-    }
-    drop(commit_stream);
-
-    // Resolve target set against selector.
-    let target_hashes: Vec<SequenceHash> = match req.selector {
-        None => committed.iter().copied().collect(),
-        Some(selector) => {
-            let missing: Vec<SequenceHash> = selector
-                .iter()
-                .copied()
-                .filter(|h| !committed.contains(h))
-                .collect();
-            if !missing.is_empty() {
-                // Best-effort close so the holder's session_manager
-                // can evict promptly; do not propagate this error.
-                session.close(Some("selector references uncommitted hashes".into()));
-                return Err(ControlError::Internal(format!(
-                    "hashes_not_committed: {} hash(es) in selector are not committed",
-                    missing.len()
-                )));
-            }
-            selector
-                .into_iter()
-                .filter(|h| committed.contains(h))
-                .collect()
-        }
-    };
-
-    if target_hashes.is_empty() {
-        session.finalize(None);
-        return Ok(PullFromSessionResponse::default());
-    }
-
-    let target_set: HashSet<SequenceHash> = target_hashes.iter().copied().collect();
-
-    // Drain availability, pulling each chunk.
-    let block_size = g2_manager.block_size();
-    let mut pulled_order: Vec<SequenceHash> = Vec::with_capacity(target_set.len());
-    let mut pulled_set: HashSet<SequenceHash> = HashSet::new();
-
-    let mut avail_stream = session.availability();
-    'drain: while let Some(delta) = avail_stream.next().await {
-        match delta {
-            AvailabilityDelta::Available(blocks) => {
-                // Filter to what we actually want and haven't pulled yet.
-                let chunk_hashes: Vec<SequenceHash> = blocks
-                    .into_iter()
-                    .filter_map(|b| {
-                        if target_set.contains(&b.hash) && !pulled_set.contains(&b.hash) {
-                            Some(b.hash)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                if chunk_hashes.is_empty() {
-                    continue;
-                }
-
-                let chunk_len = chunk_hashes.len();
-                let dst = g2_manager.allocate_blocks(chunk_len).ok_or_else(|| {
-                    ControlError::Internal(format!(
-                        "pull: failed to allocate {chunk_len} G2 mutable blocks"
-                    ))
-                })?;
-
-                let filled = session
-                    .pull_resource(resource, chunk_hashes.clone(), dst)
-                    .await
-                    .map_err(|e| ControlError::Internal(format!("session.pull: {e:#}")))?;
-
-                if filled.len() != chunk_len {
-                    return Err(ControlError::Internal(format!(
-                        "pull: session.pull returned {} blocks, expected {}",
-                        filled.len(),
-                        chunk_len
-                    )));
-                }
-
-                // Stage + register the filled mutables so the blocks
-                // join the local G2 registry as ImmutableBlocks.
-                let mut completes: Vec<CompleteBlock<G2>> = Vec::with_capacity(chunk_len);
-                for (mutable, hash) in filled.into_iter().zip(chunk_hashes.iter()) {
-                    let complete = mutable.stage(*hash, block_size).map_err(|e| {
-                        ControlError::Internal(format!("stage pulled block: {e:#}"))
-                    })?;
-                    completes.push(complete);
-                }
-                let _registered = g2_manager.register_blocks(completes);
-
-                pulled_order.extend(&chunk_hashes);
-                pulled_set.extend(&chunk_hashes);
-
-                if pulled_set.len() == target_set.len() {
-                    break 'drain;
-                }
-            }
-            AvailabilityDelta::Drained => break 'drain,
-        }
-    }
-    drop(avail_stream);
-
-    // If availability drained before we got everything we wanted,
-    // surface that as an error — the holder's commits promised more
-    // than it could make available.
-    if pulled_set.len() < target_set.len() {
-        session.finalize(None);
-        return Err(ControlError::Internal(format!(
-            "pull: availability drained with {} of {} target hashes pulled",
-            pulled_set.len(),
-            target_set.len()
-        )));
-    }
-
-    // Cooperative shutdown. The holder side will see Finished + (if it
-    // also finalizes) trigger the wire-level finalize; otherwise the
-    // SessionManager's watchdog evicts. Either way the puller-side
-    // arc drops when this function returns.
-    session.finalize(None);
-
-    crate::engine_audit!(
-        "transfer_pull_completed",
-        session_id = %req.session_id,
-        pulled = pulled_order.len()
-    );
-
-    Ok(PullFromSessionResponse {
-        pulled: pulled_order,
-        breakdown: MatchBreakdown {
-            host_blocks: pulled_set.len(),
-            disk_blocks: 0,
-            object_blocks: 0,
-        },
-    })
-}
-
-fn resolve_g2_manager(
-    leader: &InstanceLeader,
-    requested: Option<LogicalResourceId>,
-) -> Result<(LogicalResourceId, Arc<BlockManager<G2>>), ControlError> {
-    let resource = requested.unwrap_or_else(|| leader.primary_g2_resource());
-    let manager = leader.g2_manager_for(resource).cloned().ok_or_else(|| {
-        ControlError::Internal(format!(
-            "logical_resource_not_found: no G2 manager for resource {resource:?}"
-        ))
-    })?;
-    Ok((resource, manager))
+    let staged = crate::p2p::stage_from_session(leader, req).await?;
+    let response = staged.response();
+    let _published = staged.publish();
+    Ok(response)
 }

@@ -23,7 +23,7 @@ use crate::remote::cd::DisaggConfig;
 use crate::remote::cd::budget::TierCell;
 use crate::remote::cd::wire::PrefillPlane;
 use crate::remote::search::discovery::RemoteDiscoveryHandle;
-use crate::tiering::policy::ResourcePolicies;
+use crate::tiering::policy::{ResourceComponentBytes, ResourcePolicies};
 
 /// Construction config for the in-process connector engine.
 ///
@@ -39,6 +39,9 @@ pub struct ConnectorEngineConfig {
     pub remote: RemoteOps,
     /// Per-resource admission, retention, and inactive-backend policy.
     pub resource_policies: ResourcePolicies,
+    /// Positive byte widths of each atomic physical component in one logical
+    /// block, keyed by the same resource set as `resource_policies`.
+    pub resource_component_bytes: ResourceComponentBytes,
 }
 
 /// The remote-block operations the engine offers.

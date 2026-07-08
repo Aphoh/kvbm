@@ -6,7 +6,9 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
 use kvbm_common::{BlockId, LogicalResourceId, SequenceHash};
-use kvbm_protocols::cache_manifest::ResourceRole;
+use kvbm_protocols::cache_manifest::{
+    BundleResourceLineage, ResourceRole, validate_bundle_lineages,
+};
 use kvbm_protocols::connector::{
     ActionId, ActionStatus, BundleOffloadPlan, LeaderEngine, LeaderEngineError, OffloadHandle,
     RequestId,
@@ -28,12 +30,19 @@ impl LocalConnectorEngine {
         plan: BundleOffloadPlan,
     ) -> Result<OffloadHandle, LeaderEngineError> {
         let sources = self.validate_bundle_offload(&plan)?;
+        let planned_bytes = self.admit_bundle(&plan)?;
         let lineages = bundle_lineages(&plan)?;
-        let mut transaction =
-            LocalBundleOffload::new(plan.identity, plan.key, plan.generation, plan.mode, sources)
-                .map_err(|error| LeaderEngineError::InvalidBundleTransfer {
+        let generation = self
+            .leader
+            .reserve_bundle_publication_generation()
+            .map_err(|error| LeaderEngineError::InvalidBundleTransfer {
                 reason: error.to_string(),
             })?;
+        let mut transaction =
+            LocalBundleOffload::new(plan.identity, plan.key, generation, plan.mode, sources)
+                .map_err(|error| LeaderEngineError::InvalidBundleTransfer {
+                    reason: error.to_string(),
+                })?;
         transaction.start();
         let child_count = NonZeroUsize::new(plan.resources.len()).ok_or_else(|| {
             LeaderEngineError::InvalidBundleTransfer {
@@ -69,6 +78,7 @@ impl LocalConnectorEngine {
                 request_id: req.clone(),
                 resource: Some(child.resource),
                 pairs: child.blocks,
+                planned_bytes: Some(planned_bytes[&child.resource]),
                 iteration,
                 completion: BufferedOffloadCompletion::Bundle(Arc::clone(&runtime)),
             }));
@@ -89,6 +99,25 @@ impl LocalConnectorEngine {
         if !plan.key.is_compatible_with(&plan.identity) {
             return Err(LeaderEngineError::InvalidBundleTransfer {
                 reason: "bundle key is incompatible with its cache identity".to_owned(),
+            });
+        }
+        let primary_resource = self.leader.primary_g2_resource();
+        let primary_requirement = plan
+            .identity
+            .resources()
+            .iter()
+            .find(|requirement| requirement.resource() == primary_resource)
+            .ok_or_else(|| LeaderEngineError::InvalidBundleTransfer {
+                reason: format!(
+                    "primary resource {primary_resource:?} is absent from the cache identity"
+                ),
+            })?;
+        if primary_requirement.role() != ResourceRole::PrefixHistory {
+            return Err(LeaderEngineError::InvalidBundleTransfer {
+                reason: format!(
+                    "primary resource {primary_resource:?} must be a prefix history, got {:?}",
+                    primary_requirement.role()
+                ),
             });
         }
         let mut sources = BTreeMap::new();
@@ -122,18 +151,6 @@ impl LocalConnectorEngine {
                         child.resource
                     ),
                 })?;
-            if let Some(policy) = self.resource_policies.get(child.resource)
-                && policy.role() != requirement.role()
-            {
-                return Err(LeaderEngineError::InvalidBundleTransfer {
-                    reason: format!(
-                        "resource {:?} policy role {:?} disagrees with manifest role {:?}",
-                        child.resource,
-                        policy.role(),
-                        requirement.role()
-                    ),
-                });
-            }
             let expected_blocks = match requirement.role() {
                 ResourceRole::PrefixHistory => plan
                     .key
@@ -155,11 +172,15 @@ impl LocalConnectorEngine {
                     ),
                 });
             }
-            if child.blocks.last().map(|(hash, _)| *hash) != Some(plan.key.boundary_hash()) {
+            let requires_canonical_boundary = child.resource == primary_resource
+                || requirement.role() == ResourceRole::BoundaryCapsule;
+            if requires_canonical_boundary
+                && child.blocks.last().map(|(hash, _)| *hash) != Some(plan.key.boundary_hash())
+            {
                 return Err(LeaderEngineError::InvalidBundleTransfer {
                     reason: format!(
-                        "resource {:?} does not end at the bundle boundary hash",
-                        child.resource
+                        "primary history or boundary capsule {:?} does not end at the bundle boundary hash",
+                        child.resource,
                     ),
                 });
             }
@@ -169,25 +190,44 @@ impl LocalConnectorEngine {
 }
 
 fn bundle_lineages(plan: &BundleOffloadPlan) -> Result<Vec<ResourceLineage>, LeaderEngineError> {
-    plan.resources
+    let exact = plan
+        .resources
         .iter()
         .map(|child| {
+            BundleResourceLineage::new(
+                child.resource,
+                child.blocks.iter().map(|(hash, _)| *hash).collect(),
+            )
+            .map_err(|error| LeaderEngineError::InvalidBundleTransfer {
+                reason: error.to_string(),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    validate_bundle_lineages(plan.key, plan.identity.resources(), &exact).map_err(|error| {
+        LeaderEngineError::InvalidBundleTransfer {
+            reason: error.to_string(),
+        }
+    })?;
+
+    exact
+        .into_iter()
+        .map(|lineage| {
             let role = plan
                 .identity
                 .resources()
                 .iter()
-                .find(|requirement| requirement.resource() == child.resource)
+                .find(|requirement| requirement.resource() == lineage.resource())
                 .map(|requirement| requirement.role())
                 .ok_or_else(|| LeaderEngineError::InvalidBundleTransfer {
                     reason: format!(
                         "resource {:?} is absent from the cache identity",
-                        child.resource
+                        lineage.resource()
                     ),
                 })?;
             Ok(ResourceLineage::new(
-                child.resource,
+                lineage.resource(),
                 role,
-                child.blocks.iter().map(|(hash, _)| *hash).collect(),
+                lineage.hashes().to_vec(),
             ))
         })
         .collect()

@@ -146,6 +146,11 @@ pub enum ControlError {
     #[error("control module {0:?} is not enabled on this leader")]
     ModuleNotEnabled(ModuleId),
 
+    /// A directory-issued bundle hit names an earlier lifecycle of this
+    /// holder's `InstanceId`.
+    #[error("registration epoch does not match the current owner lifecycle")]
+    RegistrationEpochMismatch,
+
     /// Generic internal error from the underlying engine.
     #[error("internal: {0}")]
     Internal(String),
@@ -163,6 +168,7 @@ impl ControlError {
             ControlError::NotInitialized => 503,
             ControlError::PeerNotFound { .. } => 404,
             ControlError::ModuleNotEnabled(_) => 404,
+            ControlError::RegistrationEpochMismatch => 409,
             ControlError::Internal(_) => 500,
         }
     }
@@ -174,6 +180,7 @@ impl ControlError {
             ControlError::NotInitialized => "not_initialized",
             ControlError::PeerNotFound { .. } => "peer_not_found",
             ControlError::ModuleNotEnabled(_) => "module_not_enabled",
+            ControlError::RegistrationEpochMismatch => "registration_epoch_mismatch",
             ControlError::Internal(_) => "internal",
         }
     }

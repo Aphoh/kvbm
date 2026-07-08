@@ -10,6 +10,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -118,6 +119,54 @@ impl FenceToken {
 // Unified find / onboard seam
 // ---------------------------------------------------------------------------
 
+/// Scheduler-owned local-prefill cost assumptions for one placement decision.
+///
+/// The engine applies the rate to the suffix that remains after the greatest
+/// complete bundle seed, so the scheduler does not need to predict which cache
+/// boundary will win. A zero rate omits compute time while retaining the queue
+/// estimate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalPrefillEstimate {
+    queue: Duration,
+    tokens_per_second: u64,
+}
+
+impl LocalPrefillEstimate {
+    /// Construct an estimate from current queue/load delay and effective local
+    /// prefill throughput.
+    pub const fn from_rate(queue: Duration, tokens_per_second: u64) -> Self {
+        Self {
+            queue,
+            tokens_per_second,
+        }
+    }
+
+    /// Estimate queue plus compute time for `tokens` remaining local tokens.
+    pub fn estimate(self, tokens: usize) -> Duration {
+        let tokens = u64::try_from(tokens).unwrap_or(u64::MAX);
+        self.queue
+            .saturating_add(Duration::from_nanos(estimate_nanos(
+                tokens,
+                self.tokens_per_second,
+            )))
+    }
+
+    /// Current scheduler queue/load delay.
+    pub const fn queue(self) -> Duration {
+        self.queue
+    }
+}
+
+fn estimate_nanos(tokens: u64, tokens_per_second: u64) -> u64 {
+    if tokens == 0 || tokens_per_second == 0 {
+        return 0;
+    }
+    let nanos = u128::from(tokens)
+        .saturating_mul(1_000_000_000)
+        .div_ceil(u128::from(tokens_per_second));
+    u64::try_from(nanos).unwrap_or(u64::MAX)
+}
+
 /// Input to [`super::engine::LeaderEngine::find_blocks`]. Hashes and counts
 /// only — token ids never cross the seam.
 #[derive(Debug, Clone)]
@@ -133,6 +182,9 @@ pub struct FindBlocksRequest {
     pub total_tokens: usize,
     /// The slot's parsed `kv_transfer_params`, passed through whole.
     pub transfer_params: Option<TransferParams>,
+    /// Optional scheduler-owned queue/load estimate used by complete-bundle
+    /// conditional-prefill placement. Absence fails closed to local execution.
+    pub local_prefill_estimate: Option<LocalPrefillEstimate>,
 }
 
 /// One exact G2-to-G1 restore within a logical model resource.
@@ -180,7 +232,6 @@ pub enum OffloadMode {
 pub struct BundleOffloadPlan {
     pub identity: CacheIdentity,
     pub key: BundleKey,
-    pub generation: u64,
     pub mode: OffloadMode,
     pub resources: Vec<ResourceOffload>,
 }

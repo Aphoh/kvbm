@@ -5,6 +5,8 @@
 
 mod identity;
 mod key;
+mod lineage;
+mod registration;
 mod resource;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -15,6 +17,11 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 pub use identity::{CacheIdentity, CacheManifestId, CacheScope, ModelIdentity};
 pub use key::{BundleKey, BundleKeyError};
+pub use lineage::{
+    BundleLineageValidationError, BundleResourceLineage, BundleResourceLineageError,
+    validate_bundle_lineages,
+};
+pub use registration::RegistrationEpoch;
 use resource::resource_alignment;
 pub use resource::{ResourceRequirement, ResourceRole};
 

@@ -6,7 +6,9 @@
 use std::collections::{HashMap, HashSet};
 
 use kvbm_common::{LogicalResourceId, SequenceHash};
-use kvbm_protocols::cache_manifest::{BundleKey, ResourceRole};
+use kvbm_protocols::cache_manifest::{
+    BundleKey, BundleResourceLineage, BundleResourceLineageError, ResourceRole,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct ResourceBlock {
@@ -25,38 +27,30 @@ impl BundleDependencyIndex {
         Self::default()
     }
 
+    #[cfg(test)]
     pub(in crate::tiering) fn track(
         &mut self,
         key: BundleKey,
         resources: impl IntoIterator<Item = ResourceLineage>,
     ) -> Result<(), DependencyError> {
-        let resources = resources.into_iter().collect::<Vec<_>>();
-        if resources.is_empty() {
-            return Err(DependencyError::NoResources);
-        }
-        let mut blocks = Vec::new();
-        let mut seen_resources = HashSet::new();
-        for lineage in resources {
-            if !seen_resources.insert(lineage.resource) {
-                return Err(DependencyError::DuplicateResource {
-                    resource: lineage.resource,
-                });
-            }
-            lineage.validate(key)?;
-            blocks.extend(lineage.hashes.into_iter().map(|hash| ResourceBlock {
-                resource: lineage.resource,
-                hash,
-            }));
-        }
-        let mut unique_blocks = HashSet::new();
-        blocks.retain(|block| unique_blocks.insert(*block));
+        let prepared = PreparedDependencies::new(key, resources)?;
+        self.install(key, prepared);
+        Ok(())
+    }
 
+    pub(in crate::tiering) fn prepare(
+        key: BundleKey,
+        resources: impl IntoIterator<Item = ResourceLineage>,
+    ) -> Result<PreparedDependencies, DependencyError> {
+        PreparedDependencies::new(key, resources)
+    }
+
+    pub(in crate::tiering) fn install(&mut self, key: BundleKey, prepared: PreparedDependencies) {
         self.untrack(key);
-        for block in &blocks {
+        for block in &prepared.blocks {
             self.by_block.entry(*block).or_default().insert(key);
         }
-        self.by_bundle.insert(key, blocks);
-        Ok(())
+        self.by_bundle.insert(key, prepared.blocks);
     }
 
     pub(in crate::tiering) fn invalidate(
@@ -112,7 +106,7 @@ impl BundleDependencyIndex {
         keys
     }
 
-    fn untrack(&mut self, key: BundleKey) {
+    pub(in crate::tiering) fn untrack(&mut self, key: BundleKey) {
         let Some(blocks) = self.by_bundle.remove(&key) else {
             return;
         };
@@ -124,6 +118,39 @@ impl BundleDependencyIndex {
                 }
             }
         }
+    }
+}
+
+pub(in crate::tiering) struct PreparedDependencies {
+    blocks: Vec<ResourceBlock>,
+}
+
+impl PreparedDependencies {
+    fn new(
+        key: BundleKey,
+        resources: impl IntoIterator<Item = ResourceLineage>,
+    ) -> Result<Self, DependencyError> {
+        let resources = resources.into_iter().collect::<Vec<_>>();
+        if resources.is_empty() {
+            return Err(DependencyError::NoResources);
+        }
+        let mut blocks = Vec::new();
+        let mut seen_resources = HashSet::new();
+        for lineage in resources {
+            if !seen_resources.insert(lineage.resource) {
+                return Err(DependencyError::DuplicateResource {
+                    resource: lineage.resource,
+                });
+            }
+            lineage.validate(key)?;
+            blocks.extend(lineage.hashes.into_iter().map(|hash| ResourceBlock {
+                resource: lineage.resource,
+                hash,
+            }));
+        }
+        let mut unique_blocks = HashSet::new();
+        blocks.retain(|block| unique_blocks.insert(*block));
+        Ok(Self { blocks })
     }
 }
 
@@ -147,13 +174,39 @@ impl ResourceLineage {
         }
     }
 
+    pub(in crate::tiering) const fn resource(&self) -> LogicalResourceId {
+        self.resource
+    }
+
+    pub(in crate::tiering) fn advertisement_lineage(
+        &self,
+    ) -> Result<BundleResourceLineage, BundleResourceLineageError> {
+        BundleResourceLineage::new(self.resource, self.hashes.clone())
+    }
+
     fn validate(&self, key: BundleKey) -> Result<(), DependencyError> {
         if self.hashes.is_empty() {
             return Err(DependencyError::EmptyLineage {
                 resource: self.resource,
             });
         }
-        if self.hashes.last().copied() != Some(key.boundary_hash()) {
+        let mut unique = HashSet::with_capacity(self.hashes.len());
+        if let Some(hash) = self
+            .hashes
+            .iter()
+            .copied()
+            .find(|hash| !unique.insert(*hash))
+        {
+            return Err(DependencyError::DuplicateHash {
+                resource: self.resource,
+                hash,
+            });
+        }
+        // Histories with different native block sizes have distinct terminal hashes.
+        // Bundle ingress validates the canonical hash on the designated primary history.
+        if self.role == ResourceRole::BoundaryCapsule
+            && self.hashes.last().copied() != Some(key.boundary_hash())
+        {
             return Err(DependencyError::BoundaryMismatch {
                 resource: self.resource,
             });
@@ -196,6 +249,11 @@ pub(in crate::tiering) enum DependencyError {
     DuplicateResource { resource: LogicalResourceId },
     #[error("resource {resource:?} has an empty block lineage")]
     EmptyLineage { resource: LogicalResourceId },
+    #[error("resource {resource:?} repeats lineage hash {hash}")]
+    DuplicateHash {
+        resource: LogicalResourceId,
+        hash: SequenceHash,
+    },
     #[error("resource {resource:?} does not end at the bundle boundary")]
     BoundaryMismatch { resource: LogicalResourceId },
     #[error("capsule resource {resource:?} must be one atomic logical object")]
@@ -215,7 +273,7 @@ mod tests {
     const CAPSULE: LogicalResourceId = LogicalResourceId(71);
 
     fn hash(value: u8) -> SequenceHash {
-        SequenceHash::new(u64::from(value), None, u64::from(value))
+        (2..=u64::from(value)).fold(SequenceHash::root(1), |parent, block| parent.extend(block))
     }
 
     fn keys() -> (BundleKey, BundleKey) {

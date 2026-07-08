@@ -44,6 +44,7 @@ uuid = { workspace = true }
 
 # Non-workspace
 bytes = "1.10"
+blake3 = "1"
 crossbeam-queue = "0.3"
 oneshot = "0.1.11"
 

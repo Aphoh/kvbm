@@ -9,13 +9,14 @@ use std::sync::Arc;
 use kvbm_hub::handlers::{HEARTBEAT_HANDLER, HeartbeatAck, HeartbeatRequest};
 use kvbm_hub::protocol::{
     ConditionalDisaggConfig, ConditionalDisaggRole, DISAGG_PROTOCOL_VERSION, ErrorBody, ErrorCode,
-    Feature, HeartbeatResponse, LayoutCompatPayload, ListInstancesResponse, P2pConfig,
-    PeerLookupResponse, PrefillRequest, ProbeResponse, RegisterRequest, RegisterResponse,
-    instance_by_id, instance_heartbeat, instance_probe, paths, peers_by_instance, peers_by_worker,
+    Feature, HeartbeatResponse, LayoutCompatPayload, ListInstancesResponse,
+    MUTATION_CREDENTIAL_HEADER, MutationCredential, P2pConfig, PeerLookupResponse, PrefillRequest,
+    ProbeResponse, RegisterRequest, RegisterResponse, instance_by_id, instance_heartbeat,
+    instance_probe, paths, peers_by_instance, peers_by_worker,
 };
 use kvbm_hub::{
     ConditionalDisaggClient, ConditionalDisaggInstancesResponse, ConditionalDisaggManager,
-    HubClientBuilder, HubServer,
+    HubClientBuilder, HubServer, InMemoryRegistry, PeerRegistry,
 };
 use velo::Transport;
 use velo::discovery::PeerDiscovery;
@@ -109,6 +110,36 @@ fn http() -> reqwest::Client {
     reqwest::Client::new()
 }
 
+async fn register_plain_peer(
+    server: &HubServer,
+    peer: &PeerInfo,
+    current_credential: Option<&MutationCredential>,
+) -> RegisterResponse {
+    let mut request = http()
+        .post(control_url(server, paths::INSTANCES))
+        .json(&RegisterRequest {
+            peer_info: peer.clone(),
+            features: Vec::new(),
+            runtime: None,
+        });
+    if let Some(credential) = current_credential {
+        request = request.header(MUTATION_CREDENTIAL_HEADER, credential.to_header_value());
+    }
+    request.send().await.unwrap().json().await.unwrap()
+}
+
+async fn heartbeat_status(
+    server: &HubServer,
+    owner: InstanceId,
+    credential: Option<&MutationCredential>,
+) -> reqwest::StatusCode {
+    let mut request = http().post(control_url(server, &instance_heartbeat(owner)));
+    if let Some(credential) = credential {
+        request = request.header(MUTATION_CREDENTIAL_HEADER, credential.to_header_value());
+    }
+    request.send().await.unwrap().status()
+}
+
 // ---- handlers module --------------------------------------------------------
 
 #[test]
@@ -194,10 +225,11 @@ async fn register_success() {
     assert_eq!(resp.status(), 200);
     let body: RegisterResponse = resp.json().await.unwrap();
     assert_eq!(body.instance_id, peer.instance_id());
+    assert!(body.mutation_credential.is_some());
 }
 
 #[tokio::test]
-async fn reregister_same_instance_is_idempotent() {
+async fn active_reregister_requires_current_credential_and_rotates_it() {
     let server = start_server().await;
     let peer = make_peer();
     let req = RegisterRequest {
@@ -205,21 +237,59 @@ async fn reregister_same_instance_is_idempotent() {
         features: Vec::new(),
         runtime: None,
     };
-    let post = || {
-        http()
-            .post(control_url(&server, paths::INSTANCES))
-            .json(&req)
-            .send()
-    };
-    assert_eq!(post().await.unwrap().status(), 200);
-    assert_eq!(post().await.unwrap().status(), 200);
+    let first: RegisterResponse = http()
+        .post(control_url(&server, paths::INSTANCES))
+        .json(&req)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let first_credential = first.mutation_credential.unwrap();
+
+    let unauthenticated = http()
+        .post(control_url(&server, paths::INSTANCES))
+        .json(&req)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauthenticated.status(), 401);
+
+    let second: RegisterResponse = http()
+        .post(control_url(&server, paths::INSTANCES))
+        .header(
+            kvbm_hub::protocol::MUTATION_CREDENTIAL_HEADER,
+            first_credential.to_header_value(),
+        )
+        .json(&req)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let second_credential = second.mutation_credential.unwrap();
+    assert_ne!(first_credential, second_credential);
+
+    let stale = http()
+        .post(control_url(&server, paths::INSTANCES))
+        .header(
+            kvbm_hub::protocol::MUTATION_CREDENTIAL_HEADER,
+            first_credential.to_header_value(),
+        )
+        .json(&req)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), 401);
 }
 
 #[tokio::test]
 async fn unregister_success() {
     let server = start_server().await;
     let peer = make_peer();
-    http()
+    let registration: RegisterResponse = http()
         .post(control_url(&server, paths::INSTANCES))
         .json(&RegisterRequest {
             peer_info: peer.clone(),
@@ -228,13 +298,56 @@ async fn unregister_success() {
         })
         .send()
         .await
+        .unwrap()
+        .json()
+        .await
         .unwrap();
     let resp = http()
         .delete(control_url(&server, &instance_by_id(peer.instance_id())))
+        .header(
+            kvbm_hub::protocol::MUTATION_CREDENTIAL_HEADER,
+            registration.mutation_credential.unwrap().to_header_value(),
+        )
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 204);
+}
+
+#[tokio::test]
+async fn one_registration_cannot_unregister_another_owner() {
+    let server = start_server().await;
+    let attacker = make_peer();
+    let victim = make_peer();
+    let mut credentials = Vec::new();
+    for peer in [&attacker, &victim] {
+        let response: RegisterResponse = http()
+            .post(control_url(&server, paths::INSTANCES))
+            .json(&RegisterRequest {
+                peer_info: peer.clone(),
+                features: Vec::new(),
+                runtime: None,
+            })
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        credentials.push(response.mutation_credential.unwrap());
+    }
+
+    let spoof = http()
+        .delete(control_url(&server, &instance_by_id(victim.instance_id())))
+        .header(
+            kvbm_hub::protocol::MUTATION_CREDENTIAL_HEADER,
+            credentials[0].to_header_value(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(spoof.status(), 401);
+    assert!(server.state().registry().contains(victim.instance_id()));
 }
 
 #[tokio::test]
@@ -251,30 +364,112 @@ async fn unregister_not_found() {
 }
 
 #[tokio::test]
-async fn heartbeat_registered_instance() {
+async fn heartbeat_with_current_credential_is_acknowledged() {
     let server = start_server().await;
     let peer = make_peer();
-    http()
-        .post(control_url(&server, paths::INSTANCES))
-        .json(&RegisterRequest {
-            peer_info: peer.clone(),
-            features: Vec::new(),
-            runtime: None,
-        })
-        .send()
-        .await
-        .unwrap();
+    let registration = register_plain_peer(&server, &peer, None).await;
+    let credential = registration.mutation_credential.unwrap();
     let resp = http()
         .post(control_url(
             &server,
             &instance_heartbeat(peer.instance_id()),
         ))
+        .header(MUTATION_CREDENTIAL_HEADER, credential.to_header_value())
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
     let body: HeartbeatResponse = resp.json().await.unwrap();
     assert!(body.acknowledged);
+}
+
+#[tokio::test]
+async fn heartbeat_without_credential_is_unauthorized() {
+    let server = start_server().await;
+    let peer = make_peer();
+    register_plain_peer(&server, &peer, None).await;
+
+    assert_eq!(
+        heartbeat_status(&server, peer.instance_id(), None).await,
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn stale_and_cross_owner_credentials_cannot_heartbeat() {
+    let server = start_server().await;
+    let victim = make_peer();
+    let attacker = make_peer();
+    let first = register_plain_peer(&server, &victim, None)
+        .await
+        .mutation_credential
+        .unwrap();
+    let current = register_plain_peer(&server, &victim, Some(&first))
+        .await
+        .mutation_credential
+        .unwrap();
+    let attacker = register_plain_peer(&server, &attacker, None)
+        .await
+        .mutation_credential
+        .unwrap();
+
+    for credential in [&first, &attacker] {
+        assert_eq!(
+            heartbeat_status(&server, victim.instance_id(), Some(credential)).await,
+            reqwest::StatusCode::UNAUTHORIZED
+        );
+    }
+    assert_eq!(
+        heartbeat_status(&server, victim.instance_id(), Some(&current)).await,
+        reqwest::StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn unauthorized_heartbeats_do_not_postpone_expiry() {
+    let registry = Arc::new(
+        InMemoryRegistry::builder()
+            .ttl(Duration::from_secs(1))
+            .prune_interval(Duration::from_secs(3600))
+            .build(),
+    );
+    let server = kvbm_hub::create_server_builder()
+        .bind_addr(IpAddr::V4(Ipv4Addr::LOCALHOST))
+        .discovery_port(0)
+        .control_port(0)
+        .registry(Arc::clone(&registry) as Arc<dyn PeerRegistry>)
+        .serve()
+        .await
+        .expect("start expiring test server");
+    let victim = make_peer();
+    let attacker = make_peer();
+    let stale = register_plain_peer(&server, &victim, None)
+        .await
+        .mutation_credential
+        .unwrap();
+    let _current = register_plain_peer(&server, &victim, Some(&stale))
+        .await
+        .mutation_credential
+        .unwrap();
+    let attacker = register_plain_peer(&server, &attacker, None)
+        .await
+        .mutation_credential
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    for credential in [None, Some(&stale), Some(&attacker)] {
+        assert_eq!(
+            heartbeat_status(&server, victim.instance_id(), credential).await,
+            reqwest::StatusCode::UNAUTHORIZED
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(850)).await;
+    registry.prune_stale();
+
+    assert!(
+        !server.state().registry().contains(victim.instance_id()),
+        "rejected heartbeats must not refresh the victim's registry lease"
+    );
 }
 
 #[tokio::test]
@@ -288,9 +483,7 @@ async fn heartbeat_unregistered_instance() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200);
-    let body: HeartbeatResponse = resp.json().await.unwrap();
-    assert!(!body.acknowledged);
+    assert_eq!(resp.status(), 404);
 }
 
 #[tokio::test]
@@ -421,8 +614,9 @@ async fn peers_snapshot_tracks_unregistrations() {
     let server = start_server().await;
     let a = make_peer();
     let b = make_peer();
+    let mut credentials = Vec::new();
     for peer in [&a, &b] {
-        http()
+        let response: RegisterResponse = http()
             .post(control_url(&server, paths::INSTANCES))
             .json(&RegisterRequest {
                 peer_info: peer.clone(),
@@ -431,10 +625,18 @@ async fn peers_snapshot_tracks_unregistrations() {
             })
             .send()
             .await
+            .unwrap()
+            .json()
+            .await
             .unwrap();
+        credentials.push(response.mutation_credential.unwrap());
     }
     http()
         .delete(control_url(&server, &instance_by_id(a.instance_id())))
+        .header(
+            kvbm_hub::protocol::MUTATION_CREDENTIAL_HEADER,
+            credentials[0].to_header_value(),
+        )
         .send()
         .await
         .unwrap();
@@ -878,6 +1080,56 @@ async fn feature_register_without_manager_rejects() {
     assert_eq!(resp.status(), 404);
 }
 
+#[tokio::test]
+async fn failed_authorized_reregister_restores_prior_registration() {
+    let (server, cd) = start_server_with_cd_no_velo().await;
+    let peer = make_peer();
+    let initial: RegisterResponse = http()
+        .post(control_url(&server, paths::INSTANCES))
+        .json(&RegisterRequest {
+            peer_info: peer.clone(),
+            features: p2p_cd_features(ConditionalDisaggRole::Prefill),
+            runtime: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let credential = initial.mutation_credential.unwrap();
+
+    let rejected = http()
+        .post(control_url(&server, paths::INSTANCES))
+        .header(
+            kvbm_hub::protocol::MUTATION_CREDENTIAL_HEADER,
+            credential.to_header_value(),
+        )
+        .json(&RegisterRequest {
+            peer_info: peer.clone(),
+            features: p2p_cd_features(ConditionalDisaggRole::Decode),
+            runtime: None,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), 400);
+    assert!(server.state().registry().contains(peer.instance_id()));
+    assert_eq!(cd.snapshot().prefill, vec![peer.instance_id()]);
+    assert!(cd.snapshot().decode.is_empty());
+
+    let removed = http()
+        .delete(control_url(&server, &instance_by_id(peer.instance_id())))
+        .header(
+            kvbm_hub::protocol::MUTATION_CREDENTIAL_HEADER,
+            credential.to_header_value(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(removed.status(), 204);
+}
+
 // c2: `feature_cd_register_missing_config_rejects` removed — the type
 // system now makes `Feature::ConditionalDisagg(...)` require a config,
 // so the missing-config path is unreachable. The cross-feature
@@ -922,24 +1174,33 @@ async fn register_without_features_field_still_works() {
 async fn feature_cd_role_conflict_on_reregister() {
     let (server, _cd) = start_server_with_cd_no_velo().await;
     let peer = make_peer();
-
-    let post = |role: ConditionalDisaggRole| {
-        let req = RegisterRequest {
+    let first: RegisterResponse = http()
+        .post(control_url(&server, paths::INSTANCES))
+        .json(&RegisterRequest {
             peer_info: peer.clone(),
-            features: p2p_cd_features(role),
+            features: p2p_cd_features(ConditionalDisaggRole::Prefill),
             runtime: None,
-        };
-        http()
-            .post(control_url(&server, paths::INSTANCES))
-            .json(&req)
-            .send()
-    };
-
-    assert_eq!(
-        post(ConditionalDisaggRole::Prefill).await.unwrap().status(),
-        200
-    );
-    let resp = post(ConditionalDisaggRole::Decode).await.unwrap();
+        })
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let resp = http()
+        .post(control_url(&server, paths::INSTANCES))
+        .header(
+            kvbm_hub::protocol::MUTATION_CREDENTIAL_HEADER,
+            first.mutation_credential.unwrap().to_header_value(),
+        )
+        .json(&RegisterRequest {
+            peer_info: peer,
+            features: p2p_cd_features(ConditionalDisaggRole::Decode),
+            runtime: None,
+        })
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 400);
 }
 
@@ -952,16 +1213,23 @@ async fn feature_cd_unregister_removes_from_lists() {
         features: p2p_cd_features(ConditionalDisaggRole::Prefill),
         runtime: None,
     };
-    http()
+    let registration: RegisterResponse = http()
         .post(control_url(&server, paths::INSTANCES))
         .json(&req)
         .send()
+        .await
+        .unwrap()
+        .json()
         .await
         .unwrap();
     assert_eq!(cd.snapshot().prefill.len(), 1);
 
     http()
         .delete(control_url(&server, &instance_by_id(peer.instance_id())))
+        .header(
+            kvbm_hub::protocol::MUTATION_CREDENTIAL_HEADER,
+            registration.mutation_credential.unwrap().to_header_value(),
+        )
         .send()
         .await
         .unwrap();
@@ -1008,6 +1276,17 @@ async fn feature_cd_reaper_evicts_from_lists() {
     assert!(
         cd_manager.snapshot().prefill.is_empty(),
         "reaper eviction should fan out to the feature manager"
+    );
+    let fresh = http()
+        .post(control_url(&server, paths::INSTANCES))
+        .json(&req)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        fresh.status(),
+        200,
+        "TTL eviction must also remove the stale registration credential"
     );
 }
 
@@ -1132,6 +1411,7 @@ async fn feature_cd_prefill_and_decode_register_and_list() {
         num_provided_tokens: 48,
         request: kvbm_protocols::disagg::KvHashingRequestEnvelope::default(),
         expected_hash_digest: None,
+        bundle: None,
     };
     d_cd.push_prefill_request(&req).await.unwrap();
 
@@ -1245,6 +1525,7 @@ async fn dispatcher_worker_drains_queue_and_invokes_dispatcher() {
         num_provided_tokens: 0,
         request: kvbm_protocols::disagg::KvHashingRequestEnvelope::default(),
         expected_hash_digest: None,
+        bundle: None,
     };
     let req_two = PrefillRequest {
         request_id: "dispatch-test-2".to_string(),
@@ -1306,6 +1587,7 @@ async fn no_dispatcher_does_not_spawn_worker() {
         num_provided_tokens: 0,
         request: kvbm_protocols::disagg::KvHashingRequestEnvelope::default(),
         expected_hash_digest: None,
+        bundle: None,
     };
     // Push succeeds — queue is installed by `attach`, dispatcher absence
     // doesn't change that.

@@ -96,7 +96,8 @@ impl DiscoveryPlan {
     }
 
     /// Length of the remaining slice (`remaining_len` = "blocks past local").
-    /// Used by the composer's `min_remote_blocks` threshold check.
+    /// The leader applies remote-search admission before constructing the
+    /// composer; this retained value supports plan diagnostics and pin bounds.
     pub fn remaining_len(&self) -> usize {
         self.remaining_len
     }
@@ -161,6 +162,8 @@ pub(super) async fn pull_from(
             tiers: TierSelection::default(),
             resource: None,
             watchdog_ms: None,
+            registration_epoch: None,
+            require_payload_integrity: false,
         })
         .await
         .map_err(|e| anyhow!("open_session on {candidate}: {e}"))?;
@@ -216,6 +219,7 @@ pub(super) async fn pull_from(
             endpoint: Some(capability.endpoint),
             selector: None,
             resource: Some(resource),
+            require_payload_integrity: false,
         })
         .await;
 

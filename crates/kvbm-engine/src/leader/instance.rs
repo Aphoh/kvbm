@@ -14,6 +14,7 @@ use uuid::Uuid;
 use std::sync::{Arc, OnceLock};
 
 use kvbm_config::{DisaggregationRole, ParallelismMode};
+use kvbm_protocols::cache_manifest::RegistrationEpoch;
 use kvbm_protocols::control::{
     ControlError, HostInfo, InstanceDescription, LayoutDescription, ModuleId, TierCapacity,
     TierKind, WorkerInfo,
@@ -52,10 +53,12 @@ use super::{
         PullRef, WirePullOptions, plan_pull_for_resources,
         plan_replicated_worker_pulls_for_resources,
     },
+    dispatch_completion::{PullDispatchKind, dispatch_and_aggregate_pull_plans},
     parallelism::{
         ParallelismTemplate, ParallelismTemplateSet, stamp_parallelism_descriptors,
         stamp_resource_parallelism_descriptors,
     },
+    publication::{BundlePublicationSequence, PublicationGenerationExhausted},
     velo::{ExportMetadataCallback, VeloLeaderService},
 };
 
@@ -197,6 +200,16 @@ pub struct InstanceLeader {
     /// hub registration completes.
     hub_instance_id: Arc<OnceLock<String>>,
 
+    /// Opaque identity of the current owner lifecycle. Standalone leaders
+    /// lazily mint one; hub-backed leaders install the hub-minted value before
+    /// remote bundle publication or transfer begins.
+    registration_epoch: Arc<OnceLock<RegistrationEpoch>>,
+
+    /// Monotonic publication generation shared by every connector engine for
+    /// this hub owner. Keeping the sequence on the leader prevents rebuilding
+    /// an engine over the same owner from reusing an active generation.
+    bundle_publication_sequence: Arc<BundlePublicationSequence>,
+
     /// Opaque JSON of the leader's `KvbmConfig`, injected post-construction
     /// via [`Self::set_config_blob`]. The connector serialises its
     /// `KvbmRuntime::config()` and stores the result here so `describe`
@@ -250,9 +263,9 @@ pub struct InstanceLeader {
     remote_discovery: Arc<OnceLock<RemoteDiscoveryHandle>>,
 
     /// Block-count threshold for remote search: a search is issued only when
-    /// the number of remaining locally-uncached full blocks **exceeds** this
-    /// value. Derived from `RemoteSearch::min_remote_blocks(block_size)` at
-    /// build time.
+    /// the number of remaining locally-uncached full blocks is **at least**
+    /// this value. Derived from `RemoteSearch::min_remote_blocks(block_size)`
+    /// at build time.
     min_remote_blocks: usize,
 }
 
@@ -448,7 +461,8 @@ impl InstanceLeaderBuilder {
     }
 
     /// Set the remote-search block-count threshold. A search is issued only
-    /// when the number of remaining locally-uncached full blocks exceeds this.
+    /// when the number of remaining locally-uncached full blocks is at least
+    /// this value.
     pub fn min_remote_blocks(mut self, n: usize) -> Self {
         self.min_remote_blocks = n;
         self
@@ -548,6 +562,8 @@ impl InstanceLeaderBuilder {
             role: self.role,
             started_at: SystemTime::now(),
             hub_instance_id: Arc::new(OnceLock::new()),
+            registration_epoch: Arc::new(OnceLock::new()),
+            bundle_publication_sequence: Arc::new(BundlePublicationSequence::default()),
             config_blob: Arc::new(OnceLock::new()),
             modules: Arc::new(OnceLock::new()),
             observability: self.observability,
@@ -639,8 +655,28 @@ impl InstanceLeader {
         &self.g2_managers
     }
 
+    pub(crate) fn reserve_bundle_publication_generation(
+        &self,
+    ) -> std::result::Result<u64, PublicationGenerationExhausted> {
+        self.bundle_publication_sequence.reserve()
+    }
+
     pub fn primary_g2_resource(&self) -> LogicalResourceId {
         self.primary_g2_resource
+    }
+
+    pub(crate) fn parallelism_template_for_resource(
+        &self,
+        resource: LogicalResourceId,
+    ) -> Option<&ParallelismTemplate> {
+        self.parallelism_templates
+            .as_ref()
+            .and_then(|templates| templates.get(resource))
+            .or_else(|| {
+                (resource == self.primary_g2_resource)
+                    .then_some(self.parallelism_template.as_ref())
+                    .flatten()
+            })
     }
 
     /// Get a reference to the optional G3 BlockManager.
@@ -701,6 +737,20 @@ impl InstanceLeader {
     /// [`composer::OnboardingComposer`]: super::composer::OnboardingComposer
     pub(crate) fn remote_discovery(&self) -> Option<RemoteDiscoveryHandle> {
         self.remote_discovery.get().cloned()
+    }
+
+    /// Canonical remote-search admission policy shared by legacy shard and
+    /// manifest-scoped bundle finds.
+    ///
+    /// `remaining_blocks` is the caller's locally-uncached, scheduler-eligible
+    /// external window. A configured discovery seam alone is insufficient:
+    /// the caller must request remote search and the non-empty window must
+    /// meet the configured threshold.
+    pub(crate) fn remote_search_eligible(&self, requested: bool, remaining_blocks: usize) -> bool {
+        requested
+            && self.remote_discovery.get().is_some()
+            && remaining_blocks > 0
+            && remaining_blocks >= self.min_remote_blocks
     }
 
     /// Get the object storage client for G4 operations.
@@ -808,6 +858,16 @@ impl InstanceLeader {
         crate::leader::control::modules::transfer::pull_from_session(self, req).await
     }
 
+    /// PULLER-SIDE. Pull into private staged G2 slots without registering
+    /// their hashes. Complete-bundle transactions use this to make several
+    /// logical resources visible together or roll them all back on failure.
+    pub(crate) async fn stage_from_session(
+        self: &Arc<Self>,
+        req: kvbm_protocols::control::modules::transfer::PullFromSessionRequest,
+    ) -> Result<crate::p2p::StagedPull, kvbm_protocols::control::ControlError> {
+        crate::p2p::stage_from_session(self, req).await
+    }
+
     // ========================================================================
     // Describe (Phase C)
     // ========================================================================
@@ -827,6 +887,27 @@ impl InstanceLeader {
     /// First-write-wins.
     pub fn set_hub_instance_id(&self, id: InstanceId) -> bool {
         self.hub_instance_id.set(id.to_string()).is_ok()
+    }
+
+    /// Return the identity of this leader's current registration lifecycle.
+    /// Standalone leaders mint it on first use.
+    pub fn registration_epoch(&self) -> RegistrationEpoch {
+        *self.registration_epoch.get_or_init(RegistrationEpoch::new)
+    }
+
+    /// Read the installed lifecycle identity without initializing it.
+    /// Holder-side request validation uses this so traffic arriving before
+    /// registration cannot claim or poison the first-write epoch cell.
+    pub(crate) fn current_registration_epoch(&self) -> Option<RegistrationEpoch> {
+        self.registration_epoch.get().copied()
+    }
+
+    /// Install the epoch minted by a successful hub registration.
+    ///
+    /// This is first-write-wins so an active owner lifecycle can never be
+    /// rebound underneath already-issued advertisements or sessions.
+    pub fn set_registration_epoch(&self, epoch: RegistrationEpoch) -> bool {
+        self.registration_epoch.set(epoch).is_ok()
     }
 
     /// Inject the list of control-plane modules enabled on this leader.
@@ -1653,23 +1734,14 @@ impl InstanceLeader {
         }
 
         let workers = parallel_worker.workers();
-        let mut notifications = Vec::with_capacity(plans.len());
-        for (local_rank, plan) in plans {
-            let worker = workers.get(local_rank).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "rdma_pull: plan_pull produced a plan for local_rank {local_rank} but only \
-                     {} workers are registered",
-                    workers.len()
-                )
-            })?;
-            notifications.push(worker.execute_remote_pull_plan(plan)?);
-        }
-
         let events = Arc::new(self.messenger.event_manager());
-        let aggregated = TransferCompleteNotification::aggregate(
-            notifications,
+        let aggregated = dispatch_and_aggregate_pull_plans(
+            PullDispatchKind::Strict,
+            workers.len(),
+            plans,
             &events,
             &tokio::runtime::Handle::current(),
+            |local_rank, plan| workers[local_rank].execute_remote_pull_plan(plan),
         )?;
         aggregated.await?;
         Ok(())
@@ -1700,24 +1772,14 @@ impl InstanceLeader {
             &opts,
         )?;
         let workers = parallel_worker.workers();
-        let mut notifications = Vec::with_capacity(plans.len());
-
-        for (local_rank, plan) in plans {
-            let worker = workers.get(local_rank).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "replicated pull selected local rank {} but only {} workers are registered",
-                    local_rank,
-                    workers.len()
-                )
-            })?;
-            notifications.push(worker.execute_remote_pull_plan(plan)?);
-        }
-
         let events = Arc::new(self.messenger.event_manager());
-        let aggregated = TransferCompleteNotification::aggregate(
-            notifications,
+        let aggregated = dispatch_and_aggregate_pull_plans(
+            PullDispatchKind::Replicated,
+            workers.len(),
+            plans,
             &events,
             &tokio::runtime::Handle::current(),
+            |local_rank, plan| workers[local_rank].execute_remote_pull_plan(plan),
         )?;
         aggregated.await?;
         Ok(())
@@ -2170,9 +2232,7 @@ impl Leader for InstanceLeader {
         let post_local_tail = sequence_hashes
             .len()
             .saturating_sub(local_g2_count + local_g3_count);
-        let use_remote_search = options.search_remote
-            && self.remote_discovery.get().is_some()
-            && post_local_tail >= self.min_remote_blocks;
+        let use_remote_search = self.remote_search_eligible(options.search_remote, post_local_tail);
 
         // Local-only Ready: no G3 to stage AND no remote pull to run.
         if matched_g3_blocks.is_empty() && !use_remote_search {
@@ -2244,7 +2304,6 @@ impl Leader for InstanceLeader {
             matched_g3_blocks,
             local_g2_count,
             use_remote_search,
-            min_remote_blocks: self.min_remote_blocks,
             status_tx,
             all_g2_blocks: all_g2_blocks.clone(),
             match_breakdown: match_breakdown.clone(),

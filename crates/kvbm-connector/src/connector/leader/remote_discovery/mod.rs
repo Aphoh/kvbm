@@ -126,10 +126,11 @@ mod tests {
     use kvbm_engine::InstanceId;
     use kvbm_hub::{BundleAdvertisementRecord, BundleQueryHit, FindBlocksHit};
     use kvbm_protocols::cache_manifest::{
-        BundleKey, CacheManifest, ModelIdentity, ResourceRequirement, ResourceRole,
+        BundleKey, BundleResourceLineage, CacheManifest, ModelIdentity, RegistrationEpoch,
+        ResourceRequirement, ResourceRole,
     };
 
-    use super::index::directory_hit;
+    use super::index::{advertisement_record, directory_hit};
     use super::*;
 
     struct StubIndex {
@@ -164,7 +165,9 @@ mod tests {
     }
 
     fn hash(position: u64) -> SequenceHash {
-        SequenceHash::new(position, None, position)
+        (1..=position).fold(SequenceHash::root(1), |parent, block| {
+            parent.extend(block + 1)
+        })
     }
 
     fn bundle_query() -> (BundleDiscoveryQuery, BundleKey) {
@@ -190,7 +193,9 @@ mod tests {
     #[test]
     fn bundle_directory_hit_preserves_manifest_owner_and_lease() {
         let (query, key) = bundle_query();
+        let requirements = query.identity().resources().to_vec();
         let owner = InstanceId::new_v4();
+        let registration_epoch = RegistrationEpoch::new();
         let candidate = directory_hit(
             query,
             BundleQueryHit {
@@ -198,7 +203,15 @@ mod tests {
                     key,
                     generation: 4,
                     owner,
-                    resources: vec![kvbm_common::LogicalResourceId(7)],
+                    registration_epoch: Some(registration_epoch),
+                    requirements,
+                    lineages: vec![
+                        BundleResourceLineage::new(
+                            kvbm_common::LogicalResourceId(7),
+                            vec![hash(0), hash(1)],
+                        )
+                        .unwrap(),
+                    ],
                     expires_at_unix_ms: 10_000,
                 },
                 lease_id: uuid::Uuid::new_v4(),
@@ -209,7 +222,141 @@ mod tests {
 
         assert_eq!(candidate.advertisement().key(), key);
         assert_eq!(candidate.advertisement().owner(), owner);
+        assert_eq!(
+            candidate.advertisement().registration_epoch(),
+            registration_epoch
+        );
         assert_eq!(candidate.lease_expires_at_unix_ms(), 2_000);
+    }
+
+    #[test]
+    fn bundle_directory_hit_requires_an_owner_registration_epoch() {
+        let (query, key) = bundle_query();
+        let requirements = query.identity().resources().to_vec();
+        let result = directory_hit(
+            query,
+            BundleQueryHit {
+                advertisement: BundleAdvertisementRecord {
+                    key,
+                    generation: 4,
+                    owner: InstanceId::new_v4(),
+                    registration_epoch: None,
+                    requirements,
+                    lineages: vec![
+                        BundleResourceLineage::new(
+                            kvbm_common::LogicalResourceId(7),
+                            vec![hash(0), hash(1)],
+                        )
+                        .unwrap(),
+                    ],
+                    expires_at_unix_ms: 10_000,
+                },
+                lease_id: uuid::Uuid::new_v4(),
+                lease_expires_at_unix_ms: 2_000,
+            },
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn bundle_directory_hit_rejects_requirements_different_from_query() {
+        let (query, key) = bundle_query();
+        let result = directory_hit(
+            query,
+            BundleQueryHit {
+                advertisement: BundleAdvertisementRecord {
+                    key,
+                    generation: 4,
+                    owner: InstanceId::new_v4(),
+                    registration_epoch: Some(RegistrationEpoch::new()),
+                    requirements: vec![
+                        ResourceRequirement::new(
+                            kvbm_common::LogicalResourceId(7),
+                            ResourceRole::BoundaryCapsule,
+                            4,
+                        )
+                        .unwrap(),
+                    ],
+                    lineages: vec![
+                        BundleResourceLineage::new(
+                            kvbm_common::LogicalResourceId(7),
+                            vec![hash(0), hash(1)],
+                        )
+                        .unwrap(),
+                    ],
+                    expires_at_unix_ms: 10_000,
+                },
+                lease_id: uuid::Uuid::new_v4(),
+                lease_expires_at_unix_ms: 2_000,
+            },
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn hub_round_trip_preserves_distinct_mixed_native_resource_lineages() {
+        let primary = kvbm_common::LogicalResourceId(17);
+        let secondary = kvbm_common::LogicalResourceId(18);
+        let capsule = kvbm_common::LogicalResourceId(19);
+        let identity = CacheManifest::new(
+            ModelIdentity::new("remote-discovery-mixed-native", "v1", [6; 32]).unwrap(),
+            "remote-discovery-mixed-native-v1",
+            vec![
+                ResourceRequirement::new(primary, ResourceRole::PrefixHistory, 4).unwrap(),
+                ResourceRequirement::new(secondary, ResourceRole::PrefixHistory, 8).unwrap(),
+                ResourceRequirement::new(capsule, ResourceRole::BoundaryCapsule, 4).unwrap(),
+            ],
+            BTreeMap::new(),
+        )
+        .unwrap()
+        .identity();
+        let primary_hashes = vec![hash(0), hash(1)];
+        let secondary_hashes =
+            BundleResourceLineage::project_from_canonical(secondary, &primary_hashes, 2)
+                .unwrap()
+                .hashes()
+                .to_vec();
+        let key = BundleKey::new(&identity, primary_hashes[1], 8).unwrap();
+        let owner = InstanceId::new_v4();
+        let registration_epoch = RegistrationEpoch::new();
+        let advertisement = BundleAdvertisement::new(
+            identity.clone(),
+            key,
+            7,
+            owner,
+            registration_epoch,
+            10_000,
+            [
+                BundleResourceLineage::new(primary, primary_hashes.clone()).unwrap(),
+                BundleResourceLineage::new(secondary, secondary_hashes.clone()).unwrap(),
+                BundleResourceLineage::new(capsule, vec![primary_hashes[1]]).unwrap(),
+            ],
+        )
+        .unwrap();
+        let record = advertisement_record(&advertisement);
+        assert_eq!(record.requirements.as_slice(), identity.resources());
+        let query = BundleDiscoveryQuery::new(identity.clone(), vec![key], 1_000);
+        let hit = BundleQueryHit {
+            advertisement: record,
+            lease_id: uuid::Uuid::new_v4(),
+            lease_expires_at_unix_ms: 1_500,
+        };
+        assert_eq!(
+            hit.advertisement.requirements.as_slice(),
+            identity.resources()
+        );
+        let candidate = directory_hit(query, hit).unwrap();
+        let round_trip = candidate
+            .advertisement()
+            .lineages()
+            .map(|lineage| (lineage.resource(), lineage.hashes().to_vec()))
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(round_trip[&primary], primary_hashes);
+        assert_eq!(round_trip[&secondary], secondary_hashes);
+        assert_eq!(round_trip[&capsule], vec![key.boundary_hash()]);
     }
 
     #[tokio::test]

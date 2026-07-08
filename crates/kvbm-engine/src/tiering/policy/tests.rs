@@ -80,6 +80,47 @@ fn byte_normalized_scores_do_not_treat_equal_hits_as_equal_value() {
 }
 
 #[test]
+fn ingress_and_pressure_retention_use_independent_density_thresholds() {
+    let cold = AdmissionScoreInputs::complete(0, [bytes(1024 * 1024)]).unwrap();
+    let policy = ResourcePolicy::new(
+        ResourceRole::PrefixHistory,
+        InactiveBackendConfig::Lru,
+        InactiveBackendConfig::Lru,
+    )
+    .with_minimum_hits_per_mib(1)
+    .with_minimum_admission_hits_per_mib(0);
+
+    assert_eq!(
+        policy.evaluate_admission(&cold).decision(),
+        RetentionDecision::Retain,
+        "a first-time bundle must be able to enter before G2 has reuse evidence"
+    );
+    assert_eq!(
+        policy.evaluate(&cold).decision(),
+        RetentionDecision::Drop,
+        "the same cold bundle remains eligible for pressure-time eviction"
+    );
+}
+
+#[test]
+fn frequency_tracking_requirement_is_independent_of_inactive_backend() {
+    let unscored_lru = ResourcePolicy::new(
+        ResourceRole::PrefixHistory,
+        InactiveBackendConfig::Lru,
+        InactiveBackendConfig::Lru,
+    );
+    let retention_scored_lru = unscored_lru.clone().with_minimum_hits_per_mib(1);
+    let admission_scored_lru = unscored_lru.clone().with_minimum_admission_hits_per_mib(1);
+
+    assert!(!unscored_lru.requires_g1_frequency_tracking());
+    assert!(retention_scored_lru.requires_g1_frequency_tracking());
+    assert!(
+        !admission_scored_lru.requires_g1_frequency_tracking(),
+        "admission is scored from G2's independently tracked registry"
+    );
+}
+
+#[test]
 fn atomic_resource_cannot_admit_only_one_component() {
     let policy = ResourcePolicy::new(
         ResourceRole::PrefixHistory,

@@ -3,6 +3,7 @@
 
 //! Resource-keyed admission, retention, and inactive-backend policy.
 
+mod components;
 mod dependency;
 
 use std::cmp::Ordering;
@@ -14,7 +15,8 @@ use kvbm_logical::manager::InactiveBackendConfig;
 use kvbm_protocols::cache_manifest::ResourceRole;
 use serde::{Deserialize, Serialize};
 
-pub(in crate::tiering) use dependency::{BundleDependencyIndex, ResourceLineage};
+pub use components::{ResourceComponentBytes, ResourceComponentBytesError};
+pub(in crate::tiering) use dependency::{BundleDependencyIndex, DependencyError, ResourceLineage};
 
 /// All configurable policy for one logical cache resource.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,6 +26,8 @@ pub struct ResourcePolicy {
     g2_inactive: InactiveBackendConfig,
     atomic_components: NonZeroUsize,
     minimum_hits_per_mib: u64,
+    #[serde(default)]
+    minimum_admission_hits_per_mib: u64,
 }
 
 impl ResourcePolicy {
@@ -38,6 +42,7 @@ impl ResourcePolicy {
             g2_inactive,
             atomic_components: NonZeroUsize::MIN,
             minimum_hits_per_mib: 0,
+            minimum_admission_hits_per_mib: 0,
         }
     }
 
@@ -53,6 +58,14 @@ impl ResourcePolicy {
         self
     }
 
+    /// Set the ingress density floor independently from pressure-time
+    /// retention. It defaults to zero so a first-time bundle can enter before
+    /// its blocks have accumulated reuse evidence in G2.
+    pub fn with_minimum_admission_hits_per_mib(mut self, minimum: u64) -> Self {
+        self.minimum_admission_hits_per_mib = minimum;
+        self
+    }
+
     pub const fn role(&self) -> ResourceRole {
         self.role
     }
@@ -65,7 +78,31 @@ impl ResourcePolicy {
         &self.g2_inactive
     }
 
+    /// Whether pressure-time evaluation needs G1 reuse counts.
+    ///
+    /// This is deliberately independent of the inactive backend: an LRU can
+    /// still use frequency as a retention signal. Admission reads G2's
+    /// separately tracked registry and therefore does not affect this flag.
+    pub const fn requires_g1_frequency_tracking(&self) -> bool {
+        self.minimum_hits_per_mib > 0
+    }
+
+    /// Evaluate initial whole-bundle admission. Structural and dependency
+    /// checks are shared with retention, but ingress has its own density floor.
+    pub fn evaluate_admission(&self, input: &AdmissionScoreInputs) -> RetentionOutcome {
+        self.evaluate_with_minimum(input, self.minimum_admission_hits_per_mib)
+    }
+
+    /// Evaluate whether an admitted resource remains valuable under pressure.
     pub fn evaluate(&self, input: &AdmissionScoreInputs) -> RetentionOutcome {
+        self.evaluate_with_minimum(input, self.minimum_hits_per_mib)
+    }
+
+    fn evaluate_with_minimum(
+        &self,
+        input: &AdmissionScoreInputs,
+        minimum_hits_per_mib: u64,
+    ) -> RetentionOutcome {
         let score = input.score();
         if input.component_count() != self.atomic_components.get() {
             return RetentionOutcome::drop(score, RetentionReason::IncompleteAtomicResource);
@@ -73,7 +110,7 @@ impl ResourcePolicy {
         if self.role == ResourceRole::BoundaryCapsule && !input.history_dependency_present {
             return RetentionOutcome::drop(score, RetentionReason::MissingHistoryDependency);
         }
-        if !score.meets_hits_per_mib(self.minimum_hits_per_mib) {
+        if !score.meets_hits_per_mib(minimum_hits_per_mib) {
             return RetentionOutcome::drop(score, RetentionReason::BelowByteNormalizedThreshold);
         }
         RetentionOutcome::retain(score, RetentionReason::ByteNormalizedValue)
@@ -197,6 +234,10 @@ impl AdmissionScore {
     fn meets_hits_per_mib(self, minimum: u64) -> bool {
         u128::from(self.hits) * u128::from(1024u64 * 1024)
             >= u128::from(minimum) * u128::from(self.bytes.get())
+    }
+
+    pub const fn bytes(self) -> NonZeroU64 {
+        self.bytes
     }
 }
 

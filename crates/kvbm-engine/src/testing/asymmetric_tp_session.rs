@@ -426,6 +426,9 @@ mod tests {
             .ok_or_else(|| anyhow!("{label}: availability stream ended"))?;
         match delta {
             AvailabilityDelta::Available(b) => Ok(b),
+            AvailabilityDelta::Verified(records) => {
+                Ok(records.into_iter().map(|record| record.block).collect())
+            }
             AvailabilityDelta::Drained => {
                 anyhow::bail!("{label}: Drained before Available")
             }

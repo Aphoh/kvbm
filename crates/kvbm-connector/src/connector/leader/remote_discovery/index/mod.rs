@@ -9,9 +9,8 @@ use kvbm_engine::remote::search::bundle::{
     BundleMissReason, RemoteBundleCandidate,
 };
 use kvbm_hub::{
-    BundleAdvertisementRecord, BundleInvalidateRequest, BundlePublishRequest, BundleQueryHit,
-    BundleQueryMissReason, BundleQueryOutcome, BundleQueryRequest, FindBlocksHit,
-    IndexerLookupClient,
+    BundleAdvertisementRecord, BundleInvalidationRecord, BundleQueryHit, BundleQueryMissReason,
+    BundleQueryOutcome, BundleQueryRequest, FindBlocksHit, IndexerLookupClient,
 };
 use kvbm_logical::SequenceHash;
 
@@ -67,12 +66,7 @@ impl BlockIndex for HubBlockIndex {
         Box::pin(async move {
             let request = BundleQueryRequest {
                 manifest: query.identity().manifest(),
-                required_resources: query
-                    .identity()
-                    .resources()
-                    .iter()
-                    .map(|requirement| requirement.resource())
-                    .collect(),
+                requirements: query.identity().resources().to_vec(),
                 candidates: query.candidates().to_vec(),
                 now_unix_ms: query.now_unix_ms(),
             };
@@ -95,15 +89,7 @@ impl BlockIndex for HubBlockIndex {
         let index = Arc::clone(&self.0);
         Box::pin(async move {
             index
-                .publish_bundle(BundlePublishRequest {
-                    advertisement: BundleAdvertisementRecord {
-                        key: advertisement.key(),
-                        generation: advertisement.generation(),
-                        owner: advertisement.owner(),
-                        resources: advertisement.resources().collect(),
-                        expires_at_unix_ms: advertisement.expires_at_unix_ms(),
-                    },
-                })
+                .publish_bundle(advertisement_record(&advertisement))
                 .await
                 .context("publish KVBM bundle advertisement")
         })
@@ -116,15 +102,30 @@ impl BlockIndex for HubBlockIndex {
         let index = Arc::clone(&self.0);
         Box::pin(async move {
             index
-                .invalidate_bundle(BundleInvalidateRequest {
+                .invalidate_bundle(BundleInvalidationRecord {
                     key: invalidation.key,
                     generation: invalidation.generation,
                     owner: invalidation.owner,
+                    retain_until_unix_ms: invalidation.retain_until_unix_ms,
                 })
                 .await
                 .context("invalidate KVBM bundle advertisement")?;
             Ok(())
         })
+    }
+}
+
+pub(super) fn advertisement_record(
+    advertisement: &BundleAdvertisement,
+) -> BundleAdvertisementRecord {
+    BundleAdvertisementRecord {
+        key: advertisement.key(),
+        generation: advertisement.generation(),
+        owner: advertisement.owner(),
+        registration_epoch: Some(advertisement.registration_epoch()),
+        requirements: advertisement.identity().resources().to_vec(),
+        lineages: advertisement.lineages().cloned().collect(),
+        expires_at_unix_ms: advertisement.expires_at_unix_ms(),
     }
 }
 
@@ -142,13 +143,21 @@ pub(super) fn directory_hit(
     hit: BundleQueryHit,
 ) -> Result<RemoteBundleCandidate> {
     let record = hit.advertisement;
+    anyhow::ensure!(
+        record.requirements.as_slice() == query.identity().resources(),
+        "hub returned incompatible bundle requirements"
+    );
+    let registration_epoch = record
+        .registration_epoch
+        .context("hub bundle hit omitted its owner registration epoch")?;
     let advertisement = BundleAdvertisement::new(
         query.identity().clone(),
         record.key,
         record.generation,
         record.owner,
+        registration_epoch,
         record.expires_at_unix_ms,
-        record.resources,
+        record.lineages,
     )?;
     anyhow::ensure!(
         advertisement.matches(&query),

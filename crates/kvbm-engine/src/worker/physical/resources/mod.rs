@@ -273,6 +273,14 @@ impl WorkerTransfers for ResourceDispatchWorker {
 }
 
 impl Worker for ResourceDispatchWorker {
+    fn compute_host_payload_digests(
+        &self,
+        resource: LogicalResourceId,
+        block_ids: Vec<BlockId>,
+    ) -> BoxFuture<'static, Result<Vec<kvbm_physical::transfer::PayloadDigest>>> {
+        Worker::compute_host_payload_digests(self.inner.as_ref(), resource, block_ids)
+    }
+
     fn g1_handle(&self) -> Option<LayoutHandle> {
         self.inner.g1_handle()
     }
@@ -368,10 +376,53 @@ impl ResourceTransferPlacements {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use dynamo_memory::StorageKind;
     use kvbm_common::LogicalResourceId;
     use kvbm_physical::manager::WorkerDataPlacement;
+    use kvbm_physical::testing::{create_fc_layout, create_test_agent, create_transfer_manager};
+    use kvbm_physical::transfer::{FillPattern, fill_blocks};
 
-    use super::ResourceTransferPlacements;
+    use super::{PhysicalWorker, ResourceDispatchWorker, ResourceTransferPlacements, Worker};
+
+    #[tokio::test]
+    async fn resource_dispatch_forwards_host_payload_digests_to_physical_worker() {
+        let resource = LogicalResourceId::default();
+        let agent = create_test_agent(&format!("resource-digest-{}", uuid::Uuid::new_v4()));
+        let layout = create_fc_layout(agent.clone(), StorageKind::System, 2);
+        fill_blocks(&layout, &[0], FillPattern::Constant(37)).unwrap();
+        let manager = create_transfer_manager(agent, None).unwrap();
+        let g2 = manager.register_layout(layout).unwrap();
+        let inner = Arc::new(
+            PhysicalWorker::builder()
+                .manager(manager)
+                .g2_handle(g2)
+                .rank(0)
+                .build()
+                .unwrap(),
+        );
+        let worker = ResourceDispatchWorker {
+            inner: Arc::clone(&inner),
+            replicated: None,
+            placements: ResourceTransferPlacements::new(
+                resource,
+                vec![(resource, WorkerDataPlacement::TensorSharded)],
+            )
+            .unwrap(),
+        };
+
+        let expected = inner
+            .compute_host_payload_digests(resource, vec![0])
+            .await
+            .unwrap();
+        let actual = worker
+            .compute_host_payload_digests(resource, vec![0])
+            .await
+            .unwrap();
+
+        assert_eq!(actual, expected);
+    }
 
     #[test]
     fn placement_map_routes_each_resource_and_rejects_invalid_sets() {

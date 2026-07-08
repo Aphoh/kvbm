@@ -1,144 +1,344 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! All-resource remote session acquisition, pull, and local bundle commit.
+//! Bounded all-resource remote acquisition and atomic local publication.
+
+mod deadline;
+mod metrics;
+#[cfg(any(test, feature = "testing"))]
+pub(crate) mod test_support;
+mod transaction;
+mod transfer;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail};
 use futures::future::{BoxFuture, join_all};
 use kvbm_common::{LogicalResourceId, SequenceHash};
-use kvbm_protocols::cache_manifest::{BundleKey, CacheIdentity, ResourceRole};
-use kvbm_protocols::control::client::LeaderControlClient;
-use kvbm_protocols::control::modules::transfer::{
-    CloseTransferSessionRequest, FindMode, OpenTransferSessionRequest, OpenTransferSessionResponse,
-    PullFromSessionRequest, SearchMode, TierSelection, TransferSessionCapability,
-};
+use kvbm_protocols::cache_manifest::{BundleKey, CacheIdentity};
+use kvbm_protocols::control::modules::transfer::OpenTransferSessionResponse;
+use tokio_util::sync::CancellationToken;
 
 use crate::leader::InstanceLeader;
 
 use super::{BundleMissReason, BundlePullOutcome, RemoteBundleCandidate, unix_time_ms};
+use deadline::{BundlePullLimits, PullDeadline, bounded};
+use metrics::PullMetrics;
+pub(crate) use transaction::StagedBundle;
+#[cfg(test)]
+use transfer::BundleTransferError;
+use transfer::{
+    BundleTransfer, LeaderBundleTransfer, OpenedResource, close_all, spawn_draining_pull,
+};
+
+/// One complete-bundle acquisition attempt.
+///
+/// The object owns the expected manifest, request cancellation, one bounded
+/// deadline, and the transfer adapter. Its execution publishes no physical
+/// destination until every manifest resource has staged successfully.
+struct RemoteBundlePull {
+    target: Arc<dyn BundlePullTarget>,
+    candidate: RemoteBundleCandidate,
+    expected_identity: CacheIdentity,
+    cancel: CancellationToken,
+    search_deadline: tokio::time::Instant,
+    transfer: Arc<dyn BundleTransfer>,
+    limits: BundlePullLimits,
+}
+
+impl RemoteBundlePull {
+    async fn execute(self) -> Result<BundlePullOutcome> {
+        let mut metrics = PullMetrics::new(
+            self.target
+                .instance_leader()
+                .observability()
+                .map(|observability| observability.bundle_metrics().clone()),
+            self.expected_identity
+                .resources()
+                .iter()
+                .map(|requirement| requirement.resource())
+                .collect(),
+        );
+        let outcome = self.execute_inner(&mut metrics).await;
+        metrics.record(&outcome);
+        outcome
+    }
+
+    async fn execute_inner(&self, metrics: &mut PullMetrics) -> Result<BundlePullOutcome> {
+        if self.cancel.is_cancelled() {
+            return Ok(BundlePullOutcome::Miss(BundleMissReason::Canceled));
+        }
+        if unix_time_ms() >= self.candidate.lease_expires_at_unix_ms() {
+            return Ok(BundlePullOutcome::Miss(BundleMissReason::Expired));
+        }
+        let advertisement = self.candidate.advertisement();
+        let expected_owner = advertisement.owner();
+        if advertisement.identity() != &self.expected_identity
+            || !advertisement
+                .key()
+                .is_compatible_with(&self.expected_identity)
+        {
+            return Ok(BundlePullOutcome::Miss(BundleMissReason::Incompatible));
+        }
+        let lineages = match resource_lineages(&self.expected_identity, advertisement) {
+            Ok(lineages) => lineages,
+            Err(error) => {
+                tracing::debug!(%error, "remote bundle lineage was incompatible");
+                return Ok(BundlePullOutcome::Miss(BundleMissReason::Incompatible));
+            }
+        };
+        let generation = match self.target.reserve_publication_generation() {
+            Ok(generation) => generation,
+            Err(error) => {
+                tracing::warn!(%error, "remote bundle publication generation unavailable");
+                return Ok(BundlePullOutcome::Miss(BundleMissReason::CommitFailed));
+            }
+        };
+        let deadline = PullDeadline::new(
+            self.candidate.lease_expires_at_unix_ms(),
+            self.search_deadline,
+        );
+        let mut opened = Vec::with_capacity(lineages.len());
+        for (&resource, hashes) in &lineages {
+            let watchdog = deadline
+                .remaining()
+                .min(self.limits.holder_watchdog)
+                .max(Duration::from_millis(1));
+            let response = bounded(
+                &self.cancel,
+                deadline.at,
+                self.transfer.open(resource, hashes.clone(), watchdog),
+            )
+            .await;
+            let response = match response {
+                Ok(Ok(response)) => response,
+                Ok(Err(error)) => {
+                    close_all(
+                        &self.transfer,
+                        &opened,
+                        "bundle acquisition failed",
+                        self.limits.cleanup_timeout,
+                    )
+                    .await;
+                    return Ok(BundlePullOutcome::Miss(error.reason()));
+                }
+                Err(interruption) => {
+                    close_all(
+                        &self.transfer,
+                        &opened,
+                        "bundle acquisition interrupted",
+                        self.limits.cleanup_timeout,
+                    )
+                    .await;
+                    return Ok(BundlePullOutcome::Miss(deadline.reason(interruption)));
+                }
+            };
+            let (capability, committed) = match response {
+                OpenTransferSessionResponse::Sync {
+                    capability,
+                    committed,
+                    ..
+                } => {
+                    if capability.instance_id != expected_owner {
+                        opened.push(OpenedResource {
+                            resource,
+                            hashes: hashes.clone(),
+                            capability,
+                        });
+                        close_all(
+                            &self.transfer,
+                            &opened,
+                            "bundle holder identity changed",
+                            self.limits.cleanup_timeout,
+                        )
+                        .await;
+                        return Ok(BundlePullOutcome::Miss(BundleMissReason::OwnerLost));
+                    }
+                    (capability, committed)
+                }
+                OpenTransferSessionResponse::NoBlocksFound => {
+                    close_all(
+                        &self.transfer,
+                        &opened,
+                        "bundle resource omitted",
+                        self.limits.cleanup_timeout,
+                    )
+                    .await;
+                    return Ok(BundlePullOutcome::Miss(BundleMissReason::Incomplete));
+                }
+                OpenTransferSessionResponse::Async { capability } => {
+                    let reason = if capability.instance_id == expected_owner {
+                        BundleMissReason::Incomplete
+                    } else {
+                        BundleMissReason::OwnerLost
+                    };
+                    opened.push(OpenedResource {
+                        resource,
+                        hashes: hashes.clone(),
+                        capability,
+                    });
+                    close_all(
+                        &self.transfer,
+                        &opened,
+                        "unexpected async bundle acquisition",
+                        self.limits.cleanup_timeout,
+                    )
+                    .await;
+                    return Ok(BundlePullOutcome::Miss(reason));
+                }
+            };
+            if capability.resource != resource || committed != *hashes {
+                opened.push(OpenedResource {
+                    resource,
+                    hashes: hashes.clone(),
+                    capability,
+                });
+                close_all(
+                    &self.transfer,
+                    &opened,
+                    "incomplete bundle acquisition",
+                    self.limits.cleanup_timeout,
+                )
+                .await;
+                return Ok(BundlePullOutcome::Miss(BundleMissReason::Incomplete));
+            }
+            opened.push(OpenedResource {
+                capability,
+                resource,
+                hashes: hashes.clone(),
+            });
+        }
+
+        let pulls = opened.iter().cloned().map(|resource| {
+            let transfer = Arc::clone(&self.transfer);
+            let cancel = self.cancel.clone();
+            let pull = spawn_draining_pull(transfer, resource, self.limits.cleanup_timeout);
+            async move { bounded(&cancel, deadline.at, pull).await }
+        });
+        let pull_results = join_all(pulls).await;
+        let mut staged = Vec::with_capacity(opened.len());
+        let mut miss = None;
+        for (opened_resource, result) in opened.iter().zip(pull_results) {
+            match result {
+                Ok(Ok(Ok(resource)))
+                    if resource.resource() == opened_resource.resource
+                        && resource.hashes() == opened_resource.hashes =>
+                {
+                    let transferred_bytes = self
+                        .target
+                        .resource_bytes(resource.resource(), resource.hashes().len())
+                        .unwrap_or(0);
+                    metrics.observe_transferred_bytes(resource.resource(), transferred_bytes);
+                    staged.push(resource);
+                }
+                Ok(Ok(Ok(_))) => miss = merge_reason(miss, BundleMissReason::Incomplete),
+                Ok(Ok(Err(error))) => {
+                    tracing::debug!(
+                        resource = ?opened_resource.resource,
+                        %error,
+                        "remote bundle resource pull failed"
+                    );
+                    miss = merge_reason(miss, error.reason());
+                }
+                Ok(Err(error)) => {
+                    tracing::error!(
+                        resource = ?opened_resource.resource,
+                        %error,
+                        "detached bundle pull task failed"
+                    );
+                    miss = merge_reason(miss, BundleMissReason::TransferFailed);
+                }
+                Err(interruption) => {
+                    miss = merge_reason(miss, deadline.reason(interruption));
+                }
+            }
+        }
+        if let Some(reason) = miss {
+            return Ok(BundlePullOutcome::Miss(reason));
+        }
+        if self.cancel.is_cancelled() {
+            return Ok(BundlePullOutcome::Miss(BundleMissReason::Canceled));
+        }
+        if unix_time_ms() >= self.candidate.lease_expires_at_unix_ms() {
+            return Ok(BundlePullOutcome::Miss(BundleMissReason::Expired));
+        }
+        let bundle = match StagedBundle::new(lineages, staged) {
+            Ok(bundle) => bundle,
+            Err(error) => {
+                tracing::debug!(%error, "remote bundle staging was incomplete");
+                return Ok(BundlePullOutcome::Miss(BundleMissReason::Incomplete));
+            }
+        };
+        let key = advertisement.key();
+        let identity = self.expected_identity.clone();
+        match bounded(
+            &self.cancel,
+            deadline.at,
+            self.target
+                .commit_pulled_bundle(identity, key, generation, bundle),
+        )
+        .await
+        {
+            Ok(Ok(())) => Ok(BundlePullOutcome::Pulled(key)),
+            Ok(Err(error)) => {
+                tracing::debug!(%error, "remote bundle local commit failed");
+                Ok(BundlePullOutcome::Miss(BundleMissReason::CommitFailed))
+            }
+            Err(interruption) => Ok(BundlePullOutcome::Miss(deadline.reason(interruption))),
+        }
+    }
+}
 
 pub(crate) trait BundlePullTarget: Send + Sync {
     fn instance_leader(&self) -> Arc<InstanceLeader>;
+
+    /// Reserve the local owner's publication generation before any remote I/O.
+    /// Late attempts can therefore never publish over newer completed pulls.
+    fn reserve_publication_generation(&self) -> Result<u64>;
+
+    /// Return the configured physical bytes represented by `logical_blocks`
+    /// for resource-keyed transfer metrics. Targets without byte geometry may
+    /// omit the observation without affecting transaction correctness.
+    fn resource_bytes(&self, _resource: LogicalResourceId, _logical_blocks: usize) -> Option<u64> {
+        None
+    }
 
     fn commit_pulled_bundle(
         &self,
         identity: CacheIdentity,
         key: BundleKey,
         generation: u64,
-        lineages: BTreeMap<LogicalResourceId, Vec<SequenceHash>>,
+        bundle: StagedBundle,
     ) -> BoxFuture<'static, Result<()>>;
-}
-
-struct OpenedResource {
-    capability: TransferSessionCapability,
-    resource: LogicalResourceId,
-}
-
-trait BundleTransfer: Send + Sync {
-    fn open(
-        &self,
-        resource: LogicalResourceId,
-        hashes: Vec<SequenceHash>,
-    ) -> BoxFuture<'_, Result<OpenTransferSessionResponse>>;
-
-    fn pull(&self, resource: &OpenedResource) -> BoxFuture<'_, Result<()>>;
-
-    fn close(&self, session_id: uuid::Uuid, reason: &str) -> BoxFuture<'_, ()>;
-}
-
-struct LeaderBundleTransfer {
-    leader: Arc<InstanceLeader>,
-    client: LeaderControlClient,
-    owner: crate::InstanceId,
-}
-
-impl BundleTransfer for LeaderBundleTransfer {
-    fn open(
-        &self,
-        resource: LogicalResourceId,
-        hashes: Vec<SequenceHash>,
-    ) -> BoxFuture<'_, Result<OpenTransferSessionResponse>> {
-        Box::pin(async move {
-            self.client
-                .transfer()
-                .open_session(OpenTransferSessionRequest {
-                    sequence_hashes: hashes,
-                    search_mode: SearchMode::Prefix,
-                    find_mode: FindMode::Sync,
-                    tiers: TierSelection::default(),
-                    resource: Some(resource),
-                    watchdog_ms: None,
-                })
-                .await
-                .with_context(|| format!("open bundle resource {resource:?} on {}", self.owner))
-        })
-    }
-
-    fn pull(&self, resource: &OpenedResource) -> BoxFuture<'_, Result<()>> {
-        let leader = Arc::clone(&self.leader);
-        let owner = self.owner;
-        let session_id = resource.capability.session_id;
-        let endpoint = resource.capability.endpoint.clone();
-        let resource = resource.resource;
-        Box::pin(async move {
-            leader
-                .pull_from_session(PullFromSessionRequest {
-                    session_id,
-                    source_instance_id: owner,
-                    endpoint: Some(endpoint),
-                    selector: None,
-                    resource: Some(resource),
-                })
-                .await
-                .map(|_| ())
-                .map_err(anyhow::Error::from)
-        })
-    }
-
-    fn close(&self, session_id: uuid::Uuid, reason: &str) -> BoxFuture<'_, ()> {
-        let reason = reason.to_owned();
-        Box::pin(async move {
-            if let Err(error) = self
-                .client
-                .transfer()
-                .close_session(CloseTransferSessionRequest {
-                    session_id,
-                    reason: Some(reason),
-                })
-                .await
-            {
-                tracing::debug!(
-                    %error,
-                    %session_id,
-                    "bundle session close failed; holder watchdog will reclaim"
-                );
-            }
-        })
-    }
 }
 
 pub(crate) async fn pull_remote_bundle(
     target: Arc<dyn BundlePullTarget>,
     candidate: RemoteBundleCandidate,
-    sequence_hashes: Arc<[SequenceHash]>,
-    base_block_tokens: usize,
+    expected_identity: CacheIdentity,
+    cancel: CancellationToken,
+    search_deadline: tokio::time::Instant,
 ) -> Result<BundlePullOutcome> {
     let leader = target.instance_leader();
-    let owner = candidate.advertisement().owner();
-    let transfer = Arc::new(LeaderBundleTransfer {
-        client: LeaderControlClient::new(leader.messenger().clone(), owner),
+    let advertisement = candidate.advertisement();
+    // `execute_inner` validates the advertised manifest and every resource
+    // lineage before opening; the holder independently proves that the
+    // directory hit still names its current registration lifecycle.
+    let transfer = Arc::new(LeaderBundleTransfer::new(
         leader,
-        owner,
-    });
+        advertisement.owner(),
+        advertisement.registration_epoch(),
+    ));
     pull_remote_bundle_with_transfer(
         target,
         candidate,
-        sequence_hashes,
-        base_block_tokens,
+        expected_identity,
+        cancel,
+        search_deadline,
         transfer,
+        BundlePullLimits::PRODUCTION,
     )
     .await
 }
@@ -146,147 +346,63 @@ pub(crate) async fn pull_remote_bundle(
 async fn pull_remote_bundle_with_transfer(
     target: Arc<dyn BundlePullTarget>,
     candidate: RemoteBundleCandidate,
-    sequence_hashes: Arc<[SequenceHash]>,
-    base_block_tokens: usize,
+    expected_identity: CacheIdentity,
+    cancel: CancellationToken,
+    search_deadline: tokio::time::Instant,
     transfer: Arc<dyn BundleTransfer>,
+    limits: BundlePullLimits,
 ) -> Result<BundlePullOutcome> {
-    if unix_time_ms() >= candidate.lease_expires_at_unix_ms() {
-        return Ok(BundlePullOutcome::Miss(BundleMissReason::Expired));
+    RemoteBundlePull {
+        target,
+        candidate,
+        expected_identity,
+        cancel,
+        search_deadline,
+        transfer,
+        limits,
     }
-    let advertisement = candidate.advertisement();
-    let identity = advertisement.identity().clone();
-    let key = advertisement.key();
-    let owner = advertisement.owner();
-    let lineages = resource_lineages(&identity, key, &sequence_hashes, base_block_tokens)?;
-
-    let mut opened = Vec::with_capacity(lineages.len());
-    for (&resource, hashes) in &lineages {
-        if unix_time_ms() >= candidate.lease_expires_at_unix_ms() {
-            close_all(&transfer, &opened, "bundle directory lease expired").await;
-            return Ok(BundlePullOutcome::Miss(BundleMissReason::Expired));
-        }
-        let response = transfer.open(resource, hashes.clone()).await;
-        let response = match response {
-            Ok(response) => response,
-            Err(error) => {
-                close_all(&transfer, &opened, "bundle acquisition failed").await;
-                return Err(error);
-            }
-        };
-        let (capability, committed) = match response {
-            OpenTransferSessionResponse::Sync {
-                capability,
-                committed,
-                ..
-            } => (capability, committed),
-            OpenTransferSessionResponse::NoBlocksFound => {
-                close_all(&transfer, &opened, "bundle resource omitted").await;
-                return Ok(BundlePullOutcome::Miss(BundleMissReason::Incomplete));
-            }
-            OpenTransferSessionResponse::Async { capability } => {
-                opened.push(OpenedResource {
-                    resource,
-                    capability,
-                });
-                close_all(&transfer, &opened, "unexpected async bundle acquisition").await;
-                return Ok(BundlePullOutcome::Miss(BundleMissReason::Incomplete));
-            }
-        };
-        if capability.resource != resource || committed != *hashes {
-            opened.push(OpenedResource {
-                resource,
-                capability,
-            });
-            close_all(&transfer, &opened, "incomplete bundle acquisition").await;
-            return Ok(BundlePullOutcome::Miss(BundleMissReason::Incomplete));
-        }
-        opened.push(OpenedResource {
-            capability,
-            resource,
-        });
-    }
-
-    if unix_time_ms() >= candidate.lease_expires_at_unix_ms() {
-        close_all(&transfer, &opened, "bundle lease expired during pull").await;
-        return Ok(BundlePullOutcome::Miss(BundleMissReason::Expired));
-    }
-    let pulls = opened.iter().map(|opened_resource| {
-        let transfer = Arc::clone(&transfer);
-        async move {
-            transfer.pull(opened_resource).await.with_context(|| {
-                format!(
-                    "pull bundle resource {:?} from {owner}",
-                    opened_resource.resource
-                )
-            })
-        }
-    });
-    let error = join_all(pulls).await.into_iter().find_map(Result::err);
-    if let Some(error) = error {
-        close_all(&transfer, &opened, "bundle pull failed").await;
-        return Err(error);
-    }
-    if unix_time_ms() >= candidate.lease_expires_at_unix_ms() {
-        close_all(&transfer, &opened, "bundle lease expired after pull").await;
-        return Ok(BundlePullOutcome::Miss(BundleMissReason::Expired));
-    }
-    close_all(&transfer, &opened, "bundle pull complete").await;
-
-    target
-        .commit_pulled_bundle(identity, key, advertisement.generation(), lineages)
-        .await?;
-    Ok(BundlePullOutcome::Pulled(key))
+    .execute()
+    .await
 }
 
 fn resource_lineages(
     identity: &CacheIdentity,
-    key: BundleKey,
-    sequence_hashes: &[SequenceHash],
-    base_block_tokens: usize,
+    advertisement: &super::BundleAdvertisement,
 ) -> Result<BTreeMap<LogicalResourceId, Vec<SequenceHash>>> {
-    if base_block_tokens == 0 || !key.is_compatible_with(identity) {
-        bail!("invalid bundle lineage inputs");
+    if advertisement.identity() != identity || !advertisement.key().is_compatible_with(identity) {
+        bail!("bundle advertisement is incompatible with the expected identity");
     }
-    let boundary = usize::try_from(key.boundary_tokens())?;
     let mut lineages = BTreeMap::new();
     for requirement in identity.resources() {
-        let native = requirement.native_block_tokens().get() as usize;
-        if native < base_block_tokens || !native.is_multiple_of(base_block_tokens) {
-            bail!(
-                "resource {:?} native span is not base-block aligned",
-                requirement.resource()
-            );
-        }
-        let hashes = match requirement.role() {
-            ResourceRole::PrefixHistory => (native..=boundary)
-                .step_by(native)
-                .map(|end| {
-                    let index = end / base_block_tokens - 1;
-                    sequence_hashes.get(index).copied().ok_or_else(|| {
-                        anyhow!(
-                            "sequence does not cover resource {:?} boundary",
-                            requirement.resource()
-                        )
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?,
-            ResourceRole::BoundaryCapsule => vec![key.boundary_hash()],
-        };
-        if hashes.is_empty() {
-            bail!(
-                "resource {:?} has no hashes to pull",
-                requirement.resource()
-            );
-        }
-        lineages.insert(requirement.resource(), hashes);
+        let resource = requirement.resource();
+        let lineage = advertisement
+            .lineage(resource)
+            .ok_or_else(|| anyhow!("bundle advertisement is missing resource {resource:?}"))?;
+        lineages.insert(resource, lineage.hashes().to_vec());
     }
     Ok(lineages)
 }
 
-async fn close_all(transfer: &Arc<dyn BundleTransfer>, opened: &[OpenedResource], reason: &str) {
-    for resource in opened {
-        transfer.close(resource.capability.session_id, reason).await;
-    }
+fn merge_reason(
+    current: Option<BundleMissReason>,
+    incoming: BundleMissReason,
+) -> Option<BundleMissReason> {
+    let rank = |reason| match reason {
+        BundleMissReason::Canceled => 7,
+        BundleMissReason::OwnerLost => 6,
+        BundleMissReason::Expired => 5,
+        BundleMissReason::TimedOut => 4,
+        BundleMissReason::TransferFailed => 3,
+        BundleMissReason::ChecksumFailed => 4,
+        BundleMissReason::Incomplete => 2,
+        BundleMissReason::CommitFailed
+        | BundleMissReason::Incompatible
+        | BundleMissReason::NotFound => 1,
+    };
+    Some(match current {
+        Some(current) if rank(current) >= rank(incoming) => current,
+        _ => incoming,
+    })
 }
 
 #[cfg(test)]

@@ -195,7 +195,18 @@ fn find_blocks_req(id: &str) -> FindBlocksRequest {
         num_computed_tokens: 0,
         total_tokens: 0,
         transfer_params: None,
+        local_prefill_estimate: None,
     }
+}
+
+#[test]
+fn local_prefill_estimate_combines_queue_and_suffix_rate() {
+    let estimate = super::LocalPrefillEstimate::from_rate(std::time::Duration::from_millis(2), 5);
+    assert_eq!(
+        estimate.estimate(10),
+        std::time::Duration::from_millis(2_002)
+    );
+    assert_eq!(estimate.queue(), std::time::Duration::from_millis(2));
 }
 
 #[test]
@@ -295,6 +306,7 @@ fn find_blocks_request_carries_chain_counts_and_transfer_params() {
         num_computed_tokens: 16,
         total_tokens: 48,
         transfer_params: Some(crate::disagg::TransferParams::remote_prefill(params)),
+        local_prefill_estimate: None,
     };
     assert_eq!(req.sequence_hashes.len(), 3);
     assert_eq!(req.num_computed_tokens, 16);
@@ -350,7 +362,6 @@ fn bundle_transfer_plans_carry_one_identity_key_and_exact_resource_children() {
     let offload = BundleOffloadPlan {
         identity,
         key,
-        generation: 9,
         mode: OffloadMode::Move,
         resources: vec![
             ResourceOffload {
@@ -365,7 +376,6 @@ fn bundle_transfer_plans_carry_one_identity_key_and_exact_resource_children() {
     };
 
     assert_eq!(onboard.key, offload.key);
-    assert_eq!(offload.generation, 9);
     assert_eq!(offload.mode, OffloadMode::Move);
     assert_eq!(onboard.resources[0].resource, LogicalResourceId(4));
     assert_eq!(offload.resources[0].resource, LogicalResourceId(4));

@@ -5,10 +5,10 @@ use kvbm_physical::manager::SerializedLayout;
 
 use super::{
     Arc, ConnectRemoteMessage, DirectWorker, ExecuteRemoteOnboardForInstanceMessage,
-    ExecuteRemoteOnboardForInstanceRankMessage, LocalTransferMessage, ObjectGetBlocksMessage,
-    ObjectHasBlocksMessage, ObjectHasBlocksResponse, ObjectPutBlocksMessage,
-    ObjectPutGetBlocksResponse, RemoteOffloadMessage, RemoteOnboardMessage, RemotePullPlanMessage,
-    Result, TransferOptions, WorkerTransfers, handler_names,
+    ExecuteRemoteOnboardForInstanceRankMessage, HostPayloadDigestsMessage, LocalTransferMessage,
+    ObjectGetBlocksMessage, ObjectHasBlocksMessage, ObjectHasBlocksResponse,
+    ObjectPutBlocksMessage, ObjectPutGetBlocksResponse, RemoteOffloadMessage, RemoteOnboardMessage,
+    RemotePullPlanMessage, Result, TransferOptions, Worker, WorkerTransfers, handler_names,
 };
 use crate::object::ObjectBlockOps;
 
@@ -88,10 +88,29 @@ impl VeloWorkerService {
         self.register_execute_remote_onboard_for_instance_handler()?;
         self.register_execute_remote_onboard_for_instance_rank_handler()?;
         self.register_execute_remote_pull_plan_handler()?;
+        self.register_host_payload_digests_handler()?;
         // Object storage handlers
         self.register_object_has_blocks_handler()?;
         self.register_object_put_blocks_handler()?;
         self.register_object_get_blocks_handler()?;
+        Ok(())
+    }
+
+    fn register_host_payload_digests_handler(&self) -> Result<()> {
+        let worker = Arc::clone(&self.worker);
+        let handler =
+            Handler::unary_handler_async(handler_names::HOST_PAYLOAD_DIGESTS, move |ctx| {
+                let worker = Arc::clone(&worker);
+                async move {
+                    let message: HostPayloadDigestsMessage = serde_json::from_slice(&ctx.payload)?;
+                    let digests = worker
+                        .compute_host_payload_digests(message.resource, message.block_ids)
+                        .await?;
+                    Ok(Some(Bytes::from(serde_json::to_vec(&digests)?)))
+                }
+            })
+            .build();
+        self.messenger.register_handler(handler)?;
         Ok(())
     }
 

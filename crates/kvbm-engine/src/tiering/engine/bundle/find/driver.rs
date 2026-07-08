@@ -12,14 +12,15 @@ use kvbm_protocols::connector::{
     SearchId,
 };
 
-use super::BundleFindQuery;
-use crate::remote::search::bundle::{
-    BundleDiscoveryOutcome, BundleDiscoveryQuery, BundlePullOutcome, BundlePullTarget,
-    pull_remote_bundle, unix_time_ms,
-};
-use crate::tiering::engine::bundle::BundlePrefillRequest;
+use super::remote::{RemoteBundleFind, RemoteBundleFindInputs};
+use super::{BundleFindMatch, BundleFindQuery};
 use crate::tiering::engine::find::DerivedWindow;
-use crate::tiering::engine::local::{BundleSearchSource, BundleSearchState, LocalConnectorEngine};
+use crate::tiering::engine::local::{
+    BundleSearchSource, BundleSearchState, LocalConnectorEngine, RemoteBundleResolution,
+    RemoteBundleSearch,
+};
+
+const REMOTE_BUNDLE_DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl LocalConnectorEngine {
     pub(in crate::tiering::engine) fn start_bundle_find(
@@ -29,22 +30,58 @@ impl LocalConnectorEngine {
         derived: &DerivedWindow,
     ) -> Result<FindBlocksOutcome, LeaderEngineError> {
         let query = self.bundle_find_query(req, identity, derived);
-        let found = query.find(
-            &self
-                .bundle_index
+        let local = {
+            let catalog = self
+                .bundle_catalog
                 .lock()
-                .expect("bundle-index mutex poisoned"),
-        );
-        let Some(found) = found else {
-            if self.search_remote {
-                return self.start_remote_bundle_find(req, identity, query);
-            }
-            return Ok(FindBlocksOutcome::Resolved {
-                matched_tokens: 0,
-                minted: None,
-                release_parked: false,
-            });
+                .expect("bundle-catalog mutex poisoned");
+            query.find(catalog.index())
         };
+        let candidates = query.candidate_keys();
+        let Some(target) = candidates.first().copied() else {
+            return Ok(zero_find(false));
+        };
+        if local.as_ref().is_some_and(|found| *found.key() == target) {
+            return Ok(self.install_local_find(req, identity, local.expect("checked local match")));
+        }
+        if !self
+            .leader
+            .remote_search_eligible(self.search_remote, derived.range.len())
+        {
+            return Ok(local.map_or_else(
+                || zero_find(false),
+                |found| self.install_local_find(req, identity, found),
+            ));
+        }
+        let Some(directory) = self.leader.remote_discovery() else {
+            return Ok(local.map_or_else(
+                || zero_find(false),
+                |found| self.install_local_find(req, identity, found),
+            ));
+        };
+        let fallback_boundary = local
+            .as_ref()
+            .map(|found| found.key().boundary_tokens())
+            .unwrap_or_default();
+        let remote_candidates = candidates
+            .into_iter()
+            .filter(|key| key.boundary_tokens() > fallback_boundary)
+            .collect::<Vec<_>>();
+        if remote_candidates.is_empty() {
+            return Ok(local.map_or_else(
+                || zero_find(false),
+                |found| self.install_local_find(req, identity, found),
+            ));
+        }
+        self.start_remote_bundle_find(req, identity, target, remote_candidates, local, directory)
+    }
+
+    fn install_local_find(
+        self: &Arc<Self>,
+        req: &FindBlocksRequest,
+        identity: &CacheIdentity,
+        found: BundleFindMatch<Vec<kvbm_logical::ImmutableBlock<crate::G2>>>,
+    ) -> FindBlocksOutcome {
         let matched_tokens = found.matched_tokens();
         let search_id = SearchId::new();
         self.bundle_searches.insert(
@@ -58,7 +95,7 @@ impl LocalConnectorEngine {
             },
         );
         let engine: Arc<dyn LeaderEngine> = Arc::clone(self) as Arc<dyn LeaderEngine>;
-        Ok(FindBlocksOutcome::Resolved {
+        FindBlocksOutcome::Resolved {
             matched_tokens,
             minted: Some(FindBlocksHandle::search(
                 req.request_id.clone(),
@@ -66,134 +103,58 @@ impl LocalConnectorEngine {
                 Arc::downgrade(&engine),
             )),
             release_parked: false,
-        })
+        }
     }
 
     fn start_remote_bundle_find(
         self: &Arc<Self>,
         req: &FindBlocksRequest,
         identity: &CacheIdentity,
-        query: BundleFindQuery<'_>,
+        target: kvbm_protocols::cache_manifest::BundleKey,
+        candidates: Vec<kvbm_protocols::cache_manifest::BundleKey>,
+        fallback: Option<BundleFindMatch<Vec<kvbm_logical::ImmutableBlock<crate::G2>>>>,
+        directory: crate::leader::RemoteDiscoveryHandle,
     ) -> Result<FindBlocksOutcome, LeaderEngineError> {
-        let Some(directory) = self.leader.remote_discovery() else {
-            return Ok(FindBlocksOutcome::Resolved {
-                matched_tokens: 0,
-                minted: None,
-                release_parked: false,
-            });
-        };
-        let candidates = query.candidate_keys();
-        if candidates.is_empty() {
-            return Ok(FindBlocksOutcome::Resolved {
-                matched_tokens: 0,
-                minted: None,
-                release_parked: false,
-            });
-        }
         let search_id = SearchId::new();
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let deadline = tokio::time::Instant::now() + REMOTE_BUNDLE_DISCOVERY_TIMEOUT;
+        let fallback_key = fallback.as_ref().map(|found| *found.key());
+        let fallback_matched = fallback
+            .as_ref()
+            .map(BundleFindMatch::matched_tokens)
+            .unwrap_or_default();
+        let fallback_lease = fallback.map(BundleFindMatch::into_lease);
         self.bundle_searches.insert(
             search_id,
             BundleSearchState {
                 request_id: req.request_id.clone(),
                 identity: identity.clone(),
-                source: BundleSearchSource::Remote(rx),
+                source: BundleSearchSource::Remote(RemoteBundleSearch::new(
+                    rx,
+                    cancel.clone(),
+                    fallback_lease,
+                )),
                 computed_tokens: req.num_computed_tokens,
-                matched_tokens: 0,
+                matched_tokens: fallback_matched,
             },
         );
-        let target: Arc<dyn BundlePullTarget> = Arc::clone(self) as Arc<dyn BundlePullTarget>;
-        let target_key = candidates[0];
-        let sequence_hashes = Arc::clone(&req.sequence_hashes);
-        let block_size = self.block_size;
-        let identity = identity.clone();
-        let engine = self.weak_self.clone();
-        let request_id = req.request_id.clone();
-        let num_computed_tokens = req.num_computed_tokens;
-        let total_tokens = req.total_tokens;
-        let metrics = self
-            .leader
-            .observability()
-            .map(|observability| observability.bundle_metrics().clone());
+        let task = RemoteBundleFind::new(RemoteBundleFindInputs {
+            engine: Arc::clone(self),
+            directory,
+            request_id: req.request_id.clone(),
+            identity: identity.clone(),
+            candidates,
+            target,
+            fallback: fallback_key,
+            num_computed_tokens: req.num_computed_tokens,
+            total_tokens: req.total_tokens,
+            local_prefill_estimate: req.local_prefill_estimate,
+            cancel,
+            deadline,
+        });
         self.leader.runtime().spawn(async move {
-            let mut remaining = candidates;
-            let mut result = Ok(None);
-            while !remaining.is_empty() {
-                let query =
-                    BundleDiscoveryQuery::new(identity.clone(), remaining.clone(), unix_time_ms());
-                let candidate = match directory.discover_bundle(query).await {
-                    Ok(BundleDiscoveryOutcome::Hit(candidate)) => *candidate,
-                    Ok(BundleDiscoveryOutcome::Miss(reason)) => {
-                        if let Some(metrics) = metrics.as_ref() {
-                            metrics.record_find("remote_miss", reason.as_label());
-                        }
-                        tracing::debug!(
-                            resource_reason = reason.as_label(),
-                            "remote complete-bundle directory miss"
-                        );
-                        break;
-                    }
-                    Err(error) => {
-                        if let Some(metrics) = metrics.as_ref() {
-                            metrics.record_find("remote_miss", "directory_failed");
-                        }
-                        result = Err(error);
-                        break;
-                    }
-                };
-                let attempted = candidate.advertisement().key();
-                match pull_remote_bundle(
-                    Arc::clone(&target),
-                    candidate,
-                    Arc::clone(&sequence_hashes),
-                    block_size,
-                )
-                .await
-                {
-                    Ok(BundlePullOutcome::Pulled(key)) => {
-                        if let Some(metrics) = metrics.as_ref() {
-                            metrics.record_find("remote_hit", "complete");
-                            metrics.observe_boundary(key.boundary_tokens());
-                        }
-                        result = Ok(Some(key));
-                        break;
-                    }
-                    Ok(BundlePullOutcome::Miss(reason)) => {
-                        if let Some(metrics) = metrics.as_ref() {
-                            metrics.record_find("remote_miss", reason.as_label());
-                        }
-                    }
-                    Err(error) => {
-                        if let Some(metrics) = metrics.as_ref() {
-                            metrics.record_find("remote_miss", "transfer_failed");
-                        }
-                        tracing::debug!(
-                            %error,
-                            boundary_tokens = attempted.boundary_tokens(),
-                            "remote bundle pull failed; retrying an earlier boundary"
-                        );
-                    }
-                }
-                remaining.retain(|key| key.boundary_tokens() < attempted.boundary_tokens());
-            }
-            if matches!(result, Ok(None))
-                && let Some(engine) = engine.upgrade()
-            {
-                result = engine
-                    .run_bundle_prefill(
-                        Arc::clone(&directory),
-                        BundlePrefillRequest::new(
-                            request_id,
-                            identity,
-                            target_key,
-                            sequence_hashes,
-                            num_computed_tokens,
-                            total_tokens,
-                        ),
-                    )
-                    .await;
-            }
-            let _ = tx.send(result.map_err(|error| error.to_string()));
+            let _ = tx.send(Ok(task.execute().await));
         });
 
         let engine: Arc<dyn LeaderEngine> = Arc::clone(self) as Arc<dyn LeaderEngine>;
@@ -221,35 +182,32 @@ impl LocalConnectorEngine {
             return Err(LeaderEngineError::FindBlocksDesync);
         }
         let query = self.bundle_find_query(req, identity, derived);
-        let remote_result = match &mut state.source {
+        let terminal = match &mut state.source {
             BundleSearchSource::Local(_) => None,
-            BundleSearchSource::Remote(remote) => Some(remote.try_recv()),
-        };
-        if let Some(remote_result) = remote_result {
-            match remote_result {
-                Ok(Ok(Some(key))) => {
-                    let lease = self
-                        .bundle_index
-                        .lock()
-                        .expect("bundle-index mutex poisoned")
-                        .lease_exact(identity, &key)
-                        .ok_or(LeaderEngineError::FindBlocksDesync)?;
-                    state.source = BundleSearchSource::Local(lease);
-                }
-                Ok(Ok(None) | Err(_)) | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
-                    drop(state);
-                    self.bundle_searches.remove(&search_id);
-                    return Ok(FindBlocksOutcome::Resolved {
-                        matched_tokens: 0,
-                        minted: None,
-                        release_parked: true,
-                    });
+            BundleSearchSource::Remote(remote) => match remote.try_recv() {
+                Ok(result) => Some((result, remote.take_fallback())),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    Some((Ok(RemoteBundleResolution::Fallback), remote.take_fallback()))
                 }
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
                     return Ok(FindBlocksOutcome::Searching { minted: None });
                 }
-            }
+            },
+        };
+        if let Some((resolution, fallback)) = terminal {
+            let selected = match resolution {
+                Ok(RemoteBundleResolution::Selected(lease)) => Some(lease),
+                Ok(RemoteBundleResolution::Fallback) | Err(_) => fallback,
+                Ok(RemoteBundleResolution::Miss) => None,
+            };
+            let Some(lease) = selected else {
+                drop(state);
+                self.bundle_searches.remove(&search_id);
+                return Ok(zero_find(true));
+            };
+            state.source = BundleSearchSource::Local(lease);
         }
+
         let lease = state.lease().ok_or(LeaderEngineError::FindBlocksDesync)?;
         if let Some(matched_tokens) = query.matched_tokens_for(lease.key()) {
             state.computed_tokens = req.num_computed_tokens;
@@ -260,12 +218,13 @@ impl LocalConnectorEngine {
                 release_parked: false,
             });
         }
-        let replacement = query.find(
-            &self
-                .bundle_index
+        let replacement = {
+            let catalog = self
+                .bundle_catalog
                 .lock()
-                .expect("bundle-index mutex poisoned"),
-        );
+                .expect("bundle-catalog mutex poisoned");
+            query.find(catalog.index())
+        };
         if let Some(found) = replacement {
             let matched_tokens = found.matched_tokens();
             state.source = BundleSearchSource::Local(found.into_lease());
@@ -279,11 +238,7 @@ impl LocalConnectorEngine {
         }
         drop(state);
         self.bundle_searches.remove(&search_id);
-        Ok(FindBlocksOutcome::Resolved {
-            matched_tokens: 0,
-            minted: None,
-            release_parked: true,
-        })
+        Ok(zero_find(true))
     }
 
     fn bundle_find_query<'a>(
@@ -292,6 +247,14 @@ impl LocalConnectorEngine {
         identity: &'a CacheIdentity,
         derived: &DerivedWindow,
     ) -> BundleFindQuery<'a> {
+        let minimum_boundary = req
+            .transfer_params
+            .as_ref()
+            .and_then(|params| params.remote_prefill.as_ref())
+            .and_then(|params| params.bundle.as_ref())
+            .and_then(|context| context.initial_bundle())
+            .and_then(|key| usize::try_from(key.boundary_tokens()).ok())
+            .unwrap_or_default();
         BundleFindQuery::new(
             identity,
             &req.sequence_hashes,
@@ -299,5 +262,14 @@ impl LocalConnectorEngine {
             derived.range.end,
             NonZeroUsize::new(self.block_size).expect("engine block size must be nonzero"),
         )
+        .with_minimum_boundary(minimum_boundary)
+    }
+}
+
+fn zero_find(release_parked: bool) -> FindBlocksOutcome {
+    FindBlocksOutcome::Resolved {
+        matched_tokens: 0,
+        minted: None,
+        release_parked,
     }
 }

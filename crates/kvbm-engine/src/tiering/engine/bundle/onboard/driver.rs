@@ -2,15 +2,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::{BTreeMap, HashSet};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use kvbm_common::{BlockId, LogicalLayoutHandle, LogicalResourceId, SequenceHash};
 use kvbm_logical::ImmutableBlock;
 use kvbm_physical::transfer::TransferCompleteNotification;
+use kvbm_protocols::cache_manifest::{ResourceRequirement, ResourceRole};
 use kvbm_protocols::connector::{
-    ActionFailure, ActionId, ActionStatus, BundleOnboardPlan, FindBlocksHandle, LeaderEngine,
-    LeaderEngineError, OnboardHandle, RequestId, ResourceDestination, ResourceOnboard,
+    ActionFailure, ActionId, ActionStatus, BundleOnboardPlan, FenceHandle, FindBlocksHandle,
+    LeaderEngine, LeaderEngineError, OnboardHandle, RequestId, ResourceDestination,
+    ResourceOnboard,
 };
+use tokio_util::sync::CancellationToken;
 
 use super::{BundleOnboard, OnboardTransition};
 use crate::G2;
@@ -31,11 +35,6 @@ struct DispatchedResource {
 struct DispatchFailure {
     resource: LogicalResourceId,
     destination_block_ids: Vec<BlockId>,
-}
-
-struct DispatchBatch {
-    transfers: Vec<DispatchedResource>,
-    failure: Option<DispatchFailure>,
 }
 
 struct CompletedResource {
@@ -146,10 +145,13 @@ impl LocalConnectorEngine {
 
         let action_id = ActionId::new();
         let cell = Arc::new(Mutex::new(ActionStatus::Pending));
+        let cancel = CancellationToken::new();
+        let physical_drain = Arc::new(AtomicBool::new(false));
         self.actions.insert(
             action_id,
             ActionRecord::new(req.clone(), Arc::downgrade(&cell))
-                .with_inflight(InflightKey::Action(action_id)),
+                .with_inflight(InflightKey::Action(action_id))
+                .with_physical_drain(cancel.clone()),
         );
         self.inflight
             .lock()
@@ -167,20 +169,96 @@ impl LocalConnectorEngine {
         let request_id = req.clone();
         let driver = Arc::clone(&self);
         let terminal_dest_ids = handle_dest_ids.clone();
-        self.leader.runtime().spawn(async move {
-            let outcome = driver
+        let physical_driver = Arc::clone(&self);
+        let mut physical = self.leader.runtime().spawn(async move {
+            physical_driver
                 .drive_bundle_onboard(plan.resources, transaction)
-                .await;
-            driver.finish_load_action(action_id, &request_id, outcome, terminal_dest_ids);
+                .await
+        });
+        let watchdog = self.bundle_onboard_watchdog();
+        let drain_cell = Arc::clone(&physical_drain);
+        self.leader.runtime().spawn(async move {
+            tokio::select! {
+                biased;
+                result = &mut physical => {
+                    match result {
+                        Ok(outcome) => {
+                            driver.finish_load_action(
+                                action_id,
+                                &request_id,
+                                outcome,
+                                terminal_dest_ids,
+                            );
+                            driver.finish_physical_load_action(action_id, &drain_cell);
+                        }
+                        Err(error) => {
+                            tracing::error!(
+                                %error,
+                                %request_id,
+                                "bundle onboard physical task failed; destination quarantine remains fail-closed"
+                            );
+                            driver.finish_load_action(
+                                action_id,
+                                &request_id,
+                                ActionStatus::Failed(ActionFailure::AllBlocks),
+                                terminal_dest_ids,
+                            );
+                        }
+                    }
+                }
+                () = cancel.cancelled() => {
+                    driver.finish_load_action(
+                        action_id,
+                        &request_id,
+                        ActionStatus::Failed(ActionFailure::AllBlocks),
+                        terminal_dest_ids,
+                    );
+                    driver.spawn_bundle_drain_waiter(action_id, physical, drain_cell);
+                }
+                () = tokio::time::sleep(watchdog) => {
+                    tracing::warn!(
+                        %request_id,
+                        ?watchdog,
+                        "bundle onboard exceeded its logical watchdog"
+                    );
+                    driver.finish_load_action(
+                        action_id,
+                        &request_id,
+                        ActionStatus::Failed(ActionFailure::AllBlocks),
+                        terminal_dest_ids,
+                    );
+                    driver.spawn_bundle_drain_waiter(action_id, physical, drain_cell);
+                }
+            }
         });
 
         let engine: Arc<dyn LeaderEngine> = self;
-        Ok(OnboardHandle::new(
+        Ok(OnboardHandle::new_with_physical_drain(
             action_id,
             Arc::downgrade(&engine),
             cell,
             handle_dest_ids,
+            FenceHandle::new(physical_drain),
         ))
+    }
+
+    fn spawn_bundle_drain_waiter(
+        self: &Arc<Self>,
+        action_id: ActionId,
+        physical: tokio::task::JoinHandle<ActionStatus>,
+        physical_drain: Arc<AtomicBool>,
+    ) {
+        let driver = Arc::clone(self);
+        self.leader.runtime().spawn(async move {
+            match physical.await {
+                Ok(_) => driver.finish_physical_load_action(action_id, &physical_drain),
+                Err(error) => tracing::error!(
+                    %error,
+                    ?action_id,
+                    "quarantined bundle onboard drain task failed; destination quarantine remains fail-closed"
+                ),
+            }
+        });
     }
 
     fn acquire_bundle_sources(
@@ -188,9 +266,9 @@ impl LocalConnectorEngine {
         plan: &BundleOnboardPlan,
     ) -> Result<(SourceLeases, Vec<SequenceHash>), LeaderEngineError> {
         let lease = self
-            .bundle_index
+            .bundle_catalog
             .lock()
-            .expect("bundle-index mutex poisoned")
+            .expect("bundle-catalog mutex poisoned")
             .lease_exact(&plan.identity, &plan.key)
             .ok_or_else(|| LeaderEngineError::InvalidBundleTransfer {
                 reason: "bundle is not committed in the local index".to_owned(),
@@ -235,55 +313,59 @@ impl LocalConnectorEngine {
         &self,
         resources: Vec<ResourceOnboard>,
     ) -> (Option<DispatchFailure>, Vec<CompletedResource>) {
-        let batch = self.dispatch_bundle_onboard(resources);
-        let completed =
-            futures::future::join_all(batch.transfers.into_iter().map(|dispatched| async move {
-                CompletedResource {
-                    resource: dispatched.resource,
-                    destination_block_ids: dispatched.destination_block_ids,
-                    result: dispatched.notification.await,
-                }
-            }))
-            .await;
-        (batch.failure, completed)
+        let _admission = self.resource_onboard_admission.lock().await;
+        let mut completed = Vec::with_capacity(resources.len());
+        for transfer in resources {
+            let dispatched = match self.dispatch_resource_onboard(transfer) {
+                Ok(dispatched) => dispatched,
+                Err(failure) => return (Some(failure), completed),
+            };
+            let completion = CompletedResource {
+                resource: dispatched.resource,
+                destination_block_ids: dispatched.destination_block_ids,
+                result: dispatched.notification.await,
+            };
+            let failed = completion.result.is_err();
+            completed.push(completion);
+            if failed {
+                break;
+            }
+        }
+        (None, completed)
     }
 
-    fn dispatch_bundle_onboard(&self, resources: Vec<ResourceOnboard>) -> DispatchBatch {
-        let mut dispatched = Vec::with_capacity(resources.len());
-        for transfer in resources {
-            match self.leader.execute_local_transfer_for_resource(
-                transfer.resource,
+    fn dispatch_resource_onboard(
+        &self,
+        transfer: ResourceOnboard,
+    ) -> Result<DispatchedResource, DispatchFailure> {
+        let resource = transfer.resource;
+        let destination_block_ids = transfer.destination_block_ids;
+        let notification = self
+            .leader
+            .execute_local_transfer_for_resource(
+                resource,
                 LogicalLayoutHandle::G2,
                 LogicalLayoutHandle::G1,
                 transfer.source_block_ids,
-                transfer.destination_block_ids.clone(),
+                destination_block_ids.clone(),
                 kvbm_physical::TransferOptions::default(),
-            ) {
-                Ok(notification) => dispatched.push(DispatchedResource {
-                    resource: transfer.resource,
-                    destination_block_ids: transfer.destination_block_ids,
-                    notification,
-                }),
-                Err(error) => {
-                    tracing::error!(
-                        error = %error,
-                        resource = ?transfer.resource,
-                        "resource onboard dispatch failed"
-                    );
-                    return DispatchBatch {
-                        transfers: dispatched,
-                        failure: Some(DispatchFailure {
-                            resource: transfer.resource,
-                            destination_block_ids: transfer.destination_block_ids,
-                        }),
-                    };
+            )
+            .map_err(|error| {
+                tracing::error!(
+                    %error,
+                    ?resource,
+                    "resource onboard dispatch failed"
+                );
+                DispatchFailure {
+                    resource,
+                    destination_block_ids: destination_block_ids.clone(),
                 }
-            }
-        }
-        DispatchBatch {
-            transfers: dispatched,
-            failure: None,
-        }
+            })?;
+        Ok(DispatchedResource {
+            resource,
+            destination_block_ids,
+            notification,
+        })
     }
 }
 
@@ -347,9 +429,6 @@ fn searched_bundle_plan(
     let mut inflight_hashes = Vec::new();
     for requirement in state.identity.resources() {
         let resource = requirement.resource();
-        let native = requirement.native_block_tokens().get() as usize;
-        let first_block = computed / native;
-        let end_block = boundary.div_ceil(native);
         let destination = destinations
             .remove(&resource)
             .ok_or_else(|| invalid_bundle(format!("missing destination for {resource:?}")))?;
@@ -357,18 +436,20 @@ fn searched_bundle_plan(
             .resources()
             .get(&resource)
             .ok_or_else(|| invalid_bundle(format!("search lease is missing {resource:?}")))?;
-        if first_block >= end_block || source.len() < end_block || destination.len() < end_block {
-            return Err(invalid_bundle(format!(
-                "resource {resource:?} cannot cover native block range {first_block}..{end_block}"
-            )));
-        }
-        let pins = source[first_block..end_block].to_vec();
+        let block_range = searched_resource_block_range(
+            requirement,
+            computed,
+            boundary,
+            source.len(),
+            destination.len(),
+        )?;
+        let pins = source[block_range.clone()].to_vec();
         let source_block_ids = pins.iter().map(ImmutableBlock::block_id).collect();
         inflight_hashes.extend(pins.iter().map(ImmutableBlock::sequence_hash));
         resources.push(ResourceOnboard {
             resource,
             source_block_ids,
-            destination_block_ids: destination[first_block..end_block].to_vec(),
+            destination_block_ids: destination[block_range].to_vec(),
         });
         source_leases.insert(resource, pins);
     }
@@ -381,6 +462,40 @@ fn searched_bundle_plan(
         source_leases,
         inflight_hashes,
     ))
+}
+
+fn searched_resource_block_range(
+    requirement: &ResourceRequirement,
+    computed: usize,
+    boundary: usize,
+    source_blocks: usize,
+    destination_blocks: usize,
+) -> Result<std::ops::Range<usize>, LeaderEngineError> {
+    let resource = requirement.resource();
+    match requirement.role() {
+        ResourceRole::PrefixHistory => {
+            let native = requirement.native_block_tokens().get() as usize;
+            let first_block = computed / native;
+            let end_block = boundary.div_ceil(native);
+            if first_block >= end_block
+                || source_blocks < end_block
+                || destination_blocks < end_block
+            {
+                return Err(invalid_bundle(format!(
+                    "resource {resource:?} cannot cover native block range {first_block}..{end_block}"
+                )));
+            }
+            Ok(first_block..end_block)
+        }
+        ResourceRole::BoundaryCapsule => {
+            if source_blocks != 1 || destination_blocks != 1 {
+                return Err(invalid_bundle(format!(
+                    "boundary capsule {resource:?} requires exactly one source and one destination; got {source_blocks} and {destination_blocks}"
+                )));
+            }
+            Ok(0..1)
+        }
+    }
 }
 
 fn invalid_bundle(reason: impl Into<String>) -> LeaderEngineError {

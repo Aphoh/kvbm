@@ -12,12 +12,13 @@ use std::sync::Arc;
 
 use axum::Router;
 use futures::future::BoxFuture;
+use kvbm_protocols::cache_manifest::RegistrationEpoch;
 use tokio_util::sync::CancellationToken;
 use velo_ext::{InstanceId, PeerInfo};
 
 pub use crate::protocol::FeatureConfigRequirements;
-use crate::protocol::{Feature, FeatureKey, PrimaryConfig};
-use crate::registry::PeerRegistry;
+use crate::protocol::{Feature, FeatureKey, MutationCredential, PrimaryConfig};
+use crate::registry::{PeerRegistry, RegistryIncarnation};
 
 /// Client-side per-feature `kvbmctl` CLI surface. Gated behind the `kvbmctl`
 /// feature (it pulls in `clap` usage + the client trait); the default hub build
@@ -170,6 +171,39 @@ pub trait FeatureManager: Send + Sync + 'static {
         feature: &'a Feature,
     ) -> BoxFuture<'a, Result<(), FeatureError>>;
 
+    /// Hide prior owner-scoped mutation authority before the registration
+    /// transaction performs its first async operation. `registration_epoch` is
+    /// the unique transaction token as well as the lifecycle identity installed
+    /// on success. `participates` is false when a same-owner registration omits
+    /// this manager's feature. The server replays the prior registration through
+    /// this hook on rollback, so implementations must preserve old data until
+    /// finalization rather than eagerly deleting it.
+    fn stage_registration(
+        &self,
+        _instance_id: InstanceId,
+        _credential: &MutationCredential,
+        _registration_epoch: RegistrationEpoch,
+        _participates: bool,
+    ) -> Result<(), FeatureError> {
+        Ok(())
+    }
+
+    /// Bind previously staged mutation authority to the exact registry write.
+    /// [`Self::on_register_any`] runs after the hub credential commits so
+    /// managers can finalize the two-phase transition. The server rolls the
+    /// registration back if this hook fails. Managers without owner-scoped
+    /// mutations keep the default no-op.
+    fn commit_registration(
+        &self,
+        _instance_id: InstanceId,
+        _credential: &MutationCredential,
+        _registration_epoch: RegistrationEpoch,
+        _incarnation: RegistryIncarnation,
+        _participates: bool,
+    ) -> Result<(), FeatureError> {
+        Ok(())
+    }
+
     /// Called once per successful `register_instance` for *every* attached
     /// manager, regardless of which [`Feature`] payloads the client declared.
     /// Default no-op — managers opt in to discover post-registration state
@@ -183,6 +217,7 @@ pub trait FeatureManager: Send + Sync + 'static {
         &'a self,
         _instance_id: InstanceId,
         _peer: &'a PeerInfo,
+        _incarnation: RegistryIncarnation,
     ) -> BoxFuture<'a, ()> {
         Box::pin(async {})
     }

@@ -32,8 +32,8 @@ pub use index::PositionalIndex;
 pub use manager::IndexerManager;
 pub use protocol::{
     BUNDLE_INVALIDATE_HANDLER, BUNDLE_PUBLISH_HANDLER, BUNDLE_QUERY_HANDLER,
-    BundleAdvertisementRecord, BundleInvalidateRequest, BundlePublishRequest, BundleQueryHit,
-    BundleQueryMissReason, BundleQueryOutcome, BundleQueryRequest, ByPositionResponse,
-    FindBlocksHit, IndexEntry, IndexerConfigResponse, InstancesResponse, QUERY_HANDLER,
-    QueryRequest, QueryResponse, ROUTE_PREFIX,
+    BundleAdvertisementRecord, BundleInvalidateRequest, BundleInvalidationRecord,
+    BundlePublishRequest, BundleQueryHit, BundleQueryMissReason, BundleQueryOutcome,
+    BundleQueryRequest, ByPositionResponse, FindBlocksHit, IndexEntry, IndexerConfigResponse,
+    InstancesResponse, QUERY_HANDLER, QueryRequest, QueryResponse, ROUTE_PREFIX,
 };

@@ -34,11 +34,9 @@ use kvbm_protocols::control::{
     MetricsSnapshotRequest, ModuleId, ResetRequest,
 };
 use serde::{Deserialize, Serialize};
-use tokio::task::JoinHandle;
-use tokio::time::MissedTickBehavior;
-use tokio_util::sync::CancellationToken;
 use velo_ext::{InstanceId, PeerInfo};
 
+use super::module_refresh::{ModuleRefreshRuntime, ModuleTarget};
 use crate::features::http::{
     control_error_response, error_response, json_response, ok_response, service_unavailable,
 };
@@ -46,21 +44,7 @@ use crate::features::p2p::P2pManager;
 use crate::features::{FeatureError, FeatureManager, HubContext};
 use crate::handlers::{HEARTBEAT_HANDLER, HeartbeatAck, HeartbeatRequest};
 use crate::protocol::{self, Feature, FeatureKey, MetricsFanoutResponse, MetricsInstanceEntry};
-use crate::registry::PeerRegistry;
-
-/// Periodic refresh interval for the modules cache. Picks up module-set
-/// changes that happen after initial discovery (currently leaders bake
-/// modules at engine init, but the refresh keeps the cache aligned with
-/// any future hot-install).
-const MODULES_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
-
-/// On-register fetch backoff schedule for the modules cache. Three attempts;
-/// the leader's control plane is normally ready well before the first delay.
-const FETCH_BACKOFF: &[Duration] = &[
-    Duration::from_millis(500),
-    Duration::from_secs(2),
-    Duration::from_secs(5),
-];
+use crate::registry::{PeerRegistry, RegistryIncarnation};
 
 /// Per-leader budget for the `/v1/metrics` fanout. A leader that doesn't
 /// answer within this window becomes a per-instance `error: "timeout..."`
@@ -73,6 +57,7 @@ const METRICS_FANOUT_PER_LEADER: Duration = Duration::from_secs(2);
 struct ModulesEntry {
     modules: Vec<ModuleId>,
     fetched_at: Instant,
+    incarnation: RegistryIncarnation,
 }
 
 /// Origin of a cached describe entry.
@@ -92,6 +77,7 @@ struct DescribeEntry {
     payload: InstanceDescription,
     received_at: Instant,
     source: DescribeSource,
+    incarnation: RegistryIncarnation,
 }
 
 /// Bridges hub HTTP control routes to per-leader velo handlers and caches
@@ -114,10 +100,6 @@ struct DescribeEntry {
 pub struct ControlPlaneManager {
     velo: OnceLock<Arc<velo::Velo>>,
     registry: OnceLock<Arc<dyn PeerRegistry>>,
-    /// Shutdown token forked from the hub master. Stored separately from
-    /// `HubContext` because background tasks spawned by `on_register_any`
-    /// need access without holding `&HubContext`.
-    cancel: OnceLock<CancellationToken>,
     /// Per-instance `list_modules` cache. `std::sync::RwLock` is appropriate
     /// here: writes are uncontended, entries are tiny, and the sync trait
     /// method [`FeatureManager::on_unregister`] can drop entries without
@@ -130,9 +112,9 @@ pub struct ControlPlaneManager {
     /// `registered_secs_ago` in `503 describe_pending` responses so the UI
     /// can tell whether the leader is "still warming up" or genuinely silent.
     registered_at: Arc<RwLock<HashMap<InstanceId, Instant>>>,
-    /// Periodic refresh task handle. Set in `attach`; aborted on hub
-    /// shutdown via `cancel`.
-    refresh_task: OnceLock<JoinHandle<()>>,
+    /// Bounded, cancellation-aware owner for periodic and registration-time
+    /// module refresh work.
+    module_refresh: OnceLock<ModuleRefreshRuntime>,
 
     /// Optional reference to the hub's `P2pManager`. Set post-construction
     /// via [`Self::set_p2p_manager`] by the production binary and test
@@ -155,11 +137,10 @@ impl ControlPlaneManager {
         Self {
             velo: OnceLock::new(),
             registry: OnceLock::new(),
-            cancel: OnceLock::new(),
             modules_cache: Arc::new(RwLock::new(HashMap::new())),
             describe_cache: Arc::new(RwLock::new(HashMap::new())),
             registered_at: Arc::new(RwLock::new(HashMap::new())),
-            refresh_task: OnceLock::new(),
+            module_refresh: OnceLock::new(),
             p2p_manager: OnceLock::new(),
         }
     }
@@ -177,22 +158,24 @@ impl ControlPlaneManager {
     /// Snapshot of the cached describe payload for `instance_id`. Returns
     /// `None` if no leader has pushed and no pull has succeeded yet.
     pub fn describe_for(&self, instance_id: InstanceId) -> Option<InstanceDescription> {
-        self.describe_cache
-            .read()
-            .ok()?
-            .get(&instance_id)
-            .map(|e| e.payload.clone())
+        let cache = self.describe_cache.read().ok()?;
+        let entry = cache.get(&instance_id)?;
+        self.registry
+            .get()?
+            .is_current(instance_id, entry.incarnation)
+            .then(|| entry.payload.clone())
     }
 
     /// Snapshot of the cached module set for `instance_id`. Returns `None`
     /// when the entry hasn't been fetched yet (treat as "unknown — pass
     /// through to velo", not as "module absent").
     pub fn modules_for(&self, instance_id: InstanceId) -> Option<Vec<ModuleId>> {
-        self.modules_cache
-            .read()
-            .ok()?
-            .get(&instance_id)
-            .map(|e| e.modules.clone())
+        let cache = self.modules_cache.read().ok()?;
+        let entry = cache.get(&instance_id)?;
+        self.registry
+            .get()?
+            .is_current(instance_id, entry.incarnation)
+            .then(|| entry.modules.clone())
     }
 
     /// Is `module` known to be enabled on `instance_id`?
@@ -227,55 +210,39 @@ impl FeatureManager for ControlPlaneManager {
     fn attach<'a>(&'a self, ctx: HubContext) -> BoxFuture<'a, Result<(), FeatureError>> {
         Box::pin(async move {
             let _ = self.registry.set(ctx.registry.clone());
-            let _ = self.cancel.set(ctx.cancel.clone());
             if let Some(v) = ctx.velo.clone() {
+                let self_id = v.instance_id();
+                let messenger = v.messenger().clone();
                 let _ = self.velo.set(v);
+                let cache = Arc::clone(&self.modules_cache);
+                let commit_registry = Arc::clone(&ctx.registry);
+                let module_refresh = ModuleRefreshRuntime::new(
+                    ctx.cancel.clone(),
+                    Arc::clone(&ctx.registry),
+                    self_id,
+                    messenger,
+                    move |target, modules| {
+                        commit_modules_if_registered(
+                            &cache,
+                            Some(&commit_registry),
+                            target.instance_id(),
+                            target.incarnation(),
+                            modules,
+                        );
+                    },
+                );
+                module_refresh.spawn_periodic();
+                self.module_refresh.set(module_refresh).map_err(|_| {
+                    FeatureError::Other(anyhow::anyhow!(
+                        "control-plane module refresh runtime was already attached"
+                    ))
+                })?;
             } else {
                 tracing::warn!(
                     "ControlPlaneManager: hub has no velo transport — \
                      control routes will return 503 and modules cache will stay empty"
                 );
             }
-
-            // Periodic refresh — picks up hot-installed modules and recovers
-            // entries lost to transient `list_modules` failures during register.
-            let cache = self.modules_cache.clone();
-            let registry = ctx.registry.clone();
-            let velo = ctx.velo.clone();
-            let cancel = ctx.cancel.clone();
-            // Skip the hub's own self-entry — it has no control handlers, so
-            // the call is a guaranteed waste.
-            let self_id = ctx.velo.as_ref().map(|v| v.instance_id());
-            let handle = tokio::spawn(async move {
-                let mut ticker = tokio::time::interval(MODULES_REFRESH_INTERVAL);
-                ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-                // Skip the initial immediate tick — registration-time fetch
-                // already covers the first poll.
-                ticker.tick().await;
-                loop {
-                    tokio::select! {
-                        _ = ticker.tick() => {}
-                        _ = cancel.cancelled() => return,
-                    }
-                    let Some(v) = velo.as_ref() else { continue };
-                    let ids: Vec<InstanceId> = registry
-                        .list()
-                        .into_iter()
-                        .map(|p| p.instance_id())
-                        .filter(|id| Some(*id) != self_id)
-                        .collect();
-                    for id in ids {
-                        if cancel.is_cancelled() {
-                            return;
-                        }
-                        let client = LeaderControlClient::new(v.messenger().clone(), id);
-                        if let Ok(modules) = client.list_modules().await {
-                            commit_modules_if_registered(&cache, Some(&registry), id, modules);
-                        }
-                    }
-                }
-            });
-            let _ = self.refresh_task.set(handle);
             Ok(())
         })
     }
@@ -301,6 +268,7 @@ impl FeatureManager for ControlPlaneManager {
         &'a self,
         instance_id: InstanceId,
         _peer: &'a PeerInfo,
+        incarnation: RegistryIncarnation,
     ) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             // Record the registration timestamp so `503 describe_pending`
@@ -309,60 +277,21 @@ impl FeatureManager for ControlPlaneManager {
             if let Ok(mut w) = self.registered_at.write() {
                 w.insert(instance_id, Instant::now());
             }
-            // Skip when the hub has no velo — the leader is unreachable.
-            let Some(velo) = self.velo.get().cloned() else {
+            let Some(module_refresh) = self.module_refresh.get() else {
                 return;
             };
             // Skip the hub's own self-registration — no control handlers.
             // The HTTP register path won't trigger this for the hub today
             // (hub self-registers via the registry trait), but defensive
             // symmetry with the refresh loop is cheap.
-            if instance_id == velo.instance_id() {
+            if self
+                .velo
+                .get()
+                .is_some_and(|velo| instance_id == velo.instance_id())
+            {
                 return;
             }
-            let cache = self.modules_cache.clone();
-            let cancel = self.cancel.get().cloned().unwrap_or_default();
-            let registry = self.registry.get().cloned();
-            // Fan out the fetch into a background task so registration is
-            // not blocked by leader control-plane latency.
-            tokio::spawn(async move {
-                let client = LeaderControlClient::new(velo.messenger().clone(), instance_id);
-                for (attempt, delay) in FETCH_BACKOFF.iter().enumerate() {
-                    if cancel.is_cancelled() {
-                        return;
-                    }
-                    match client.list_modules().await {
-                        Ok(modules) => {
-                            commit_modules_if_registered(
-                                &cache,
-                                registry.as_ref(),
-                                instance_id,
-                                modules,
-                            );
-                            tracing::debug!(
-                                instance = %instance_id, attempt,
-                                "control_plane: modules cached on register"
-                            );
-                            return;
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                instance = %instance_id, attempt, error = %e,
-                                "control_plane: list_modules failed, retrying"
-                            );
-                            tokio::select! {
-                                _ = tokio::time::sleep(*delay) => {}
-                                _ = cancel.cancelled() => return,
-                            }
-                        }
-                    }
-                }
-                tracing::warn!(
-                    instance = %instance_id,
-                    "control_plane: list_modules failed after backoff; cache stays empty \
-                     until the periodic refresh"
-                );
-            });
+            module_refresh.spawn_on_register(ModuleTarget::new(instance_id, incarnation));
         })
     }
 
@@ -417,6 +346,10 @@ async fn core_describe_instance(
     Path(instance_id): Path<InstanceId>,
     _body: Option<Json<DescribeInstanceRequest>>,
 ) -> Response {
+    let incarnation = match registered_incarnation(&mgr, instance_id) {
+        Ok(incarnation) => incarnation,
+        Err(response) => return response,
+    };
     let client = match leader_client(&mgr, instance_id) {
         Ok(c) => c,
         Err(resp) => return resp,
@@ -432,6 +365,7 @@ async fn core_describe_instance(
                 &mgr.describe_cache,
                 mgr.registry.get(),
                 instance_id,
+                incarnation,
                 payload.clone(),
                 DescribeSource::PullFallback,
             );
@@ -663,6 +597,10 @@ async fn get_modules(
     if !q.force
         && let Ok(cache) = mgr.modules_cache.read()
         && let Some(entry) = cache.get(&instance_id)
+        && mgr
+            .registry
+            .get()
+            .is_some_and(|registry| registry.is_current(instance_id, entry.incarnation))
     {
         return json_response(
             StatusCode::OK,
@@ -675,6 +613,10 @@ async fn get_modules(
     }
 
     // Miss (or force) — fetch inline (single attempt, no backoff).
+    let incarnation = match registered_incarnation(&mgr, instance_id) {
+        Ok(incarnation) => incarnation,
+        Err(response) => return response,
+    };
     let client = match leader_client(&mgr, instance_id) {
         Ok(c) => c,
         Err(resp) => return resp,
@@ -690,6 +632,7 @@ async fn get_modules(
                 &mgr.modules_cache,
                 mgr.registry.get(),
                 instance_id,
+                incarnation,
                 modules.clone(),
             );
             json_response(
@@ -726,9 +669,9 @@ async fn post_describe(
     let Some(registry) = mgr.registry.get() else {
         return service_unavailable("registry not attached");
     };
-    if !registry.contains(instance_id) {
+    let Some(incarnation) = registry.current_incarnation(instance_id) else {
         return error_response(StatusCode::NOT_FOUND, "instance not registered");
-    }
+    };
     // Split-brain detection: if the leader reports a different hub
     // instance_id than the one this hub thinks it is, warn (but accept
     // the push). The leader's view comes from `set_hub_instance_id`,
@@ -753,6 +696,7 @@ async fn post_describe(
         &mgr.describe_cache,
         Some(registry),
         instance_id,
+        incarnation,
         payload,
         DescribeSource::Push,
     );
@@ -777,6 +721,10 @@ async fn get_describe(
     if !q.force
         && let Ok(cache) = mgr.describe_cache.read()
         && let Some(entry) = cache.get(&instance_id)
+        && mgr
+            .registry
+            .get()
+            .is_some_and(|registry| registry.is_current(instance_id, entry.incarnation))
     {
         let body = serde_json::json!({
             "description": &entry.payload,
@@ -815,6 +763,10 @@ async fn get_describe(
     }
 
     // `force=true` — pull via velo.
+    let incarnation = match registered_incarnation(&mgr, instance_id) {
+        Ok(incarnation) => incarnation,
+        Err(response) => return response,
+    };
     let client = match leader_client(&mgr, instance_id) {
         Ok(c) => c,
         Err(resp) => return resp,
@@ -830,6 +782,7 @@ async fn get_describe(
                 &mgr.describe_cache,
                 mgr.registry.get(),
                 instance_id,
+                incarnation,
                 payload.clone(),
                 DescribeSource::PullFallback,
             );
@@ -909,14 +862,21 @@ fn commit_modules_if_registered(
     cache: &RwLock<HashMap<InstanceId, ModulesEntry>>,
     registry: Option<&Arc<dyn PeerRegistry>>,
     instance_id: InstanceId,
+    incarnation: RegistryIncarnation,
     modules: Vec<ModuleId>,
 ) {
-    commit_if_registered(cache, registry, instance_id, "list_modules", |_| {
-        ModulesEntry {
+    commit_if_registered(
+        cache,
+        registry,
+        instance_id,
+        incarnation,
+        "list_modules",
+        |_| ModulesEntry {
             modules,
             fetched_at: Instant::now(),
-        }
-    });
+            incarnation,
+        },
+    );
 }
 
 /// Insert a freshly fetched describe payload into the cache, applying the
@@ -925,16 +885,23 @@ fn commit_describe_if_registered(
     cache: &RwLock<HashMap<InstanceId, DescribeEntry>>,
     registry: Option<&Arc<dyn PeerRegistry>>,
     instance_id: InstanceId,
+    incarnation: RegistryIncarnation,
     payload: InstanceDescription,
     source: DescribeSource,
 ) {
-    commit_if_registered(cache, registry, instance_id, "describe", |_| {
-        DescribeEntry {
+    commit_if_registered(
+        cache,
+        registry,
+        instance_id,
+        incarnation,
+        "describe",
+        |_| DescribeEntry {
             payload,
             received_at: Instant::now(),
             source,
-        }
-    });
+            incarnation,
+        },
+    );
 }
 
 /// Generic "commit a freshly-fetched value into a per-instance cache, but
@@ -948,6 +915,7 @@ fn commit_if_registered<V, F>(
     cache: &RwLock<HashMap<InstanceId, V>>,
     registry: Option<&Arc<dyn PeerRegistry>>,
     instance_id: InstanceId,
+    incarnation: RegistryIncarnation,
     label: &str,
     build_value: F,
 ) where
@@ -958,14 +926,27 @@ fn commit_if_registered<V, F>(
     // happens during the narrow attach() window; production-time inserts
     // always have a registry.
     let Some(registry) = registry else { return };
-    if !registry.contains(instance_id) {
+    if !registry.is_current(instance_id, incarnation) {
         tracing::debug!(
-            instance = %instance_id, what = label,
-            "control_plane: late result dropped (instance no longer registered)"
+            instance = %instance_id, %incarnation, what = label,
+            "control_plane: late result dropped (registration incarnation changed)"
         );
         return;
     }
     w.insert(instance_id, build_value(instance_id));
+}
+
+#[allow(clippy::result_large_err)]
+fn registered_incarnation(
+    mgr: &ControlPlaneManager,
+    instance_id: InstanceId,
+) -> Result<RegistryIncarnation, Response> {
+    let Some(registry) = mgr.registry.get() else {
+        return Err(service_unavailable("registry not attached"));
+    };
+    registry
+        .current_incarnation(instance_id)
+        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "instance not registered"))
 }
 
 /// Build a `LeaderControlClient` for `instance_id`, validating velo + registry
