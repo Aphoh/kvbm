@@ -106,7 +106,7 @@ use crate::manager::BlockManager;
 use crate::sequence::{BlockSequence, LogicalBlockAssignmentError, LogicalBlockAssignments};
 use crate::{BlockId, KvbmSequenceHashProvider, SequenceHash};
 
-use dynamo_tokens::Token;
+use dynamo_tokens::{SaltHash, Token};
 
 /// Manages a request's block lifecycle through direct RAII integration with
 /// [`BlockManager`], bypassing the `MoveBlock` signal protocol.
@@ -156,8 +156,24 @@ impl<T: BlockMetadata> RequestSequence<T> {
     /// [`allocate_blocks`]: Self::allocate_blocks
     /// [`complete_and_register_pending`]: Self::complete_and_register_pending
     pub fn new(tokens: Vec<Token>, max_output_tokens: usize, block_size: u32) -> Self {
+        Self::new_with_salt(tokens, max_output_tokens, block_size, None)
+    }
+
+    /// Creates a `RequestSequence` like [`new`](Self::new), additionally
+    /// seeding the sequence-hash chain with `salt_hash` (see
+    /// [`BlockSequence::new`]). Two sequences over identical tokens but
+    /// different salts produce disjoint hash chains, so their blocks never
+    /// prefix-match each other — the seat for tenant/adapter cache scoping.
+    ///
+    /// `salt_hash: None` is byte-for-byte identical to [`new`](Self::new).
+    pub fn new_with_salt(
+        tokens: Vec<Token>,
+        max_output_tokens: usize,
+        block_size: u32,
+        salt_hash: Option<SaltHash>,
+    ) -> Self {
         let num_input_tokens = tokens.len();
-        let sequence = BlockSequence::new(tokens, block_size, None);
+        let sequence = BlockSequence::new(tokens, block_size, salt_hash);
         let assignments = LogicalBlockAssignments::new();
 
         Self {
@@ -701,6 +717,33 @@ mod tests {
 
         let seq = build_prefilled(tokens, 10, BLOCK_SIZE, &manager).unwrap();
         assert_eq!(seq.prefix_matched_blocks(), 2);
+    }
+
+    #[test]
+    fn test_new_with_salt_none_is_identical_and_some_partitions_the_chain() {
+        let tokens = make_tokens(8);
+
+        // Delegation identity: `new` must equal `new_with_salt(.., None)`
+        // hash-for-hash (zero behavior change for existing callers).
+        let unsalted = RequestSequence::<TestMeta>::new(tokens.clone(), 10, BLOCK_SIZE);
+        let none_salted =
+            RequestSequence::<TestMeta>::new_with_salt(tokens.clone(), 10, BLOCK_SIZE, None);
+        let base = unsalted.sequence().all_sequence_hashes();
+        assert_eq!(base, none_salted.sequence().all_sequence_hashes());
+
+        // A salt seeds the chain at block 0, so EVERY block hash differs.
+        let salted =
+            RequestSequence::<TestMeta>::new_with_salt(tokens, 10, BLOCK_SIZE, Some(0xA5A5));
+        let salted_hashes = salted.sequence().all_sequence_hashes();
+        assert_eq!(base.len(), salted_hashes.len());
+        for (block_index, (unsalted_hash, salted_hash)) in
+            base.iter().zip(salted_hashes.iter()).enumerate()
+        {
+            assert_ne!(
+                unsalted_hash, salted_hash,
+                "salted chain must diverge at block {block_index}"
+            );
+        }
     }
 
     #[test]
