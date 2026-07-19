@@ -15,8 +15,8 @@ use std::sync::Arc;
 
 use anyhow::{Result, bail};
 
-use dynamo_memory::TensorDescriptor;
 use kvbm_common::{KvBlockLayout, KvDim, KvDimLayout, KvDimStrides};
+use kvbm_memory::TensorDescriptor;
 use kvbm_physical::layout::{BlockDimension, LayoutConfig};
 
 /// Detect the permutation between a tensor's *logical* axis order
@@ -499,8 +499,8 @@ mod tests {
 
     use std::any::Any;
 
-    use dynamo_memory::nixl::NixlDescriptor;
-    use dynamo_memory::{MemoryDescriptor, StorageKind};
+    use kvbm_memory::nixl::NixlDescriptor;
+    use kvbm_memory::{MemoryDescriptor, StorageKind};
 
     #[derive(Debug)]
     struct TestTensor {

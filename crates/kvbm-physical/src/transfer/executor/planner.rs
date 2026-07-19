@@ -39,8 +39,8 @@ use anyhow::{Result, anyhow, bail};
 use cudarc::driver::CudaStream;
 use cudarc::driver::sys as cu_sys;
 use cudarc::runtime::sys::cudaStream_t;
-use dynamo_memory::nixl::{XferDescList, XferOp};
 use kvbm_kernels::MemcpyBatchMode;
+use kvbm_memory::nixl::{XferDescList, XferOp};
 
 use super::TransferContext;
 use super::{PhysicalLayout, TransferStrategy};
@@ -1496,7 +1496,7 @@ struct OwnedStagedContext {
             crate::transfer::notifications::NixlStatusChecker,
         >,
     >,
-    raw_agent: dynamo_memory::nixl::Agent,
+    raw_agent: kvbm_memory::nixl::Agent,
     nixl_agent: super::super::NixlAgent,
     stream: Arc<CudaStream>,
     /// Copied from `TransferContext` so the staged task can build a
@@ -1545,7 +1545,7 @@ impl OwnedStagedContext {
     /// Register a NIXL xfer request for polling completion.
     fn register_nixl_status(
         &self,
-        xfer_req: dynamo_memory::nixl::XferRequest,
+        xfer_req: kvbm_memory::nixl::XferRequest,
     ) -> Result<TransferCompleteNotification> {
         let new_event = self.event_system.new_event()?;
         let handle = new_event.into_handle();
@@ -2604,8 +2604,8 @@ mod tests {
     // entrypoint wrappers (`execute_planner_{cuda,nixl}_transfer`) add the
     // `physical_to_layout_view` projection and call it with the result.
 
-    use dynamo_memory::StorageKind;
     use kvbm_common::{KvDim, KvDimLayout, KvDimStrides};
+    use kvbm_memory::StorageKind;
 
     /// Build a minimal 2-axis homogeneous `LayoutView` with all axes = `kind`.
     fn homogeneous_view(kind: StorageKind) -> crate::layout::LayoutView {

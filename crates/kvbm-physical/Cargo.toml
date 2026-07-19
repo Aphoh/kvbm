@@ -10,7 +10,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-dynamo-memory = { workspace = true }
+kvbm-memory = { workspace = true }
 kvbm-common = { workspace = true }
 kvbm-kernels = { workspace = true }
 kvbm-observability = { workspace = true }
@@ -41,6 +41,6 @@ testing-kvbm = []
 testing-nixl-gds = []
 
 [dev-dependencies]
-dynamo-memory = { workspace = true, features = ["unsafe-slices"] }
+kvbm-memory = { workspace = true, features = ["unsafe-slices"] }
 rstest = "0.26"
 tokio = { workspace = true, features = ["test-util"] }

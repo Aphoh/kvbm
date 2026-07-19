@@ -1693,7 +1693,7 @@ mod tests {
         let strides = KvDimStrides::from_byte_strides(byte_strides, 2).unwrap();
         let regions: Vec<usize> = (0..4).map(|i| 0x1000_0000 + i * 0x10_0000).collect();
 
-        let axis_storage_kinds = vec![dynamo_memory::StorageKind::System; layout.dims().len()];
+        let axis_storage_kinds = vec![kvbm_memory::StorageKind::System; layout.dims().len()];
         let view = LayoutView::full(
             layout,
             strides,
@@ -1718,7 +1718,7 @@ mod tests {
         let global_coord = local_coord.with(KvDim::HeadCount, 1);
 
         let unsliced_kinds =
-            vec![dynamo_memory::StorageKind::System; view.local_layout().dims().len()];
+            vec![kvbm_memory::StorageKind::System; view.local_layout().dims().len()];
         let unsliced = LayoutView::full(
             view.local_layout().clone(), // fine — full() shape is [2,8,16,4,64] with HC=2 here
             view.byte_strides().clone(),

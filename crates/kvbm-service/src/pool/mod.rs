@@ -20,7 +20,7 @@ pub use slab::{NodeSlab, NodeSlabSnapshot};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use dynamo_memory::{
+use kvbm_memory::{
     HugepageInfo, MmappedPinnedOptions, NumaNode, NumaNodeView, Resources,
     nixl::{NixlAgent, NixlBackendConfig, NixlRegisterExt, is_stub as nixl_is_stub},
     numa::worker_pool::NumaWorkerPool,
@@ -383,8 +383,11 @@ fn allocate_slab(
     let agent = NixlAgent::from_nixl_backend_config(&agent_name, backend_config.clone())
         .map_err(|e| ServiceError::Internal(format!("build NixlAgent {agent_name}: {e:?}")))?;
 
-    let registered = storage.register(&agent, None).map_err(|_storage| {
-        ServiceError::Internal(format!("register slab with NIXL agent {agent_name} failed"))
+    let registered = storage.register(&agent, None).map_err(|e| {
+        ServiceError::Internal(format!(
+            "register slab with NIXL agent {agent_name} failed: {}",
+            e.source
+        ))
     })?;
 
     Ok(NodeSlab::new_registered(
@@ -580,7 +583,7 @@ mod tests {
             node: NumaNode(id),
             cpus,
             gpu_indices: vec![],
-            role: dynamo_memory::NumaNodeRole::HostCpu,
+            role: kvbm_memory::NumaNodeRole::HostCpu,
             total_bytes,
         }
     }

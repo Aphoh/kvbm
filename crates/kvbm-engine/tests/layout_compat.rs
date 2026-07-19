@@ -14,11 +14,11 @@
 
 use std::ops::Range;
 
-use dynamo_memory::StorageKind;
-use dynamo_memory::nixl::MemType;
 use kvbm_common::LogicalLayoutHandle;
 use kvbm_common::{BlockLayoutMode, KvBlockLayout, KvDim};
 use kvbm_engine::leader::layout_compat::check_import_compat;
+use kvbm_memory::StorageKind;
+use kvbm_memory::nixl::MemType;
 use kvbm_physical::layout::{
     BlockFormat, FullyContiguousDetails, LayoutConfig, LayoutDescriptor, LayoutTypeDetails,
     NixlMetadata, RaggedLayerSeparateDetails,

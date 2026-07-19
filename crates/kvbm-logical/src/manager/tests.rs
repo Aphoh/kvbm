@@ -124,7 +124,7 @@ mod builder_tests {
                     .frequency_tracker(FrequencyTrackingCapacity::Small.create_tracker())
                     .build(),
             )
-            .inactive_backend(decoded.clone())
+            .inactive_backend(decoded)
             .build()
             .unwrap();
 

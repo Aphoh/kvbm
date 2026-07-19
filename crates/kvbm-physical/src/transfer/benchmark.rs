@@ -375,17 +375,17 @@ pub(crate) enum BenchmarkCandidate {
         /// Copy descriptors (coalesced op list from the planner).
         ops: Vec<CopyOp>,
         /// NIXL agent driving this transfer (the "local" agent).
-        nixl_agent: dynamo_memory::nixl::NixlAgent,
+        nixl_agent: kvbm_memory::nixl::NixlAgent,
         /// Source layout metadata (agent name, mem_type, device_id).
         src_agent_name: String,
-        src_mem_type: dynamo_memory::nixl::MemType,
+        src_mem_type: kvbm_memory::nixl::MemType,
         src_device_id: u64,
         /// Destination layout metadata.
         dst_agent_name: String,
-        dst_mem_type: dynamo_memory::nixl::MemType,
+        dst_mem_type: kvbm_memory::nixl::MemType,
         dst_device_id: u64,
         /// Transfer direction (Read = pull, Write = push).
-        xfer_op: dynamo_memory::nixl::XferOp,
+        xfer_op: kvbm_memory::nixl::XferOp,
         /// When `true`, swap src/dst descriptor lists at the NIXL layer
         /// (NixlReadFlipped / NixlWriteFlipped strategies).
         flip_descriptors: bool,
@@ -567,17 +567,17 @@ fn dispatch_direct_dma_ops(ops: &[CopyOp], stream: &Arc<CudaStream>) -> Result<(
 #[allow(clippy::too_many_arguments)]
 fn dispatch_nixl_dma_ops_timed(
     ops: &[CopyOp],
-    nixl_agent: &dynamo_memory::nixl::NixlAgent,
+    nixl_agent: &kvbm_memory::nixl::NixlAgent,
     src_agent_name: &str,
-    src_mem_type: dynamo_memory::nixl::MemType,
+    src_mem_type: kvbm_memory::nixl::MemType,
     src_device_id: u64,
     dst_agent_name: &str,
-    dst_mem_type: dynamo_memory::nixl::MemType,
+    dst_mem_type: kvbm_memory::nixl::MemType,
     dst_device_id: u64,
-    xfer_op: dynamo_memory::nixl::XferOp,
+    xfer_op: kvbm_memory::nixl::XferOp,
     flip_descriptors: bool,
 ) -> Result<(&'static str, u64)> {
-    use dynamo_memory::nixl::{XferDescList, XferOp};
+    use kvbm_memory::nixl::{XferDescList, XferOp};
 
     // Locality check (mirrors execute_planner_nixl_transfer).
     let local_name = nixl_agent.name();
@@ -763,14 +763,14 @@ mod tests {
         // NixlDirectDma maps to "DirectDma" (same class, different route).
         let nixl = BenchmarkCandidate::NixlDirectDma {
             ops: vec![],
-            nixl_agent: dynamo_memory::nixl::NixlAgent::new("bench-test-cls").expect("agent"),
+            nixl_agent: kvbm_memory::nixl::NixlAgent::new("bench-test-cls").expect("agent"),
             src_agent_name: "a".to_string(),
-            src_mem_type: dynamo_memory::nixl::MemType::Dram,
+            src_mem_type: kvbm_memory::nixl::MemType::Dram,
             src_device_id: 0,
             dst_agent_name: "b".to_string(),
-            dst_mem_type: dynamo_memory::nixl::MemType::Dram,
+            dst_mem_type: kvbm_memory::nixl::MemType::Dram,
             dst_device_id: 0,
-            xfer_op: dynamo_memory::nixl::XferOp::Read,
+            xfer_op: kvbm_memory::nixl::XferOp::Read,
             flip_descriptors: false,
         };
         assert_eq!(nixl.class_name(), "DirectDma");
@@ -793,19 +793,19 @@ mod tests {
         // Construct the candidate explicitly to trigger the check.
 
         // Agent named "local-agent" is local; src_agent_name is "remote-agent".
-        let nixl_agent = dynamo_memory::nixl::NixlAgent::new("local-agent-write-check")
+        let nixl_agent = kvbm_memory::nixl::NixlAgent::new("local-agent-write-check")
             .expect("NixlAgent::new must succeed");
 
         let _candidate = BenchmarkCandidate::NixlDirectDma {
             ops: vec![],
             nixl_agent: nixl_agent.clone(),
             src_agent_name: "remote-agent".to_string(),
-            src_mem_type: dynamo_memory::nixl::MemType::Dram,
+            src_mem_type: kvbm_memory::nixl::MemType::Dram,
             src_device_id: 0,
             dst_agent_name: "local-agent-write-check".to_string(),
-            dst_mem_type: dynamo_memory::nixl::MemType::Dram,
+            dst_mem_type: kvbm_memory::nixl::MemType::Dram,
             dst_device_id: 0,
-            xfer_op: dynamo_memory::nixl::XferOp::Write,
+            xfer_op: kvbm_memory::nixl::XferOp::Write,
             flip_descriptors: false,
         };
 
@@ -824,12 +824,12 @@ mod tests {
             &[],
             &nixl_agent,
             "remote-agent", // src_agent_name (not local)
-            dynamo_memory::nixl::MemType::Dram,
+            kvbm_memory::nixl::MemType::Dram,
             0,
             "local-agent-write-check", // dst_agent_name
-            dynamo_memory::nixl::MemType::Dram,
+            kvbm_memory::nixl::MemType::Dram,
             0,
-            dynamo_memory::nixl::XferOp::Write,
+            kvbm_memory::nixl::XferOp::Write,
             false,
         )
         .unwrap_err();
@@ -848,19 +848,19 @@ mod tests {
     /// with a descriptive error.
     #[test]
     fn benchmark_nixl_locality_read_requires_local_dst() {
-        let nixl_agent = dynamo_memory::nixl::NixlAgent::new("local-agent-read-check")
+        let nixl_agent = kvbm_memory::nixl::NixlAgent::new("local-agent-read-check")
             .expect("NixlAgent::new must succeed");
 
         let err = dispatch_nixl_dma_ops_timed(
             &[],
             &nixl_agent,
             "local-agent-read-check", // src_agent_name
-            dynamo_memory::nixl::MemType::Dram,
+            kvbm_memory::nixl::MemType::Dram,
             0,
             "remote-agent", // dst_agent_name (not local)
-            dynamo_memory::nixl::MemType::Dram,
+            kvbm_memory::nixl::MemType::Dram,
             0,
-            dynamo_memory::nixl::XferOp::Read,
+            kvbm_memory::nixl::XferOp::Read,
             false,
         )
         .unwrap_err();

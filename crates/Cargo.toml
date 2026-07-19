@@ -12,6 +12,7 @@ members = [
     "kvbm-hub",
     "kvbm-kernels",
     "kvbm-logical",
+    "kvbm-memory",
     "kvbm-observability",
     "kvbm-physical",
     "kvbm-protocols",
@@ -41,6 +42,7 @@ kvbm-engine = { path = "kvbm-engine" }
 kvbm-hub = { path = "kvbm-hub" }
 kvbm-kernels = { path = "kvbm-kernels" }
 kvbm-logical = { path = "kvbm-logical" }
+kvbm-memory = { path = "kvbm-memory" }
 kvbm-observability = { path = "kvbm-observability" }
 kvbm-physical = { path = "kvbm-physical" }
 kvbm-protocols = { path = "kvbm-protocols" }
@@ -52,7 +54,6 @@ kvbm-service = { path = "kvbm-service" }
 # feature pulls `dynamo-runtime` (and its dynamo-core closure); kvbm-consolidator
 # only consumes `dynamo_kv_router::zmq_wire`, which is available without features.
 dynamo-tokens = { git = "https://github.com/ai-dynamo/dynamo", branch = "ryan/kvbm-engine-service" }
-dynamo-memory = { git = "https://github.com/ai-dynamo/dynamo", branch = "ryan/kvbm-engine-service" }
 dynamo-kv-router = { git = "https://github.com/ai-dynamo/dynamo", branch = "ryan/kvbm-engine-service" }
 dynamo-kv-hashing = { git = "https://github.com/ai-dynamo/dynamo", branch = "ryan/kvbm-engine-service" }
 
@@ -79,6 +80,7 @@ hyper-util = { version = "=0.1.17" }
 indexmap = { version = "2" }
 libc = { version = "0.2" }
 libloading = "0.8.9"
+nixl-sys = { version = "=1.0.1" } # the single graph-wide NIXL binding pin (kvbm-memory inherits via workspace = true)
 oneshot = { version = "0.1.13", features = ["std", "async"] }
 parking_lot = "0.12.5"
 prometheus = { version = "0.14" }

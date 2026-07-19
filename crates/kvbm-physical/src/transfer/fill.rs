@@ -13,7 +13,7 @@ use super::PhysicalLayout;
 use aligned_vec::{AVec, avec};
 use anyhow::{Result, anyhow};
 use cudarc::runtime::sys::{cudaMemcpy, cudaMemcpyKind};
-use dynamo_memory::StorageKind;
+use kvbm_memory::StorageKind;
 
 use std::{
     fs::File,

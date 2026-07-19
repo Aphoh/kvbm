@@ -11,8 +11,8 @@ use crate::transfer::{can_use_whole_block_transfer, validate_layout_compatibilit
 use anyhow::{Result, anyhow};
 use cudarc::driver::{CudaStream, result as cuda_result};
 use cudarc::runtime::sys::cudaStream_t;
-use dynamo_memory::CudaMemPool;
 use kvbm_kernels::MemcpyBatchMode;
+use kvbm_memory::CudaMemPool;
 use std::ffi::c_void;
 use std::ops::Range;
 use std::sync::Arc;

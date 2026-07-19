@@ -6,7 +6,7 @@
 use anyhow::{Result, anyhow};
 use std::sync::Arc;
 
-use dynamo_memory::TensorDescriptor;
+use kvbm_memory::TensorDescriptor;
 
 /// Format of tensor layout (for future TP translation).
 #[allow(clippy::upper_case_acronyms)]

@@ -4,7 +4,7 @@
 //! Build KVBM runtime *primitives* from a [`kvbm_config`].
 //!
 //! This crate exists to keep [`kvbm_config`] pure: the config structs there
-//! carry no `velo` or `dynamo-memory` (CUDA) dependency, so config-only
+//! carry no `velo` or `kvbm-memory` (CUDA) dependency, so config-only
 //! consumers — the `kvbm_hub` server, `kvbmctl` validation — link without
 //! pulling a transport stack or CUDA. The actual construction of velo
 //! transports/messengers and NIXL backends from that config lives here, as
@@ -19,7 +19,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use kvbm_config::{DiscoveryConfig, MessengerConfig, NixlConfig};
 
-use dynamo_memory::nixl::NixlBackendConfig;
+use kvbm_memory::nixl::NixlBackendConfig;
 
 /// Build a [`velo::Velo`] instance from a [`MessengerConfig`].
 ///
@@ -137,7 +137,7 @@ pub async fn build_messenger(cfg: &MessengerConfig) -> Result<Arc<velo::Messenge
     Ok(velo.messenger().clone())
 }
 
-/// Convert a [`NixlConfig`] into a [`NixlBackendConfig`] (the dynamo-memory
+/// Convert a [`NixlConfig`] into a [`NixlBackendConfig`] (the kvbm-memory
 /// type the NIXL agent is built from).
 ///
 /// A free function rather than a `From` impl: the orphan rule forbids

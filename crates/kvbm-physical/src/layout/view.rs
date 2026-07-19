@@ -28,11 +28,11 @@
 use std::collections::HashMap;
 
 use anyhow::{Result, bail};
-use dynamo_memory::StorageKind;
 use kvbm_common::{
     AxisExtent, AxisIntersection, AxisSlice, CoordByLabel, KvDim, KvDimLayout, KvDimStrides,
     LayoutSignature, intersect_axis,
 };
+use kvbm_memory::StorageKind;
 
 /// A sliced, stride-aware, label-driven view over a registered KV layout.
 ///

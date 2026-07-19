@@ -444,8 +444,8 @@ async fn drain_replica_phase(
 
 #[cfg(test)]
 mod trait_tests {
-    use dynamo_memory::StorageKind;
     use kvbm_config::KvbmConfig;
+    use kvbm_memory::StorageKind;
     use kvbm_physical::testing::{create_fc_layout, create_test_agent, create_transfer_manager};
     use kvbm_physical::transfer::{FillPattern, fill_blocks};
 

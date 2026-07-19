@@ -59,14 +59,14 @@ pub(crate) mod validation;
 mod tests;
 
 // Re-export StorageKind
-pub use dynamo_memory::StorageKind;
+pub use kvbm_memory::StorageKind;
 
 pub use capabilities::TransferCapabilities;
 pub use checksum::{BlockChecksum, compute_block_checksums, compute_layer_checksums};
 pub use context::{TransferCompleteNotification, TransferConfig};
-pub use dynamo_memory::nixl::NixlAgent;
 pub use fill::{FillPattern, fill_blocks, fill_layers};
 pub use integrity::{PayloadDigest, compute_host_block_digests};
+pub use kvbm_memory::nixl::NixlAgent;
 pub use options::{TransferOptions, TransferOptionsBuilder};
 // AB-1d: TransferSelection is the input shape for sliced cross-leader
 // transfers. Exposed for the cross-parallelism dispatcher (AB-2) which

@@ -5,7 +5,7 @@
 
 use anyhow::{Result, anyhow, ensure};
 use blake3::Hasher;
-use dynamo_memory::StorageKind;
+use kvbm_memory::StorageKind;
 use serde::{Deserialize, Serialize};
 
 use super::PhysicalLayout;

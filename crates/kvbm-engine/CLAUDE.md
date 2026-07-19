@@ -70,7 +70,7 @@ Module docs live in `docs/` and are included via `#[doc = include_str!("../docs/
 
 ### Workspace Dependencies
 
-Internal crates: `kvbm-common`, `kvbm-config`, `kvbm-kernels`, `kvbm-logical`, `kvbm-physical`, `velo`, `dynamo-tokens`, `dynamo-memory`.
+Internal crates: `kvbm-common`, `kvbm-config`, `kvbm-kernels`, `kvbm-logical`, `kvbm-physical`, `kvbm-memory`, `velo`, `dynamo-tokens`.
 
 ## Offload Module Governance
 

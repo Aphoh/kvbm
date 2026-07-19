@@ -12,8 +12,8 @@ use derive_builder::Builder;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use dynamo_memory::CudaMemPool;
-use dynamo_memory::nixl::{NixlAgent, NixlBackendConfig, XferRequest};
+use kvbm_memory::CudaMemPool;
+use kvbm_memory::nixl::{NixlAgent, NixlBackendConfig, XferRequest};
 use kvbm_observability::SharedKvbmObservability;
 use velo::EventManager;
 

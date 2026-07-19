@@ -6,8 +6,8 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use dynamo_memory::nixl::NixlAgent;
 use kvbm_config::KvbmConfig;
+use kvbm_memory::nixl::NixlAgent;
 use kvbm_observability::{KvbmObservability, SharedKvbmObservability};
 use tokio::runtime::{Handle, Runtime};
 use velo::{Messenger, Velo};

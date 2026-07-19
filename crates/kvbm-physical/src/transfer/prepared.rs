@@ -27,8 +27,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow, bail};
-use dynamo_memory::nixl::XferDescList;
 use kvbm_common::{AxisIntersection, KvDim};
+use kvbm_memory::nixl::XferDescList;
 
 use crate::BlockId;
 use crate::manager::LayoutHandle;

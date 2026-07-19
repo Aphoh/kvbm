@@ -27,11 +27,15 @@ or modify dynamo from here.
 
 ## External dependencies
 
-- Four **git** deps on dynamo, pinned to branch `ryan/kvbm-engine-service`:
-  `dynamo-tokens`, `dynamo-memory`, `dynamo-kv-router`, `dynamo-kv-hashing` (the latter two
+- Three **git** deps on dynamo, pinned to branch `ryan/kvbm-engine-service`:
+  `dynamo-tokens`, `dynamo-kv-router`, `dynamo-kv-hashing` (the latter two
   via `kvbm-consolidator`). The dependency only runs kvbm → dynamo; dynamo does not depend
   on this repo. Keep that branch fetchable; prefer pinning to an immutable rev for CI
   reproducibility.
+- `kvbm-memory` is a locally-owned crate (`crates/kvbm-memory`), forked from
+  `dynamo-memory` and no longer resolved via git. The single graph-wide NIXL
+  binding pin (`nixl-sys = "=1.0.1"`) is declared once in `crates/Cargo.toml`'s
+  `[workspace.dependencies]`; `kvbm-memory` inherits it via `nixl-sys = { workspace = true }`.
 - `velo` / `velo-ext` are registry deps.
 
 ## Build

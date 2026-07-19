@@ -24,7 +24,7 @@ pub struct ServiceMetrics {
     pub unregister_total: IntCounter,
     pub reset_total: IntCounter,
     /// Bytes allocated to the host-memory pool per `{node, tier}` label
-    /// pair. `tier` is the [`dynamo_memory::HugepageTier`] the slab landed
+    /// pair. `tier` is the [`kvbm_memory::HugepageTier`] the slab landed
     /// on (`Explicit`, `Thp`, or `None`).
     pub pool_bytes_total: IntGaugeVec,
     /// Number of slabs the host-memory pool created per `{tier}`.

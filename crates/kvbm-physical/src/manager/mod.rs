@@ -32,10 +32,10 @@ use crate::transfer::executor::TransferOptionsInternal;
 use crate::transfer::options::TransferOptions;
 use crate::{BlockId, SequenceHash};
 use anyhow::{Result, anyhow, bail};
-use dynamo_memory::StorageKind;
-use dynamo_memory::nixl::NixlAgent;
 use kvbm_common::KvbmTransferRoute;
 use kvbm_common::LogicalLayoutHandle;
+use kvbm_memory::StorageKind;
+use kvbm_memory::nixl::NixlAgent;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, RwLock};
@@ -648,7 +648,7 @@ impl TransferManager {
     /// Get the CUDA memory pool (for testing only).
     #[cfg(test)]
     #[expect(dead_code)]
-    pub(crate) fn cuda_pool(&self) -> &std::sync::Arc<dynamo_memory::CudaMemPool> {
+    pub(crate) fn cuda_pool(&self) -> &std::sync::Arc<kvbm_memory::CudaMemPool> {
         self.context.cuda_pool()
     }
 }
@@ -966,7 +966,7 @@ impl LayoutRegistry {
 mod tests {
     use super::*;
     use crate::layout::LayoutConfig;
-    use dynamo_memory::nixl::NixlAgent;
+    use kvbm_memory::nixl::NixlAgent;
 
     fn make_test_agent(name: &str) -> NixlAgent {
         NixlAgent::new(name).expect("failed to create agent")

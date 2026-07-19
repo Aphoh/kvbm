@@ -35,7 +35,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use derive_builder::Builder;
-use dynamo_memory::TensorDescriptor;
+use kvbm_memory::TensorDescriptor;
 
 use kvbm_physical::transfer::context::TokioRuntime;
 
@@ -152,7 +152,7 @@ impl PendingWorkerStateBuilder {
     /// - If first tensor is not on a CUDA device
     pub fn build(mut self) -> Result<PendingWorkerState> {
         use anyhow::{bail, ensure};
-        use dynamo_memory::TensorDescriptorExt;
+        use kvbm_memory::TensorDescriptorExt;
 
         // Validate tensors first (before build_internal which requires cuda_device_id)
         let tensors = self

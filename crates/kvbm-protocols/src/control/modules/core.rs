@@ -119,7 +119,7 @@ pub struct LayoutDescription {
     /// `kvbm_physical::layout::config::LayoutConfig`.
     pub config: LayoutConfigDescription,
     /// Where this layout's memory lives — wire mirror of
-    /// `dynamo_memory::StorageKind`. Surfaces GPU device index for `Device`,
+    /// `kvbm_memory::StorageKind`. Surfaces GPU device index for `Device`,
     /// the disk handle for `Disk`, etc.
     pub location: StorageKindDescription,
     /// `LayoutTypeDetails` discriminant — `"fully_contiguous"` or
@@ -135,7 +135,7 @@ pub struct LayoutDescription {
     pub total_bytes: usize,
 }
 
-/// Wire mirror of `dynamo_memory::StorageKind`. Same variants, snake_case
+/// Wire mirror of `kvbm_memory::StorageKind`. Same variants, snake_case
 /// serde so JSON keys match the rest of the control plane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

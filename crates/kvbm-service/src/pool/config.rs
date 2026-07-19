@@ -8,14 +8,14 @@
 
 use std::collections::HashMap;
 
-use dynamo_memory::HugepageMode;
+use kvbm_memory::HugepageMode;
 use serde::{Deserialize, Serialize};
 
 /// Sizing policy for the host-memory pool.
 ///
 /// All variants size **per host-CPU NUMA node** —
 /// [`crate::pool::HostMemoryPool`] iterates
-/// [`dynamo_memory::Resources::host_memory_nodes`] and creates one slab per
+/// [`kvbm_memory::Resources::host_memory_nodes`] and creates one slab per
 /// such node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PoolSizing {
@@ -89,7 +89,7 @@ pub struct PoolConfig {
     /// `["UCX"]` — UCX is required for remote workers to RDMA into the
     /// pool. If this list is non-empty it takes precedence; if empty,
     /// the pool falls back to reading `DYN_KVBM_NIXL_BACKEND_*` env vars
-    /// via [`dynamo_memory::nixl::NixlBackendConfig::from_env`]. Clear
+    /// via [`kvbm_memory::nixl::NixlBackendConfig::from_env`]. Clear
     /// to `vec![]` together with `allow_no_nixl_backends = true` only
     /// for local-only deployments.
     #[serde(default = "default_nixl_backends")]
@@ -188,7 +188,7 @@ impl PoolConfigBuilder {
     }
 
     /// Append a NIXL backend by name (`"UCX"`, `"POSIX"`, …). Calls are
-    /// idempotent at the [`dynamo_memory::nixl::NixlAgent`] layer.
+    /// idempotent at the [`kvbm_memory::nixl::NixlAgent`] layer.
     pub fn nixl_backend(mut self, name: impl Into<String>) -> Self {
         self.cfg.backends.push(name.into());
         self

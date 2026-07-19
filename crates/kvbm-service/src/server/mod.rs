@@ -4,7 +4,7 @@
 //! Top-level service driver.
 //!
 //! [`KvbmService::start`] is the single entry point. It:
-//! 1. Discovers host resources (`dynamo_memory::resources::Resources::discover`)
+//! 1. Discovers host resources (`kvbm_memory::resources::Resources::discover`)
 //!    and uses the CUDA-visible GPU count as the slot capacity.
 //! 2. Builds the metrics registry and the registry state machine.
 //! 3. Binds the HTTP sidecar first so it can learn the actual port the OS
@@ -30,7 +30,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use dynamo_memory::resources::Resources;
+use kvbm_memory::resources::Resources;
 use tokio::net::UnixListener;
 use tokio_stream::wrappers::UnixListenerStream;
 use tokio_util::sync::CancellationToken;
@@ -283,11 +283,11 @@ fn publish_pool_metrics(metrics: &ServiceMetrics, pool: &HostMemoryPool) {
     }
 }
 
-fn hugepage_tier_label(tier: &dynamo_memory::HugepageTier) -> &'static str {
+fn hugepage_tier_label(tier: &kvbm_memory::HugepageTier) -> &'static str {
     match tier {
-        dynamo_memory::HugepageTier::Explicit { .. } => "explicit",
-        dynamo_memory::HugepageTier::Thp => "thp",
-        dynamo_memory::HugepageTier::None => "none",
+        kvbm_memory::HugepageTier::Explicit { .. } => "explicit",
+        kvbm_memory::HugepageTier::Thp => "thp",
+        kvbm_memory::HugepageTier::None => "none",
     }
 }
 

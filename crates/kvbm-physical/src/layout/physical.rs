@@ -13,7 +13,7 @@ use super::{
 };
 
 use anyhow::{Result, anyhow};
-use dynamo_memory::{
+use kvbm_memory::{
     Buffer, MemoryDescriptor, StorageKind,
     nixl::{MemType, NixlAgent, NixlDescriptor},
 };

@@ -1851,9 +1851,9 @@ mod tests {
 
     use std::ops::Range;
 
-    use dynamo_memory::StorageKind;
-    use dynamo_memory::nixl::MemType;
     use kvbm_common::{KvBlockLayout, LogicalLayoutHandle};
+    use kvbm_memory::StorageKind;
+    use kvbm_memory::nixl::MemType;
     use kvbm_physical::layout::{
         BlockFormat, FullyContiguousDetails, LayoutConfig, LayoutDescriptor, LayoutTypeDetails,
         NixlMetadata,

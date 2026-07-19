@@ -3,14 +3,10 @@
 
 [package]
 name = "kvbm-memory"
-version = "1.2.0"
+version.workspace = true
 edition = "2024"
 license = "Apache-2.0"
 description = "KV Block Manager memory layer (forked from dynamo-memory)"
-
-# TEMP (M1/M2): standalone until M3 joins the kvbm workspace; then switch deps
-# to workspace=true. See agent-docs/kvbm-memory-design.md §6.
-[workspace]
 
 [features]
 default = []
@@ -31,8 +27,8 @@ testing-all = ["testing-cuda", "testing-nixl"]
 
 [dependencies]
 anyhow = "1"
-cudarc = { version = "=0.19.3", features = ["cuda-version-from-build-system", "fallback-latest"] }
-nixl-sys = { version = "=1.0.1" }
+cudarc = { workspace = true }
+nixl-sys = { workspace = true }
 serde = { version = "1", features = ["derive", "rc"] }
 thiserror = "2.0.17"
 tracing = "0.1"

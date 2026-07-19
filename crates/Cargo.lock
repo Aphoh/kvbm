@@ -1540,23 +1540,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dynamo-memory"
-version = "1.2.0"
-source = "git+https://github.com/ai-dynamo/dynamo?branch=ryan%2Fkvbm-engine-service#bf5a008fc5f024712059bbd7a8661741f4c5aacd"
-dependencies = [
- "anyhow",
- "cudarc",
- "libc",
- "libloading 0.8.9",
- "nix 0.30.1",
- "nixl-sys",
- "offset-allocator",
- "serde",
- "thiserror 2.0.18",
- "tracing",
-]
-
-[[package]]
 name = "dynamo-tokens"
 version = "1.2.0"
 source = "git+https://github.com/ai-dynamo/dynamo?branch=ryan%2Fkvbm-engine-service#bf5a008fc5f024712059bbd7a8661741f4c5aacd"
@@ -2548,7 +2531,6 @@ dependencies = [
  "bytes",
  "derive-getters",
  "derive_builder",
- "dynamo-memory",
  "dynamo-tokens",
  "futures",
  "insta",
@@ -2557,6 +2539,7 @@ dependencies = [
  "kvbm-engine",
  "kvbm-hub",
  "kvbm-logical",
+ "kvbm-memory",
  "kvbm-physical",
  "kvbm-protocols",
  "libc",
@@ -2621,7 +2604,6 @@ dependencies = [
  "cudarc",
  "dashmap",
  "derive_builder",
- "dynamo-memory",
  "figment",
  "flume 0.11.1",
  "futures",
@@ -2629,6 +2611,7 @@ dependencies = [
  "kvbm-config",
  "kvbm-consolidator",
  "kvbm-logical",
+ "kvbm-memory",
  "kvbm-observability",
  "kvbm-physical",
  "kvbm-protocols",
@@ -2739,6 +2722,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "kvbm-memory"
+version = "1.2.0"
+dependencies = [
+ "anyhow",
+ "cudarc",
+ "libc",
+ "libloading 0.8.9",
+ "nix 0.30.1",
+ "nixl-sys",
+ "offset-allocator",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "kvbm-observability"
 version = "1.2.0"
 dependencies = [
@@ -2761,10 +2762,10 @@ dependencies = [
  "cudarc",
  "derive-getters",
  "derive_builder",
- "dynamo-memory",
  "futures",
  "kvbm-common",
  "kvbm-kernels",
+ "kvbm-memory",
  "kvbm-observability",
  "rstest 0.26.1",
  "serde",
@@ -2800,8 +2801,8 @@ name = "kvbm-runtime"
 version = "1.2.0"
 dependencies = [
  "anyhow",
- "dynamo-memory",
  "kvbm-config",
+ "kvbm-memory",
  "tracing",
  "uuid",
  "velo",
@@ -2816,11 +2817,11 @@ dependencies = [
  "axum",
  "blake3",
  "clap",
- "dynamo-memory",
  "figment",
  "futures",
  "humantime",
  "kvbm-client",
+ "kvbm-memory",
  "parking_lot",
  "prometheus",
  "prost",
@@ -3093,9 +3094,9 @@ dependencies = [
 
 [[package]]
 name = "nixl-sys"
-version = "1.1.0"
+version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f30fb14be08db3d22f82b0e8a375345d015fd742db6fa754c3fdd60026a6405"
+checksum = "2ebc0a255ea1cbd18ba08d7bc430ea781105c5ceb278a46b52b93fc2dca0ed06"
 dependencies = [
  "anyhow",
  "bincode 1.3.3",

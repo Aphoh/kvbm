@@ -635,8 +635,8 @@ mod tests {
         BlockFormat, FullyContiguousDetails, KvBlockLayout, LayoutConfig, LayoutDescriptor,
         LayoutTypeDetails, NixlMetadata,
     };
-    use dynamo_memory::{MemoryRegion, StorageKind, nixl};
     use kvbm_common::LogicalLayoutHandle;
+    use kvbm_memory::{MemoryRegion, StorageKind, nixl};
 
     fn make_test_serialized_layout() -> LayoutDescriptor {
         let config = LayoutConfig::builder()

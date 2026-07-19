@@ -378,8 +378,8 @@ impl ResourceTransferPlacements {
 mod tests {
     use std::sync::Arc;
 
-    use dynamo_memory::StorageKind;
     use kvbm_common::LogicalResourceId;
+    use kvbm_memory::StorageKind;
     use kvbm_physical::manager::WorkerDataPlacement;
     use kvbm_physical::testing::{create_fc_layout, create_test_agent, create_transfer_manager};
     use kvbm_physical::transfer::{FillPattern, fill_blocks};

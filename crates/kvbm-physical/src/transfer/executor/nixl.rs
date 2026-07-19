@@ -11,7 +11,7 @@ use crate::BlockId;
 use crate::transfer::context::TransferCompleteNotification;
 use crate::transfer::{can_use_whole_block_transfer, validate_layout_compatibility};
 use anyhow::{Result, anyhow};
-use dynamo_memory::nixl::{XferDescList, XferOp};
+use kvbm_memory::nixl::{XferDescList, XferOp};
 use std::marker::PhantomData;
 use std::ops::Range;
 

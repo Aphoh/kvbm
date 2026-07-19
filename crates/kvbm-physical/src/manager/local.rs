@@ -70,7 +70,7 @@ impl Deref for LocalLayout {
 mod tests {
     use super::*;
     use crate::layout::{LayoutConfig, PhysicalLayout};
-    use dynamo_memory::nixl::NixlAgent;
+    use kvbm_memory::nixl::NixlAgent;
 
     fn create_test_agent(name: &str) -> NixlAgent {
         NixlAgent::new(name).expect("failed to create agent")

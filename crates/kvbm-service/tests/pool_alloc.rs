@@ -15,7 +15,7 @@
 
 use std::time::Duration;
 
-use dynamo_memory::HugepageMode;
+use kvbm_memory::HugepageMode;
 use kvbm_service::{HostMemoryPool, KvbmService, PoolConfig, ServiceConfig};
 
 const SMALL_SLAB_BYTES: u64 = 16 * 1024 * 1024;

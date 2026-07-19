@@ -3,7 +3,7 @@
 
 //! Transfer strategy selection based on source and destination storage locations.
 
-use dynamo_memory::StorageKind;
+use kvbm_memory::StorageKind;
 
 use crate::{layout::PhysicalLayout, transfer::TransferContext};
 
