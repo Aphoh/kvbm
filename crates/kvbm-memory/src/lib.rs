@@ -45,7 +45,7 @@ mod util;
 mod tests;
 
 pub use arena::{ArenaAllocator, ArenaBuffer, ArenaError};
-pub use device::DeviceStorage;
+pub use device::{CudaContextProvider, DeviceStorage, set_cuda_context_provider};
 #[cfg(target_os = "linux")]
 pub use disk::DiskStorage;
 pub use external::ExternalDeviceMemory;

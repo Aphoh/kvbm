@@ -11,7 +11,7 @@ use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
-pub use agent::NixlAgent;
+pub use agent::{NIXL_CAPI_LIB_ENV, NixlAgent};
 pub use config::NixlBackendConfig;
 
 pub use nixl_sys::{
@@ -83,6 +83,19 @@ pub trait RegisteredView {
     fn descriptor(&self) -> NixlDescriptor;
 }
 
+/// The state backing a [`NixlRegistered`] wrapper.
+enum Registration {
+    /// We registered this memory ourselves; the handle deregisters it on
+    /// drop (before the wrapped storage drops). The field is never read
+    /// directly -- it exists solely for its `Drop` side effect.
+    Owned(#[allow(dead_code)] RegistrationHandle),
+    /// Storage arrived already carrying its own [`NixlDescriptor`] (see
+    /// [`MemoryDescriptor::nixl_descriptor`]); its registration lifetime is
+    /// managed elsewhere and there is nothing for this wrapper to
+    /// deregister.
+    PreRegistered,
+}
+
 /// Wrapper for storage that has been registered with NIXL.
 ///
 /// This wrapper ensures proper drop order: the registration handle is
@@ -90,15 +103,32 @@ pub trait RegisteredView {
 /// the memory is freed.
 pub struct NixlRegistered<S: NixlCompatible> {
     storage: S,
-    handle: Option<RegistrationHandle>,
+    // `Option` only so `Drop`/`into_storage` can `take()` it.
+    registration: Option<Registration>,
     agent_name: String,
 }
 
 impl<S: NixlCompatible> Drop for NixlRegistered<S> {
     fn drop(&mut self) {
         // Explicitly drop the registration handle first
-        drop(self.handle.take());
+        drop(self.registration.take());
         // Storage drops naturally after
+    }
+}
+
+impl<S: NixlCompatible> NixlRegistered<S> {
+    /// True when NIXL can address this memory, whether this wrapper owns
+    /// the registration (`Owned`) or the storage arrived pre-registered
+    /// (`PreRegistered`).
+    pub fn is_registered(&self) -> bool {
+        self.registration.is_some()
+    }
+
+    /// True only when this wrapper owns the registration handle (i.e. it
+    /// will deregister the memory on drop). `false` for pre-registered
+    /// storage, whose registration lifetime is managed elsewhere.
+    pub fn owns_registration(&self) -> bool {
+        matches!(self.registration, Some(Registration::Owned(_)))
     }
 }
 
@@ -107,7 +137,8 @@ impl<S: NixlCompatible + fmt::Debug> fmt::Debug for NixlRegistered<S> {
         f.debug_struct("NixlRegistered")
             .field("storage", &self.storage)
             .field("agent_name", &self.agent_name)
-            .field("handle", &self.handle.is_some())
+            .field("is_registered", &self.is_registered())
+            .field("owns_registration", &self.owns_registration())
             .finish()
     }
 }
@@ -161,22 +192,55 @@ impl<S: MemoryDescriptor + NixlCompatible> NixlRegistered<S> {
         &mut self.storage
     }
 
-    /// Check if the registration handle is still valid.
-    pub fn is_registered(&self) -> bool {
-        self.handle.is_some()
-    }
-
     /// Consume this wrapper and return the underlying storage.
     ///
-    /// This will deregister the storage from NIXL.
+    /// This will deregister the storage from NIXL (a no-op for
+    /// pre-registered storage, whose registration is managed elsewhere).
     pub fn into_storage(mut self) -> S {
-        drop(self.handle.take());
+        drop(self.registration.take());
         let mut this = std::mem::ManuallyDrop::new(self);
         unsafe {
             let storage = std::ptr::read(&this.storage);
             std::ptr::drop_in_place(&mut this.agent_name);
             storage
         }
+    }
+}
+
+/// Registration with a NIXL agent failed.
+///
+/// The storage is returned so callers can retry or fall back to another
+/// path; `source` carries the underlying `nixl_sys` error that caused the
+/// failure.
+pub struct RegisterError<S> {
+    /// The storage that failed to register. Ownership is handed back to the
+    /// caller (registration failure does not destroy the memory).
+    pub storage: S,
+    /// The underlying NIXL error that caused registration to fail.
+    pub source: nixl_sys::NixlError,
+}
+
+impl<S> fmt::Display for RegisterError<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "failed to register memory with NIXL agent: {}",
+            self.source
+        )
+    }
+}
+
+impl<S> fmt::Debug for RegisterError<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RegisterError")
+            .field("source", &self.source)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<S> std::error::Error for RegisterError<S> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
     }
 }
 
@@ -193,12 +257,14 @@ impl<S: MemoryDescriptor + NixlCompatible> NixlRegistered<S> {
 /// * `opt` - Optional arguments for registration
 ///
 /// # Returns
-/// A `NixlRegistered` wrapper containing the storage and registration handle.
+/// A `NixlRegistered` wrapper containing the storage and registration handle
+/// on success. On failure, a [`RegisterError`] carrying both the storage
+/// (for retry/fallback) and the underlying `nixl_sys` error.
 pub fn register_with_nixl<S>(
     storage: S,
     agent: &Agent,
     opt: Option<&OptArgs>,
-) -> std::result::Result<NixlRegistered<S>, S>
+) -> std::result::Result<NixlRegistered<S>, RegisterError<S>>
 where
     S: MemoryDescriptor + NixlCompatible,
 {
@@ -231,7 +297,7 @@ where
     if storage.nixl_descriptor().is_some() {
         return Ok(NixlRegistered {
             storage,
-            handle: None,
+            registration: Some(Registration::PreRegistered),
             agent_name: agent.name().to_string(),
         });
     }
@@ -250,10 +316,10 @@ where
     match agent.register_memory(&descriptor, opt) {
         Ok(handle) => Ok(NixlRegistered {
             storage,
-            handle: Some(handle),
+            registration: Some(Registration::Owned(handle)),
             agent_name: agent.name().to_string(),
         }),
-        Err(_) => Err(storage),
+        Err(e) => Err(RegisterError { storage, source: e }),
     }
 }
 
@@ -310,15 +376,69 @@ pub trait NixlRegisterExt: MemoryDescriptor + NixlCompatible + Sized {
     /// * `opt` - Optional arguments for registration
     ///
     /// # Returns
-    /// A `NixlRegistered` wrapper on success, or the original storage on failure.
+    /// A `NixlRegistered` wrapper on success, or a [`RegisterError`] carrying
+    /// the original storage and the underlying `nixl_sys` error on failure.
     fn register(
         self,
         agent: &NixlAgent,
         opt: Option<&OptArgs>,
-    ) -> std::result::Result<NixlRegistered<Self>, Self> {
+    ) -> std::result::Result<NixlRegistered<Self>, RegisterError<Self>> {
         register_with_nixl(self, agent, opt)
     }
 }
 
 // Blanket impl for all compatible types
 impl<T: MemoryDescriptor + NixlCompatible + Sized> NixlRegisterExt for T {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::SystemStorage;
+
+    /// §5.4 regression test: storage that arrives pre-registered (i.e.
+    /// `nixl_descriptor()` already returns `Some`) must report
+    /// `is_registered() == true`, since NIXL can address it -- even though
+    /// this wrapper does not own the registration and has nothing to
+    /// deregister on drop.
+    #[test]
+    fn pre_registered_is_registered_but_not_owned() {
+        let storage = SystemStorage::new(1024).expect("allocation should succeed");
+        let registered = NixlRegistered {
+            storage,
+            registration: Some(Registration::PreRegistered),
+            agent_name: "test-agent".to_string(),
+        };
+
+        assert!(registered.is_registered());
+        assert!(!registered.owns_registration());
+    }
+
+    /// §5.3 regression test: a failed registration must not swallow the
+    /// underlying `nixl_sys::NixlError` -- it travels with the returned
+    /// storage inside `RegisterError`, reachable via `Display` and
+    /// `std::error::Error::source()`.
+    #[test]
+    fn register_error_carries_source_and_storage() {
+        let storage = SystemStorage::new(1024).expect("allocation should succeed");
+        let err = RegisterError {
+            storage,
+            source: nixl_sys::NixlError::InvalidParam,
+        };
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("failed to register memory with NIXL agent"),
+            "unexpected message: {msg}"
+        );
+        assert!(
+            msg.contains("Invalid parameter"),
+            "message should include the source error: {msg}"
+        );
+
+        let source = std::error::Error::source(&err).expect("source() should delegate");
+        assert!(source.to_string().contains("Invalid parameter"));
+
+        // Storage is handed back so callers can retry or fall back.
+        assert_eq!(err.storage.size(), 1024);
+    }
+}

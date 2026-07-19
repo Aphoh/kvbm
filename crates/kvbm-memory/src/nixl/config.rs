@@ -8,16 +8,18 @@
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Configuration for NIXL backends.
 ///
 /// Supports extracting backend configurations from environment variables:
 /// - `DYN_KVBM_NIXL_BACKEND_UCX=true` - Enable UCX backend with default params
 /// - `DYN_KVBM_NIXL_BACKEND_GDS=false` - Explicitly disable GDS backend
-/// - Valid values: true/false, 1/0, on/off, yes/no (case-insensitive)
-/// - Invalid values (e.g., "maybe", "random") will cause an error
-/// - Custom params (e.g., `DYN_KVBM_NIXL_BACKEND_UCX_PARAM1=value`) will cause an error
+/// - `DYN_KVBM_NIXL_BACKEND_GDS_MT__THREAD_COUNT=8` - Enable `GDS_MT` with a
+///   `thread_count = "8"` custom param (backend and param are split on the
+///   first `__`; backend names may themselves contain single underscores)
+/// - Valid boolean values: true/false, 1/0, on/off, yes/no (case-insensitive)
+/// - Invalid boolean values (e.g., "maybe", "random") will cause an error
 ///
 /// # Data Structure
 ///
@@ -56,41 +58,71 @@ impl NixlBackendConfig {
 
     /// Create configuration from environment variables.
     ///
-    /// Extracts backends from `DYN_KVBM_NIXL_BACKEND_<backend>=<value>` variables.
+    /// Extracts backends from `DYN_KVBM_NIXL_BACKEND_<backend>=<value>`
+    /// (boolean enable/disable) and
+    /// `DYN_KVBM_NIXL_BACKEND_<backend>__<param>=<value>` (custom param,
+    /// split on the first `__`) variables. Both forms merge for the same
+    /// backend regardless of `std::env::vars()` iteration order; an explicit
+    /// `<backend>=false` always wins over a `<backend>__*` param for the same
+    /// backend, whichever was visited first.
     ///
     /// # Errors
-    /// Returns an error if:
-    /// - Custom parameters are detected (not yet supported)
-    /// - Invalid boolean values are provided (must be truthy or falsey)
+    /// Returns an error if a boolean-enable value is neither truthy nor
+    /// falsey.
     pub fn from_env() -> Result<Self> {
-        let mut backends = HashMap::new();
+        Self::from_env_pairs(std::env::vars())
+    }
 
-        // Extract all environment variables that match our pattern
-        for (key, value) in std::env::vars() {
-            if let Some(remainder) = key.strip_prefix("DYN_KVBM_NIXL_BACKEND_") {
-                // Check if there's an underscore (indicating custom params)
-                if remainder.contains('_') {
+    /// Pure variant of [`Self::from_env`] taking an explicit `(key, value)`
+    /// iterator instead of reading the process environment. Kept separate so
+    /// tests can exercise the parsing logic with synthetic input rather than
+    /// mutating global process state.
+    fn from_env_pairs(vars: impl Iterator<Item = (String, String)>) -> Result<Self> {
+        let mut backends: HashMap<String, HashMap<String, String>> = HashMap::new();
+        let mut disabled: HashSet<String> = HashSet::new();
+
+        for (key, value) in vars {
+            let Some(remainder) = key.strip_prefix("DYN_KVBM_NIXL_BACKEND_") else {
+                continue;
+            };
+
+            if let Some((backend_part, param_part)) = remainder.split_once("__") {
+                // Custom param: DYN_KVBM_NIXL_BACKEND_<backend>__<param>=<value>
+                if backend_part.is_empty() || param_part.is_empty() {
                     bail!(
-                        "Custom NIXL backend parameters are not yet supported. \
-                         Found: {}. Please use only DYN_KVBM_NIXL_BACKEND_<backend>=true \
-                         to enable backends with default parameters.",
+                        "Invalid NIXL backend env var {}: backend and param names must not be \
+                         empty (expected DYN_KVBM_NIXL_BACKEND_<backend>__<param>)",
                         key
                     );
                 }
-
-                // Simple backend enablement (e.g., DYN_KVBM_NIXL_BACKEND_UCX=true)
+                let backend_name = backend_part.to_uppercase();
+                let param_name = param_part.to_lowercase();
+                backends
+                    .entry(backend_name)
+                    .or_default()
+                    .insert(param_name, value);
+            } else {
+                // Boolean enable/disable: DYN_KVBM_NIXL_BACKEND_<backend>=<value>
                 let backend_name = remainder.to_uppercase();
                 match crate::parse_bool(&value) {
                     Ok(true) => {
-                        backends.insert(backend_name, HashMap::new());
+                        // Preserve any params already collected for this
+                        // backend from a `__`-suffixed variable, regardless
+                        // of env-var iteration order.
+                        backends.entry(backend_name).or_default();
                     }
                     Ok(false) => {
-                        // Explicitly disabled, don't add to backends
-                        continue;
+                        // Explicitly disabled; applied as a second pass below
+                        // so it wins irrespective of iteration order.
+                        disabled.insert(backend_name);
                     }
                     Err(e) => bail!("Invalid value for {}: {}", key, e),
                 }
             }
+        }
+
+        for backend_name in &disabled {
+            backends.remove(backend_name);
         }
 
         Ok(Self { backends })
@@ -236,6 +268,146 @@ mod tests {
         assert_eq!(items.len(), 2);
     }
 
-    // Note: Testing from_env() would require setting environment variables,
-    // which is challenging in unit tests. This is better tested with integration tests.
+    // `from_env()` itself reads the real process environment (racy to test
+    // in-process); `from_env_pairs` is the pure, directly-testable core.
+
+    #[test]
+    fn test_from_env_pairs_simple_enable() {
+        let config = NixlBackendConfig::from_env_pairs(
+            [("DYN_KVBM_NIXL_BACKEND_UCX".to_string(), "true".to_string())].into_iter(),
+        )
+        .unwrap();
+
+        assert!(config.has_backend("UCX"));
+        assert!(config.backend_params("UCX").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_from_env_pairs_explicit_disable_is_absent() {
+        let config = NixlBackendConfig::from_env_pairs(
+            [("DYN_KVBM_NIXL_BACKEND_GDS".to_string(), "false".to_string())].into_iter(),
+        )
+        .unwrap();
+
+        assert!(!config.has_backend("GDS"));
+    }
+
+    #[test]
+    fn test_from_env_pairs_invalid_boolean_errors() {
+        let result = NixlBackendConfig::from_env_pairs(
+            [("DYN_KVBM_NIXL_BACKEND_UCX".to_string(), "maybe".to_string())].into_iter(),
+        );
+        assert!(result.is_err());
+    }
+
+    /// An empty backend or param segment either side of the `__` splitter
+    /// must be rejected at parse time, naming the offending env var, rather
+    /// than deferred to a later `params.set("", ..)` failure that no longer
+    /// has the var name in scope.
+    #[test]
+    fn test_from_env_pairs_empty_backend_or_param_segment_errors() {
+        for key in [
+            "DYN_KVBM_NIXL_BACKEND_GDS_MT__",
+            "DYN_KVBM_NIXL_BACKEND___FOO",
+        ] {
+            let result =
+                NixlBackendConfig::from_env_pairs([(key.to_string(), "8".to_string())].into_iter());
+            let err = result.expect_err(&format!("{key} should be rejected"));
+            assert!(
+                err.to_string().contains(key),
+                "error should mention the offending var {key}: {err}"
+            );
+        }
+    }
+
+    /// §5.1b regression test: `GDS_MT` (a backend name containing an
+    /// underscore) must be settable, and its `thread_count` custom param
+    /// (the double-underscore form) must parse into a lowercase param key.
+    #[test]
+    fn test_from_env_pairs_gds_mt_thread_count_param() {
+        let config = NixlBackendConfig::from_env_pairs(
+            [(
+                "DYN_KVBM_NIXL_BACKEND_GDS_MT__THREAD_COUNT".to_string(),
+                "8".to_string(),
+            )]
+            .into_iter(),
+        )
+        .unwrap();
+
+        assert!(config.has_backend("GDS_MT"));
+        let params = config.backend_params("GDS_MT").unwrap();
+        assert_eq!(params.get("thread_count"), Some(&"8".to_string()));
+    }
+
+    #[test]
+    fn test_from_env_pairs_param_and_boolean_enable_merge_regardless_of_order() {
+        // Param-then-enable and enable-then-param must both preserve the param.
+        for pairs in [
+            vec![
+                (
+                    "DYN_KVBM_NIXL_BACKEND_GDS_MT__THREAD_COUNT".to_string(),
+                    "8".to_string(),
+                ),
+                (
+                    "DYN_KVBM_NIXL_BACKEND_GDS_MT".to_string(),
+                    "true".to_string(),
+                ),
+            ],
+            vec![
+                (
+                    "DYN_KVBM_NIXL_BACKEND_GDS_MT".to_string(),
+                    "true".to_string(),
+                ),
+                (
+                    "DYN_KVBM_NIXL_BACKEND_GDS_MT__THREAD_COUNT".to_string(),
+                    "8".to_string(),
+                ),
+            ],
+        ] {
+            let config = NixlBackendConfig::from_env_pairs(pairs.into_iter()).unwrap();
+            assert!(config.has_backend("GDS_MT"));
+            assert_eq!(
+                config.backend_params("GDS_MT").unwrap().get("thread_count"),
+                Some(&"8".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn test_from_env_pairs_explicit_disable_wins_over_param_regardless_of_order() {
+        for pairs in [
+            vec![
+                (
+                    "DYN_KVBM_NIXL_BACKEND_GDS_MT__THREAD_COUNT".to_string(),
+                    "8".to_string(),
+                ),
+                (
+                    "DYN_KVBM_NIXL_BACKEND_GDS_MT".to_string(),
+                    "false".to_string(),
+                ),
+            ],
+            vec![
+                (
+                    "DYN_KVBM_NIXL_BACKEND_GDS_MT".to_string(),
+                    "false".to_string(),
+                ),
+                (
+                    "DYN_KVBM_NIXL_BACKEND_GDS_MT__THREAD_COUNT".to_string(),
+                    "8".to_string(),
+                ),
+            ],
+        ] {
+            let config = NixlBackendConfig::from_env_pairs(pairs.into_iter()).unwrap();
+            assert!(!config.has_backend("GDS_MT"));
+        }
+    }
+
+    #[test]
+    fn test_from_env_pairs_ignores_unrelated_keys() {
+        let config = NixlBackendConfig::from_env_pairs(
+            [("SOME_OTHER_VAR".to_string(), "true".to_string())].into_iter(),
+        )
+        .unwrap();
+        assert!(config.backends().is_empty());
+    }
 }

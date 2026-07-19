@@ -7,11 +7,25 @@
 //! - `NixlAgent`: Wrapper around nixl_sys::Agent that tracks initialized backends
 //! - `NixlBackendConfig`: Configuration for NIXL backends from environment variables
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use nixl_sys::{Agent, is_stub};
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use std::sync::OnceLock;
 
 use crate::nixl::NixlBackendConfig;
+
+/// Environment variable naming an explicit `libnixl_capi.so` to preload
+/// before the first `nixl_sys::Agent::new` call. See [`NixlAgent::new`].
+pub const NIXL_CAPI_LIB_ENV: &str = "KVBM_NIXL_CAPI_LIB";
+
+/// Holds the dlopen'd NIXL C API library for the process lifetime.
+///
+/// `nixl_sys` caches its first `dlopen("libnixl_capi.so")` result --
+/// including failure -- so whichever library the dynamic loader finds first
+/// wins for the process lifetime. Preloading a specific path before the
+/// first `nixl_sys` call pins which runtime this process uses.
+static NIXL_CAPI: OnceLock<libloading::os::unix::Library> = OnceLock::new();
 
 /// A NIXL agent wrapper that tracks which backends were successfully initialized.
 ///
@@ -32,8 +46,57 @@ pub struct NixlAgent {
 }
 
 impl NixlAgent {
+    /// dlopen the given `libnixl_capi.so` (`RTLD_NOW | RTLD_GLOBAL`) before
+    /// the first `nixl_sys` call, pinning which NIXL runtime this process
+    /// uses.
+    ///
+    /// Idempotent: only the first successful call has any effect; later calls
+    /// (with any path) are no-ops that return `Ok(())`. This must run before
+    /// any `nixl_sys::Agent` is constructed -- once `nixl_sys` has resolved
+    /// its symbols, preloading a different library has no effect.
+    pub fn preload_runtime(path: &Path) -> Result<()> {
+        if NIXL_CAPI.get().is_some() {
+            return Ok(());
+        }
+        // SAFETY: this loads a NIXL C API shared object and retains the
+        // handle for the process lifetime, matching rhino-nixl-ffi's
+        // `load_packaged_nixl_runtime` guard.
+        let library = unsafe {
+            libloading::os::unix::Library::open(Some(path), libc::RTLD_NOW | libc::RTLD_GLOBAL)
+        }
+        .with_context(|| format!("load NIXL runtime {}", path.display()))?;
+        // Another thread may have won the race; either way the slot is now
+        // occupied and a library is loaded, so ignore a losing `set`.
+        let _ = NIXL_CAPI.set(library);
+        Ok(())
+    }
+
+    /// Opt-in preload hook driven by [`NIXL_CAPI_LIB_ENV`]. No-op (returns
+    /// `Ok(())`) when the variable is unset, so existing callers of
+    /// [`NixlAgent::new`] see zero behavior change.
+    fn preload_runtime_from_env() -> Result<()> {
+        match std::env::var_os(NIXL_CAPI_LIB_ENV) {
+            Some(path) => Self::preload_runtime(Path::new(&path)),
+            None => Ok(()),
+        }
+    }
+
     /// Create a NIXL agent without any backends.
+    ///
+    /// Honors [`NIXL_CAPI_LIB_ENV`] (`KVBM_NIXL_CAPI_LIB`): if set, its path
+    /// is dlopen'd (`RTLD_NOW | RTLD_GLOBAL`) before the first `nixl_sys`
+    /// call, pinning which NIXL runtime this process resolves to. No-op when
+    /// unset -- source-compatible with existing callers.
+    ///
+    /// To pin a packaged NIXL runtime explicitly rather than through the
+    /// `KVBM_NIXL_CAPI_LIB` environment variable, call
+    /// [`NixlAgent::preload_runtime`] before this constructor.
     pub fn new(name: &str) -> Result<Self> {
+        Self::preload_runtime_from_env()?;
+        Self::new_uncached(name)
+    }
+
+    fn new_uncached(name: &str) -> Result<Self> {
         if is_stub() {
             return Err(anyhow::anyhow!("NIXL is not supported in stub mode"));
         }
@@ -65,11 +128,13 @@ impl NixlAgent {
 
     /// Add a backend to the agent with optional custom parameters.
     ///
-    /// If `custom_params` is non-empty, those parameters are used instead of
-    /// the plugin defaults. If empty, default parameters from the plugin are used.
+    /// If `custom_params` is non-empty, each entry overrides the plugin's
+    /// default parameters (fetched first via `get_plugin_params`) before the
+    /// backend is created. If empty, the plugin defaults are used as-is.
     ///
     /// # Errors
-    /// Returns an error if custom parameters are provided (not yet supported until nixl_sys 0.9).
+    /// Returns an error if the plugin is unavailable, a parameter is rejected
+    /// by NIXL, or backend creation fails.
     pub fn add_backend_with_params(
         &mut self,
         backend: &str,
@@ -80,29 +145,22 @@ impl NixlAgent {
             return Ok(());
         }
 
-        // TODO(DIS-1310): Custom params require nixl_sys 0.9+ which adds nixl_capi_params_add
-        if !custom_params.is_empty() {
-            anyhow::bail!(
-                "Custom NIXL backend parameters for {} are not yet supported. \
-                 This feature requires nixl_sys 0.9+. Params provided: {:?}",
-                backend_upper,
-                custom_params.keys().collect::<Vec<_>>()
-            );
+        // Get default params from plugin, then layer custom params on top.
+        let (_, mut params) = self
+            .agent
+            .get_plugin_params(&backend_upper)
+            .map_err(|e| anyhow::anyhow!("no {backend_upper} plugin found: {e}"))?;
+        for (key, value) in custom_params {
+            params
+                .set(key, value)
+                .with_context(|| format!("set NIXL {backend_upper} backend param {key}={value}"))?;
         }
 
-        // Get default params from plugin
-        let (_, params) = match self.agent.get_plugin_params(&backend_upper) {
-            Ok(result) => result,
-            Err(_) => anyhow::bail!("No {} plugin found", backend_upper),
-        };
-
-        match self.agent.create_backend(&backend_upper, &params) {
-            Ok(_) => {
-                self.available_backends.insert(backend_upper);
-                Ok(())
-            }
-            Err(e) => anyhow::bail!("Failed to create nixl backend: {}", e),
-        }
+        self.agent
+            .create_backend(&backend_upper, &params)
+            .with_context(|| format!("create NIXL backend {backend_upper}"))?;
+        self.available_backends.insert(backend_upper);
+        Ok(())
     }
 
     /// Create a NIXL agent requiring ALL specified backends to be available.
@@ -255,36 +313,46 @@ mod tests {
     }
 
     #[test]
-    fn test_add_backend_with_custom_params_fails() {
+    fn test_add_backend_with_custom_params_applies_them() {
         let mut agent = NixlAgent::new("test_custom_params").expect("Failed to create agent");
 
-        // Custom params should fail until nixl_sys 0.9
+        // Custom params are layered onto the plugin defaults and passed through
+        // to `create_backend`; UCX ignores keys it doesn't recognize.
         let mut params = HashMap::new();
-        params.insert("some_key".to_string(), "some_value".to_string());
+        params.insert("thread_count".to_string(), "4".to_string());
 
         let result = agent.add_backend_with_params("UCX", &params);
-        assert!(result.is_err());
-
-        let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("not yet supported"));
-        assert!(err_msg.contains("nixl_sys 0.9"));
-        assert!(err_msg.contains("some_key"));
+        assert!(
+            result.is_ok(),
+            "custom params should plumb through: {result:?}"
+        );
+        assert!(agent.has_backend("UCX"));
     }
 
     #[test]
-    fn test_from_nixl_backend_config_with_custom_params_fails() {
-        // Config with custom params should fail
+    fn test_add_backend_with_unknown_plugin_fails() {
+        let mut agent = NixlAgent::new("test_unknown_plugin").expect("Failed to create agent");
+
+        let result = agent.add_backend_with_params("NOT_A_REAL_BACKEND", &HashMap::new());
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("no NOT_A_REAL_BACKEND plugin found"));
+    }
+
+    #[test]
+    fn test_from_nixl_backend_config_with_custom_params_applies_them() {
+        // Config with custom params should plumb through to the created backend.
         let mut params = HashMap::new();
-        params.insert("threads".to_string(), "4".to_string());
+        params.insert("thread_count".to_string(), "4".to_string());
 
         let config = NixlBackendConfig::default().with_backend_params("UCX", params);
 
         let result = NixlAgent::from_nixl_backend_config("test_config_params", config);
-        assert!(result.is_err());
-
-        let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("not yet supported"));
-        assert!(err_msg.contains("threads"));
+        assert!(
+            result.is_ok(),
+            "custom params should plumb through: {result:?}"
+        );
+        assert!(result.unwrap().has_backend("UCX"));
     }
 
     #[test]
