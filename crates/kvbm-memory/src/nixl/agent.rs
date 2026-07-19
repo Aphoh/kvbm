@@ -256,7 +256,17 @@ impl NixlAgent {
     }
 }
 
-// Delegate common methods to the underlying agent
+// Delegate common methods to the underlying agent.
+//
+// FORBIDDEN at the pinned nixl-sys `=1.0.1` (see the workspace pin in
+// `crates/Cargo.toml`): do NOT call `Agent::fetch_remote_md` or
+// `Agent::invalidate_remote_md` through this `Deref`. At 1.0.1 the former
+// self-deadlocks (takes `inner.write()` twice on its success path) and the
+// latter passes a non-NUL-terminated string to the C API. Both are fixed at
+// 1.1.0 but the graph-wide pin is held at 1.0.1 to unify with rhino's dynamo
+// stack; rhino-nixl-ffi carries the `invalidate_remote_metadata` workaround for
+// the second bug. kvbm calls neither today (only `get_local_md`/`load_remote_md`
+// are used); lift this note when the pin can rise.
 impl std::ops::Deref for NixlAgent {
     type Target = Agent;
 
