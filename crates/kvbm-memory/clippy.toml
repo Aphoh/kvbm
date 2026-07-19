@@ -1,0 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Intentionally empty (default lint config).
+#
+# clippy's clippy.toml lookup walks the filesystem upward from the crate's
+# manifest dir and is NOT bounded by cargo workspace membership. While
+# kvbm-memory is nested inside the rhino checkout (3rdparty/kvbm/...) but not
+# yet a member of any workspace rooted there, that walk would otherwise find
+# and inherit /home/ryan/repos/rhino/clippy.toml — whose
+# `disallowed-macros = [assert!, assert_eq!, ...]` rule fails the fork's
+# verbatim `tests.rs` (which uses plain asserts, matching upstream
+# dynamo-memory). This file stops the walk at the crate root, restoring the
+# lint defaults kvbm-memory actually has standalone (verified: the kvbm
+# submodule carries no clippy.toml of its own). This is a systemic effect of
+# nesting under rhino, not specific to this crate — kvbm-physical fails the
+# same way today (`cargo clippy --manifest-path .../kvbm-physical/Cargo.toml
+# --all-targets -- -D warnings`).
