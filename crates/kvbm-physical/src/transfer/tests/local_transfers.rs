@@ -67,6 +67,51 @@ fn build_ragged_layout(
     }
 }
 
+fn dsv4_flash_live_state_region_sizes() -> Vec<usize> {
+    let mut sizes = vec![
+        21 * 8 * 512 * 16,  // C4 compressor tail
+        21 * 8 * 128 * 16,  // C4 indexer compressor tail
+        20 * 128 * 512 * 8, // C128 compressor tail
+    ];
+    sizes.extend(std::iter::repeat_n(8 * 512 * 4 * 4, 21));
+    sizes.extend(std::iter::repeat_n(8 * 128 * 4 * 4, 21));
+    sizes.extend(std::iter::repeat_n(128 * 512 * 2 * 4, 20));
+    sizes.extend(std::iter::repeat_n(8 * 512 * 2 * 4, 42));
+    sizes.extend(std::iter::repeat_n(8 * 128 * 2 * 4, 42));
+    sizes.extend(std::iter::repeat_n(128 * 512 * 4, 40));
+    sizes.extend(std::iter::repeat_n(256 * 512, 43));
+    assert_eq!(sizes.len(), 232);
+    assert_eq!(sizes.iter().sum::<usize>(), 42_254_336);
+    sizes
+}
+
+fn build_dsv4_flash_live_state_layout(
+    agent: NixlAgent,
+    storage_kind: StorageKind,
+    num_blocks: usize,
+) -> PhysicalLayout {
+    let region_sizes = dsv4_flash_live_state_region_sizes();
+    let config = LayoutConfig::builder()
+        .num_blocks(num_blocks)
+        .num_layers(region_sizes.len())
+        .outer_dim(1)
+        .page_size(1)
+        .inner_dim(1)
+        .dtype_width_bytes(1)
+        .num_heads(Some(1))
+        .build()
+        .unwrap();
+    let builder = PhysicalLayout::builder(agent)
+        .with_config(config)
+        .ragged_layer_separate(region_sizes);
+    match storage_kind {
+        StorageKind::System => builder.allocate_system().build().unwrap(),
+        StorageKind::Pinned => builder.allocate_pinned(Some(0)).build().unwrap(),
+        StorageKind::Device(device_id) => builder.allocate_device(device_id).build().unwrap(),
+        StorageKind::Disk(_) => builder.allocate_disk(None).build().unwrap(),
+    }
+}
+
 #[tokio::test]
 async fn ragged_system_transfer_copies_every_segment() -> Result<()> {
     storage_serial!(StorageKind::System, StorageKind::System);
@@ -126,6 +171,63 @@ async fn ragged_pinned_device_roundtrip_copies_every_segment() -> Result<()> {
     .await?;
 
     verify_checksums_by_position(&checksums, &src_blocks, &dst, &dst_blocks)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn dsv4_flash_live_state_snapshot_restore_roundtrip() -> Result<()> {
+    skip_if_stubs_and_device!(StorageKind::Pinned, StorageKind::Device(0));
+    gpu_serial!();
+    let agent = build_agent_for_kinds(&[StorageKind::Pinned, StorageKind::Device(0)])?;
+    let seed = build_dsv4_flash_live_state_layout(agent.clone(), StorageKind::Pinned, 1);
+    let device = build_dsv4_flash_live_state_layout(agent.clone(), StorageKind::Device(0), 2);
+    let snapshots = build_dsv4_flash_live_state_layout(agent.clone(), StorageKind::Pinned, 4);
+    let restored = build_dsv4_flash_live_state_layout(agent.clone(), StorageKind::Pinned, 1);
+    let checksums = fill_and_checksum(&seed, &[0], FillPattern::Sequential)?;
+    let ctx = create_transfer_context(agent, None)?;
+
+    execute_transfer(
+        &seed,
+        &device,
+        &[0],
+        &[0],
+        TransferOptionsInternal::default(),
+        ctx.context(),
+    )?
+    .await?;
+
+    for snapshot in 0..4 {
+        execute_transfer(
+            &device,
+            &snapshots,
+            &[0],
+            &[snapshot],
+            TransferOptionsInternal::default(),
+            ctx.context(),
+        )?
+        .await?;
+    }
+
+    execute_transfer(
+        &snapshots,
+        &device,
+        &[2],
+        &[1],
+        TransferOptionsInternal::default(),
+        ctx.context(),
+    )?
+    .await?;
+    execute_transfer(
+        &device,
+        &restored,
+        &[1],
+        &[0],
+        TransferOptionsInternal::default(),
+        ctx.context(),
+    )?
+    .await?;
+
+    verify_checksums_by_position(&checksums, &[0], &restored, &[0])?;
     Ok(())
 }
 

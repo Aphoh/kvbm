@@ -39,6 +39,11 @@ pub struct SpmdParallelWorkers {
     events: Arc<::velo::EventManager>,
     runtime: tokio::runtime::Handle,
 
+    /// Serializes logical G2 -> G1 operations that may enter replicated
+    /// collectives. Every rank for one logical operation must dispatch before
+    /// any rank enters the next operation on the same NCCL communicators.
+    replicated_onboard_sequence: Arc<tokio::sync::Mutex<()>>,
+
     /// Remote handle mappings: (InstanceId, REMOTE rank, LogicalLayoutHandle)
     /// -> remote LayoutHandle. Populated by `connect_remote` for later use
     /// by `execute_remote_onboard_for_instance`. The middle index is the
@@ -135,6 +140,7 @@ impl SpmdParallelWorkers {
             workers,
             events,
             runtime,
+            replicated_onboard_sequence: Arc::new(tokio::sync::Mutex::new(())),
             remote_handles: RwLock::new(HashMap::new()),
             remote_tp_sizes: RwLock::new(HashMap::new()),
             remote_descriptors: RwLock::new(HashMap::new()),
@@ -175,6 +181,78 @@ impl SpmdParallelWorkers {
         self.workers.len()
     }
 
+    fn primary_onboard_uses_collectives(&self) -> bool {
+        if self.workers.len() <= 1 {
+            return false;
+        }
+        if let Some(templates) = self.local_template_set.read().unwrap().as_ref() {
+            return templates.get(templates.primary()).is_none_or(|template| {
+                template.worker_data_placement() == WorkerDataPlacement::ReplicatedG1StripedLower
+            });
+        }
+        self.local_template
+            .read()
+            .unwrap()
+            .as_ref()
+            .is_none_or(|template| {
+                template.worker_data_placement() == WorkerDataPlacement::ReplicatedG1StripedLower
+            })
+    }
+
+    fn resource_onboard_uses_collectives(&self, resource: LogicalResourceId) -> bool {
+        if self.workers.len() <= 1 {
+            return false;
+        }
+        if let Some(templates) = self.local_template_set.read().unwrap().as_ref() {
+            return templates.get(resource).is_none_or(|template| {
+                template.worker_data_placement() == WorkerDataPlacement::ReplicatedG1StripedLower
+            });
+        }
+        self.local_template
+            .read()
+            .unwrap()
+            .as_ref()
+            .is_none_or(|template| {
+                template.worker_data_placement() == WorkerDataPlacement::ReplicatedG1StripedLower
+            })
+    }
+
+    fn execute_sequenced_onboard<Dispatch>(
+        &self,
+        dispatch: Dispatch,
+    ) -> Result<TransferCompleteNotification>
+    where
+        Dispatch: FnOnce() -> Vec<Result<TransferCompleteNotification>> + Send + 'static,
+    {
+        let event = self.events.new_event()?;
+        let awaiter = self.events.awaiter(event.handle())?;
+        let events = Arc::clone(&self.events);
+        let sequence = Arc::clone(&self.replicated_onboard_sequence);
+        let runtime = self.runtime.clone();
+
+        self.runtime.spawn(async move {
+            let _sequence_guard = sequence.lock().await;
+            let result = match TransferCompleteNotification::aggregate_results(
+                dispatch(),
+                &events,
+                &runtime,
+            ) {
+                Ok(notification) => notification.await,
+                Err(error) => Err(error),
+            };
+            match result {
+                Ok(()) => {
+                    let _ = event.trigger();
+                }
+                Err(error) => {
+                    let _ = event.poison(error.to_string());
+                }
+            }
+        });
+
+        Ok(TransferCompleteNotification::from_awaiter(awaiter))
+    }
+
     /// Builder-style: install a local parallelism template so that
     /// `connect_remote` can run cross-leader compatibility gates and
     /// reject incompatible peer metadata up front.
@@ -213,6 +291,26 @@ impl WorkerTransfers for SpmdParallelWorkers {
         dst_block_ids: Arc<[BlockId]>,
         options: kvbm_physical::transfer::TransferOptions,
     ) -> Result<TransferCompleteNotification> {
+        if src == LogicalLayoutHandle::G2
+            && dst == LogicalLayoutHandle::G1
+            && self.primary_onboard_uses_collectives()
+        {
+            let workers = self.workers.clone();
+            return self.execute_sequenced_onboard(move || {
+                workers
+                    .iter()
+                    .map(|worker| {
+                        worker.execute_local_transfer(
+                            src,
+                            dst,
+                            src_block_ids.clone(),
+                            dst_block_ids.clone(),
+                            options.clone(),
+                        )
+                    })
+                    .collect()
+            });
+        }
         let notifications = self
             .workers
             .iter()
@@ -239,6 +337,27 @@ impl WorkerTransfers for SpmdParallelWorkers {
         dst_block_ids: Arc<[BlockId]>,
         options: kvbm_physical::transfer::TransferOptions,
     ) -> Result<TransferCompleteNotification> {
+        if src == LogicalLayoutHandle::G2
+            && dst == LogicalLayoutHandle::G1
+            && self.resource_onboard_uses_collectives(resource)
+        {
+            let workers = self.workers.clone();
+            return self.execute_sequenced_onboard(move || {
+                workers
+                    .iter()
+                    .map(|worker| {
+                        worker.execute_local_transfer_for_resource(
+                            resource,
+                            src,
+                            dst,
+                            src_block_ids.clone(),
+                            dst_block_ids.clone(),
+                            options.clone(),
+                        )
+                    })
+                    .collect()
+            });
+        }
         let notifications = self
             .workers
             .iter()
@@ -1254,6 +1373,61 @@ mod tests {
     use super::*;
     use kvbm_common::KvDim;
     use kvbm_physical::manager::ParallelismDescriptor;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn concurrent_replicated_onboards_are_dispatched_one_logical_operation_at_a_time() {
+        let events = Arc::new(::velo::EventManager::local());
+        let spmd = SpmdParallelWorkers::new(
+            Vec::new(),
+            Arc::clone(&events),
+            tokio::runtime::Handle::current(),
+        );
+        let first_event = events.new_event().unwrap();
+        let first_notification = TransferCompleteNotification::from_awaiter(
+            events.awaiter(first_event.handle()).unwrap(),
+        );
+        let first_started = Arc::new(AtomicBool::new(false));
+        let second_started = Arc::new(AtomicBool::new(false));
+
+        let first = spmd
+            .execute_sequenced_onboard({
+                let first_started = Arc::clone(&first_started);
+                move || {
+                    first_started.store(true, Ordering::SeqCst);
+                    vec![Ok(first_notification)]
+                }
+            })
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !first_started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let second = spmd
+            .execute_sequenced_onboard({
+                let second_started = Arc::clone(&second_started);
+                move || {
+                    second_started.store(true, Ordering::SeqCst);
+                    vec![Ok(TransferCompleteNotification::completed())]
+                }
+            })
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !second_started.load(Ordering::SeqCst),
+            "a later logical onboard must not enter the communicator sequence early"
+        );
+
+        first_event.trigger().unwrap();
+        first.await.unwrap();
+        second.await.unwrap();
+        assert!(second_started.load(Ordering::SeqCst));
+    }
 
     fn descriptor(rank: usize, tp_size: usize) -> ParallelismDescriptor {
         ParallelismDescriptor {

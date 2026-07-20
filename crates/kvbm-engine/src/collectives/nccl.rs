@@ -179,8 +179,9 @@ pub struct NcclCollectives {
     /// CUDA stream for NCCL operations (owned or borrowed)
     nccl_stream: NcclStream,
 
-    /// CUDA context for stream/event management (only used for owned mode)
-    #[allow(dead_code)]
+    /// CUDA context for stream/event management. KVBM can execute several
+    /// co-located ranks on a shared Tokio runtime, so the current context on a
+    /// worker thread is not stable between calls.
     cuda_context: Arc<CudaContext>,
 
     /// Event system for completion notifications (used for borrowed stream fallback)
@@ -511,6 +512,13 @@ impl NcclCollectives {
         dst_block_ids: &[BlockId],
         layer_range: Option<Range<usize>>,
     ) -> Result<TransferCompleteNotification> {
+        // A Tokio worker may previously have run transfer work for another
+        // co-located rank. NCCL and CUDA event recording both use thread-local
+        // current-context state, so bind this collective's device before
+        // touching its communicator, stream, or pointers.
+        self.cuda_context
+            .bind_to_thread()
+            .context("failed to bind NCCL rank CUDA context")?;
         let layout = if self.rank == root_rank {
             src_layout
         } else {

@@ -506,7 +506,7 @@ mod trait_tests {
 #[cfg(test)]
 mod drain_tests {
     use std::sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use std::time::Duration;
@@ -524,14 +524,17 @@ mod drain_tests {
         let broadcast_event = events.new_event()?;
         let broadcast_notification =
             TransferCompleteNotification::from_awaiter(events.awaiter(broadcast_event.handle())?);
-        let broadcast_entered = AtomicBool::new(false);
+        let broadcast_entered = Arc::new(AtomicBool::new(false));
 
         let mut completion = Box::pin(execute_owner_copy_then_broadcast(
             true,
             || Err(anyhow!("injected owner copy dispatch failure")),
-            || {
-                broadcast_entered.store(true, Ordering::SeqCst);
-                Ok(broadcast_notification)
+            {
+                let broadcast_entered = Arc::clone(&broadcast_entered);
+                move || {
+                    broadcast_entered.store(true, Ordering::SeqCst);
+                    Ok(broadcast_notification)
+                }
             },
         ));
 
@@ -612,6 +615,45 @@ mod drain_tests {
             .await??
             .expect_err("first plan failure must surface after every plan drains");
         assert!(failure.to_string().contains("first-plan owner copy failed"));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn one_async_worker_per_colocated_rank_allows_blocking_collective_entry() -> Result<()> {
+        const RANKS: usize = 4;
+        let rendezvous = Arc::new((Mutex::new(0usize), Condvar::new()));
+        let mut ranks = Vec::with_capacity(RANKS);
+
+        for _ in 0..RANKS {
+            let rendezvous = Arc::clone(&rendezvous);
+            ranks.push(tokio::spawn(execute_owner_copy_then_broadcast(
+                false,
+                || Ok(TransferCompleteNotification::completed()),
+                move || {
+                    let (arrivals, ready) = rendezvous.as_ref();
+                    let mut arrivals = arrivals.lock().unwrap();
+                    *arrivals += 1;
+                    if *arrivals == RANKS {
+                        ready.notify_all();
+                    } else {
+                        let (observed, timeout) = ready
+                            .wait_timeout_while(arrivals, Duration::from_millis(250), |count| {
+                                *count != RANKS
+                            })
+                            .unwrap();
+                        arrivals = observed;
+                        if timeout.timed_out() && *arrivals != RANKS {
+                            return Err(anyhow!("peer ranks were starved before collective entry"));
+                        }
+                    }
+                    Ok(TransferCompleteNotification::completed())
+                },
+            )));
+        }
+
+        for rank in ranks {
+            rank.await??;
+        }
         Ok(())
     }
 }

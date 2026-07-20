@@ -256,8 +256,10 @@ pub struct TransferContext {
     // CUDA memory pool for kernel allocations
     cuda_pool: Arc<CudaMemPool>,
     // Channels for background notification handlers
-    tx_nixl_status: mpsc::Sender<RegisterPollingNotification<notifications::NixlStatusChecker>>,
-    tx_cuda_event: mpsc::Sender<RegisterPollingNotification<notifications::CudaEventChecker>>,
+    tx_nixl_status:
+        mpsc::UnboundedSender<RegisterPollingNotification<notifications::NixlStatusChecker>>,
+    tx_cuda_event:
+        mpsc::UnboundedSender<RegisterPollingNotification<notifications::CudaEventChecker>>,
     #[allow(dead_code)]
     tx_nixl_events: mpsc::Sender<notifications::RegisterNixlNotification>,
     observability: Option<SharedKvbmObservability>,
@@ -318,8 +320,14 @@ impl TransferContext {
         let cuda_pool = Arc::new(pool_builder.build()?);
 
         // Create channels for background notification handlers
-        let (tx_nixl_status, rx_nixl_status) = mpsc::channel(64);
-        let (tx_cuda_event, rx_cuda_event) = mpsc::channel(64);
+        // Transfer registration is a synchronous API, so a bounded channel
+        // cannot apply backpressure here. Using `try_send` on a bounded queue
+        // used to drop registrations while still returning a live completion
+        // awaiter, which could then never resolve. The number of outstanding
+        // transfers is already bounded by the owning cache/runtime resources;
+        // make the registration queues lossless.
+        let (tx_nixl_status, rx_nixl_status) = mpsc::unbounded_channel();
+        let (tx_cuda_event, rx_cuda_event) = mpsc::unbounded_channel();
         let (tx_nixl_events, rx_nixl_events) = mpsc::channel(64);
 
         // Spawn background handlers
@@ -563,7 +571,7 @@ impl TransferContext {
     /// holding `&TransferContext` across an `.await`.
     pub(crate) fn tx_cuda_event_clone(
         &self,
-    ) -> mpsc::Sender<RegisterPollingNotification<notifications::CudaEventChecker>> {
+    ) -> mpsc::UnboundedSender<RegisterPollingNotification<notifications::CudaEventChecker>> {
         self.tx_cuda_event.clone()
     }
 
@@ -572,7 +580,7 @@ impl TransferContext {
     /// completion registration without `&TransferContext`.
     pub(crate) fn tx_nixl_status_clone(
         &self,
-    ) -> mpsc::Sender<RegisterPollingNotification<notifications::NixlStatusChecker>> {
+    ) -> mpsc::UnboundedSender<RegisterPollingNotification<notifications::NixlStatusChecker>> {
         self.tx_nixl_status.clone()
     }
 
@@ -606,12 +614,17 @@ impl TransferContext {
             telemetry,
         };
 
-        // Send to background handler — log error if channel is full or closed
-        if let Err(e) = self.tx_nixl_status.try_send(notification) {
+        // Send to the lossless registration queue. A closed queue means the
+        // completion worker is gone, so poison the event instead of returning
+        // an awaiter that can never resolve.
+        if let Err(e) = self.tx_nixl_status.send(notification) {
             tracing::error!(
-                "Failed to enqueue NIXL status notification: channel full or closed: {}",
+                "Failed to enqueue NIXL status notification: channel closed: {}",
                 e
             );
+            let _ = self
+                .event_system
+                .poison(handle, "NIXL status completion worker stopped".to_owned());
         }
 
         TransferCompleteNotification::from_awaiter(awaiter)
@@ -639,12 +652,17 @@ impl TransferContext {
             telemetry: None,
         };
 
-        // Send to background handler — log error if channel is full or closed
-        if let Err(e) = self.tx_cuda_event.try_send(notification) {
+        // Send to the lossless registration queue. A closed queue means the
+        // completion worker is gone, so poison the event instead of returning
+        // an awaiter that can never resolve.
+        if let Err(e) = self.tx_cuda_event.send(notification) {
             tracing::error!(
-                "Failed to enqueue CUDA event notification: channel full or closed: {}",
+                "Failed to enqueue CUDA event notification: channel closed: {}",
                 e
             );
+            let _ = self
+                .event_system
+                .poison(handle, "CUDA event completion worker stopped".to_owned());
         }
 
         TransferCompleteNotification::from_awaiter(awaiter)

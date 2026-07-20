@@ -136,7 +136,7 @@ fn check_and_warn_slow_transfer(
 /// Generic polling-based transfer completion handler.
 /// Works with any CompletionChecker implementation (NIXL status, CUDA events, etc.)
 pub async fn process_polling_notifications<C: CompletionChecker>(
-    mut rx: mpsc::Receiver<RegisterPollingNotification<C>>,
+    mut rx: mpsc::UnboundedReceiver<RegisterPollingNotification<C>>,
     system: Arc<EventManager>,
 ) {
     let mut outstanding: HashMap<Uuid, OutstandingPollingTransfer<C>> = HashMap::new();
@@ -148,6 +148,11 @@ pub async fn process_polling_notifications<C: CompletionChecker>(
             notification = rx.recv() => {
                 match notification {
                     Some(notif) => {
+                        tracing::debug!(
+                            uuid = %notif.uuid,
+                            checker = std::any::type_name::<C>(),
+                            "registered KVBM polling notification"
+                        );
                         outstanding.insert(notif.uuid, OutstandingPollingTransfer {
                             checker: notif.checker,
                             event_handle: notif.event_handle,
@@ -196,6 +201,12 @@ pub async fn process_polling_notifications<C: CompletionChecker>(
                 // Remove completed transfers and signal completion
                 for (uuid, result) in completed {
                     if let Some(transfer) = outstanding.remove(&uuid) {
+                        tracing::debug!(
+                            uuid = %uuid,
+                            checker = std::any::type_name::<C>(),
+                            success = result.is_ok(),
+                            "completed KVBM polling notification"
+                        );
                         // Per-worker RDMA telemetry: emit on the transition to
                         // complete (this site fires exactly once per transfer).
                         if let Some(tel) = &transfer.telemetry {
@@ -258,5 +269,62 @@ pub async fn process_polling_notifications<C: CompletionChecker>(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use anyhow::Result;
+    use tokio::sync::mpsc;
+    use uuid::Uuid;
+    use velo::EventManager;
+
+    use super::{CompletionChecker, RegisterPollingNotification, process_polling_notifications};
+
+    struct ImmediatelyComplete;
+
+    impl CompletionChecker for ImmediatelyComplete {
+        fn is_complete(&self) -> Result<bool> {
+            Ok(true)
+        }
+    }
+
+    #[tokio::test]
+    async fn polling_registration_queue_is_lossless_under_burst() -> Result<()> {
+        const REGISTRATIONS: usize = 256;
+
+        let system = Arc::new(EventManager::local());
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut awaiters = Vec::with_capacity(REGISTRATIONS);
+
+        // Enqueue the whole burst before the receiver starts. This exceeded
+        // the old capacity of 64 and reproduced the silently lost completion
+        // registrations seen when models expose many fixed KV resources.
+        for _ in 0..REGISTRATIONS {
+            let event = system.new_event()?;
+            let handle = event.into_handle();
+            awaiters.push(system.awaiter(handle)?);
+            tx.send(RegisterPollingNotification {
+                uuid: Uuid::new_v4(),
+                checker: ImmediatelyComplete,
+                event_handle: handle,
+                telemetry: None,
+            })?;
+        }
+        drop(tx);
+
+        let worker = tokio::spawn(process_polling_notifications(rx, Arc::clone(&system)));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            for awaiter in awaiters {
+                awaiter.await?;
+            }
+            Result::<()>::Ok(())
+        })
+        .await??;
+        worker.await?;
+        Ok(())
     }
 }

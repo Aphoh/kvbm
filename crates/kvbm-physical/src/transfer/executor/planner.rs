@@ -1486,12 +1486,12 @@ pub(crate) fn dispatch_transform_kernel(
 /// caller for graceful handling.
 struct OwnedStagedContext {
     event_system: Arc<velo::EventManager>,
-    tx_cuda_event: tokio::sync::mpsc::Sender<
+    tx_cuda_event: tokio::sync::mpsc::UnboundedSender<
         crate::transfer::notifications::RegisterPollingNotification<
             crate::transfer::notifications::CudaEventChecker,
         >,
     >,
-    tx_nixl_status: tokio::sync::mpsc::Sender<
+    tx_nixl_status: tokio::sync::mpsc::UnboundedSender<
         crate::transfer::notifications::RegisterPollingNotification<
             crate::transfer::notifications::NixlStatusChecker,
         >,
@@ -1537,7 +1537,7 @@ impl OwnedStagedContext {
             telemetry: None,
         };
         self.tx_cuda_event
-            .try_send(notification)
+            .send(notification)
             .map_err(|e| anyhow!("staged: failed to enqueue CUDA event notification: {e}"))?;
         Ok(TransferCompleteNotification::from_awaiter(awaiter))
     }
@@ -1562,7 +1562,7 @@ impl OwnedStagedContext {
             telemetry: None,
         };
         self.tx_nixl_status
-            .try_send(notification)
+            .send(notification)
             .map_err(|e| anyhow!("staged: failed to enqueue NIXL status notification: {e}"))?;
         Ok(TransferCompleteNotification::from_awaiter(awaiter))
     }
