@@ -165,6 +165,9 @@ fn library_candidates() -> Vec<PathBuf> {
     if let Some(path) = loaded_nccl_path() {
         candidates.push(path);
     }
+    if let Some(venv) = std::env::var_os("VIRTUAL_ENV") {
+        candidates.extend(venv_nccl_candidates(Path::new(&venv)));
+    }
     for variable in ["NCCL_LIB_DIR", "LD_LIBRARY_PATH"] {
         if let Some(paths) = std::env::var_os(variable) {
             for directory in std::env::split_paths(&paths) {
@@ -175,6 +178,26 @@ fn library_candidates() -> Vec<PathBuf> {
     }
     candidates.extend([PathBuf::from("libnccl.so.2"), PathBuf::from("libnccl.so")]);
     deduplicate_paths(&mut candidates);
+    candidates
+}
+
+fn venv_nccl_candidates(venv: &Path) -> Vec<PathBuf> {
+    let Ok(python_dirs) = std::fs::read_dir(venv.join("lib")) else {
+        return Vec::new();
+    };
+    let mut candidates = Vec::new();
+    for entry in python_dirs.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with("python") {
+            continue;
+        }
+        let directory = entry.path().join("site-packages/nvidia/nccl/lib");
+        for name in ["libnccl.so.2", "libnccl.so"] {
+            let candidate = directory.join(name);
+            if candidate.is_file() {
+                candidates.push(candidate);
+            }
+        }
+    }
     candidates
 }
 
@@ -304,5 +327,18 @@ mod tests {
                 PathBuf::from("libnccl.so.2"),
             ]
         );
+    }
+
+    #[test]
+    fn active_python_environment_exposes_packaged_nccl() {
+        let venv = tempfile::tempdir().unwrap();
+        let nccl_dir = venv
+            .path()
+            .join("lib/python3.12/site-packages/nvidia/nccl/lib");
+        std::fs::create_dir_all(&nccl_dir).unwrap();
+        let versioned = nccl_dir.join("libnccl.so.2");
+        std::fs::write(&versioned, []).unwrap();
+
+        assert_eq!(venv_nccl_candidates(venv.path()), vec![versioned]);
     }
 }
