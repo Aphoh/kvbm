@@ -3,6 +3,7 @@
 
 use super::*;
 
+mod replicated_onboard;
 mod resources;
 
 use crate::leader::dispatch::{PullRef, WirePullOptions, plan_pull};
@@ -16,9 +17,10 @@ use kvbm_common::LogicalResourceId;
 use kvbm_physical::manager::{ParallelismDescriptor, WorkerDataPlacement};
 // velo event types used via fully-qualified paths (::velo::Event, ::velo::EventManager)
 use futures::future::BoxFuture;
-
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+
+use replicated_onboard::{ReplicatedOnboardCoordinator, dispatch_collective_aborts};
 
 /// SPMD (Single Program, Multiple Data) parallel worker group.
 ///
@@ -39,10 +41,8 @@ pub struct SpmdParallelWorkers {
     events: Arc<::velo::EventManager>,
     runtime: tokio::runtime::Handle,
 
-    /// Serializes logical G2 -> G1 operations that may enter replicated
-    /// collectives. Every rank for one logical operation must dispatch before
-    /// any rank enters the next operation on the same NCCL communicators.
-    replicated_onboard_sequence: Arc<tokio::sync::Mutex<()>>,
+    /// Owns sequencing and fatal recovery for replicated G2 -> G1 onboards.
+    replicated_onboard: ReplicatedOnboardCoordinator,
 
     /// Remote handle mappings: (InstanceId, REMOTE rank, LogicalLayoutHandle)
     /// -> remote LayoutHandle. Populated by `connect_remote` for later use
@@ -138,9 +138,9 @@ impl SpmdParallelWorkers {
     ) -> Self {
         Self {
             workers,
-            events,
-            runtime,
-            replicated_onboard_sequence: Arc::new(tokio::sync::Mutex::new(())),
+            events: Arc::clone(&events),
+            runtime: runtime.clone(),
+            replicated_onboard: ReplicatedOnboardCoordinator::new(events, runtime),
             remote_handles: RwLock::new(HashMap::new()),
             remote_tp_sizes: RwLock::new(HashMap::new()),
             remote_descriptors: RwLock::new(HashMap::new()),
@@ -181,40 +181,12 @@ impl SpmdParallelWorkers {
         self.workers.len()
     }
 
-    fn primary_onboard_uses_collectives(&self) -> bool {
-        if self.workers.len() <= 1 {
-            return false;
-        }
-        if let Some(templates) = self.local_template_set.read().unwrap().as_ref() {
-            return templates.get(templates.primary()).is_none_or(|template| {
-                template.worker_data_placement() == WorkerDataPlacement::ReplicatedG1StripedLower
-            });
-        }
-        self.local_template
-            .read()
-            .unwrap()
-            .as_ref()
-            .is_none_or(|template| {
-                template.worker_data_placement() == WorkerDataPlacement::ReplicatedG1StripedLower
-            })
-    }
-
-    fn resource_onboard_uses_collectives(&self, resource: LogicalResourceId) -> bool {
-        if self.workers.len() <= 1 {
-            return false;
-        }
-        if let Some(templates) = self.local_template_set.read().unwrap().as_ref() {
-            return templates.get(resource).is_none_or(|template| {
-                template.worker_data_placement() == WorkerDataPlacement::ReplicatedG1StripedLower
-            });
-        }
-        self.local_template
-            .read()
-            .unwrap()
-            .as_ref()
-            .is_none_or(|template| {
-                template.worker_data_placement() == WorkerDataPlacement::ReplicatedG1StripedLower
-            })
+    fn onboard_requires_serialization(&self, resource: Option<LogicalResourceId>) -> bool {
+        self.workers.len() > 1
+            && self
+                .workers
+                .iter()
+                .any(|worker| worker.local_onboard_requires_serialization(resource))
     }
 
     fn execute_sequenced_onboard<Dispatch>(
@@ -224,33 +196,58 @@ impl SpmdParallelWorkers {
     where
         Dispatch: FnOnce() -> Vec<Result<TransferCompleteNotification>> + Send + 'static,
     {
-        let event = self.events.new_event()?;
-        let awaiter = self.events.awaiter(event.handle())?;
-        let events = Arc::clone(&self.events);
-        let sequence = Arc::clone(&self.replicated_onboard_sequence);
+        let workers = self.workers.clone();
         let runtime = self.runtime.clone();
+        self.replicated_onboard.execute(dispatch, move |reason| {
+            dispatch_collective_aborts(
+                workers,
+                reason,
+                runtime,
+                Arc::new(|worker: Arc<dyn Worker>, reason| worker.abort_local_collectives(reason)),
+            );
+        })
+    }
 
-        self.runtime.spawn(async move {
-            let _sequence_guard = sequence.lock().await;
-            let result = match TransferCompleteNotification::aggregate_results(
-                dispatch(),
-                &events,
-                &runtime,
-            ) {
-                Ok(notification) => notification.await,
-                Err(error) => Err(error),
-            };
-            match result {
-                Ok(()) => {
-                    let _ = event.trigger();
-                }
-                Err(error) => {
-                    let _ = event.poison(error.to_string());
-                }
-            }
-        });
+    fn execute_local_transfer_route(
+        &self,
+        resource: Option<LogicalResourceId>,
+        src: LogicalLayoutHandle,
+        dst: LogicalLayoutHandle,
+        src_block_ids: Arc<[BlockId]>,
+        dst_block_ids: Arc<[BlockId]>,
+        options: kvbm_physical::transfer::TransferOptions,
+    ) -> Result<TransferCompleteNotification> {
+        let workers = self.workers.clone();
+        let dispatch = move || {
+            workers
+                .iter()
+                .map(|worker| match resource {
+                    Some(resource) => worker.execute_local_transfer_for_resource(
+                        resource,
+                        src,
+                        dst,
+                        src_block_ids.clone(),
+                        dst_block_ids.clone(),
+                        options.clone(),
+                    ),
+                    None => worker.execute_local_transfer(
+                        src,
+                        dst,
+                        src_block_ids.clone(),
+                        dst_block_ids.clone(),
+                        options.clone(),
+                    ),
+                })
+                .collect::<Vec<_>>()
+        };
 
-        Ok(TransferCompleteNotification::from_awaiter(awaiter))
+        if src == LogicalLayoutHandle::G2
+            && dst == LogicalLayoutHandle::G1
+            && self.onboard_requires_serialization(resource)
+        {
+            return self.execute_sequenced_onboard(dispatch);
+        }
+        TransferCompleteNotification::aggregate_results(dispatch(), &self.events, &self.runtime)
     }
 
     /// Builder-style: install a local parallelism template so that
@@ -283,6 +280,20 @@ impl SpmdParallelWorkers {
 }
 
 impl WorkerTransfers for SpmdParallelWorkers {
+    fn local_onboard_requires_serialization(&self, resource: Option<LogicalResourceId>) -> bool {
+        self.onboard_requires_serialization(resource)
+    }
+
+    fn abort_local_collectives(&self, reason: String) -> Result<TransferCompleteNotification> {
+        self.replicated_onboard.poison(reason.clone());
+        let notifications = self
+            .workers
+            .iter()
+            .map(|worker| worker.abort_local_collectives(reason.clone()))
+            .collect();
+        TransferCompleteNotification::aggregate_results(notifications, &self.events, &self.runtime)
+    }
+
     fn execute_local_transfer(
         &self,
         src: LogicalLayoutHandle,
@@ -291,41 +302,7 @@ impl WorkerTransfers for SpmdParallelWorkers {
         dst_block_ids: Arc<[BlockId]>,
         options: kvbm_physical::transfer::TransferOptions,
     ) -> Result<TransferCompleteNotification> {
-        if src == LogicalLayoutHandle::G2
-            && dst == LogicalLayoutHandle::G1
-            && self.primary_onboard_uses_collectives()
-        {
-            let workers = self.workers.clone();
-            return self.execute_sequenced_onboard(move || {
-                workers
-                    .iter()
-                    .map(|worker| {
-                        worker.execute_local_transfer(
-                            src,
-                            dst,
-                            src_block_ids.clone(),
-                            dst_block_ids.clone(),
-                            options.clone(),
-                        )
-                    })
-                    .collect()
-            });
-        }
-        let notifications = self
-            .workers
-            .iter()
-            .map(|worker| {
-                worker.execute_local_transfer(
-                    src,
-                    dst,
-                    src_block_ids.clone(),
-                    dst_block_ids.clone(),
-                    options.clone(),
-                )
-            })
-            .collect::<Vec<_>>();
-
-        TransferCompleteNotification::aggregate_results(notifications, &self.events, &self.runtime)
+        self.execute_local_transfer_route(None, src, dst, src_block_ids, dst_block_ids, options)
     }
 
     fn execute_local_transfer_for_resource(
@@ -337,43 +314,14 @@ impl WorkerTransfers for SpmdParallelWorkers {
         dst_block_ids: Arc<[BlockId]>,
         options: kvbm_physical::transfer::TransferOptions,
     ) -> Result<TransferCompleteNotification> {
-        if src == LogicalLayoutHandle::G2
-            && dst == LogicalLayoutHandle::G1
-            && self.resource_onboard_uses_collectives(resource)
-        {
-            let workers = self.workers.clone();
-            return self.execute_sequenced_onboard(move || {
-                workers
-                    .iter()
-                    .map(|worker| {
-                        worker.execute_local_transfer_for_resource(
-                            resource,
-                            src,
-                            dst,
-                            src_block_ids.clone(),
-                            dst_block_ids.clone(),
-                            options.clone(),
-                        )
-                    })
-                    .collect()
-            });
-        }
-        let notifications = self
-            .workers
-            .iter()
-            .map(|worker| {
-                worker.execute_local_transfer_for_resource(
-                    resource,
-                    src,
-                    dst,
-                    src_block_ids.clone(),
-                    dst_block_ids.clone(),
-                    options.clone(),
-                )
-            })
-            .collect::<Vec<_>>();
-
-        TransferCompleteNotification::aggregate_results(notifications, &self.events, &self.runtime)
+        self.execute_local_transfer_route(
+            Some(resource),
+            src,
+            dst,
+            src_block_ids,
+            dst_block_ids,
+            options,
+        )
     }
 
     fn execute_remote_onboard(
@@ -1373,61 +1321,6 @@ mod tests {
     use super::*;
     use kvbm_common::KvDim;
     use kvbm_physical::manager::ParallelismDescriptor;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::Duration;
-
-    #[tokio::test]
-    async fn concurrent_replicated_onboards_are_dispatched_one_logical_operation_at_a_time() {
-        let events = Arc::new(::velo::EventManager::local());
-        let spmd = SpmdParallelWorkers::new(
-            Vec::new(),
-            Arc::clone(&events),
-            tokio::runtime::Handle::current(),
-        );
-        let first_event = events.new_event().unwrap();
-        let first_notification = TransferCompleteNotification::from_awaiter(
-            events.awaiter(first_event.handle()).unwrap(),
-        );
-        let first_started = Arc::new(AtomicBool::new(false));
-        let second_started = Arc::new(AtomicBool::new(false));
-
-        let first = spmd
-            .execute_sequenced_onboard({
-                let first_started = Arc::clone(&first_started);
-                move || {
-                    first_started.store(true, Ordering::SeqCst);
-                    vec![Ok(first_notification)]
-                }
-            })
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !first_started.load(Ordering::SeqCst) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-
-        let second = spmd
-            .execute_sequenced_onboard({
-                let second_started = Arc::clone(&second_started);
-                move || {
-                    second_started.store(true, Ordering::SeqCst);
-                    vec![Ok(TransferCompleteNotification::completed())]
-                }
-            })
-            .unwrap();
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        assert!(
-            !second_started.load(Ordering::SeqCst),
-            "a later logical onboard must not enter the communicator sequence early"
-        );
-
-        first_event.trigger().unwrap();
-        first.await.unwrap();
-        second.await.unwrap();
-        assert!(second_started.load(Ordering::SeqCst));
-    }
 
     fn descriptor(rank: usize, tp_size: usize) -> ParallelismDescriptor {
         ParallelismDescriptor {
