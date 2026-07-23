@@ -7,6 +7,7 @@ use super::attachments::{AttachmentError, AttachmentStore, TypedAttachments};
 use super::{BlockRegistry, PositionalRadixTree};
 
 use crate::blocks::{BlockMetadata, SequenceHash};
+use crate::branch_tracker::BranchOracle;
 
 use std::any::{Any, TypeId};
 use std::marker::PhantomData;
@@ -40,6 +41,9 @@ pub(crate) struct BlockRegistrationHandleInner {
     touch_callbacks: Mutex<Vec<TouchCallback>>,
     /// Weak reference to the registry - allows us to remove the block from the registry on drop
     registry: Weak<PositionalRadixTree<Weak<BlockRegistrationHandleInner>>>,
+    /// Branch oracle to notify on removal (mirrors the registry's own field at the time
+    /// this handle was created). `None` when branch tracking isn't attached -- fail-closed.
+    branch_oracle: Option<Arc<dyn BranchOracle>>,
 }
 
 impl std::fmt::Debug for BlockRegistrationHandleInner {
@@ -59,12 +63,14 @@ impl BlockRegistrationHandleInner {
     pub(super) fn new(
         seq_hash: SequenceHash,
         registry: Weak<PositionalRadixTree<Weak<BlockRegistrationHandleInner>>>,
+        branch_oracle: Option<Arc<dyn BranchOracle>>,
     ) -> Self {
         Self {
             seq_hash,
             attachments: Mutex::new(AttachmentStore::new()),
             touch_callbacks: Mutex::new(Vec::new()),
             registry,
+            branch_oracle,
         }
     }
 }
@@ -101,6 +107,9 @@ impl Drop for BlockRegistrationHandleInner {
         };
         if should_remove {
             map.remove(&self.seq_hash);
+            if let Some(oracle) = &self.branch_oracle {
+                oracle.on_block_removed(self.seq_hash);
+            }
         }
     }
 }

@@ -39,7 +39,7 @@ pub(crate) mod tests;
 pub use attachments::{AttachmentError, TypedAttachments};
 pub use handle::BlockRegistrationHandle;
 
-use crate::{events::EventsManager, tinylfu::FrequencyTracker};
+use crate::{branch_tracker::BranchOracle, events::EventsManager, tinylfu::FrequencyTracker};
 
 use crate::blocks::SequenceHash;
 
@@ -72,6 +72,7 @@ pub(crate) type PositionalRadixTree<V> = dynamo_tokens::PositionalRadixTree<V, S
 pub struct BlockRegistryBuilder {
     frequency_tracker: Option<Arc<dyn FrequencyTracker<u128>>>,
     event_manager: Option<Arc<EventsManager>>,
+    branch_oracle: Option<Arc<dyn BranchOracle>>,
 }
 
 impl BlockRegistryBuilder {
@@ -93,11 +94,19 @@ impl BlockRegistryBuilder {
         self
     }
 
+    /// Sets the branch oracle for branch-point fanout tracking. Unset, the registry is
+    /// a no-op with respect to branch tracking (fail-closed).
+    pub fn branch_oracle(mut self, oracle: Arc<dyn BranchOracle>) -> Self {
+        self.branch_oracle = Some(oracle);
+        self
+    }
+
     /// Builds the BlockRegistry.
     pub fn build(self) -> BlockRegistry {
         BlockRegistry {
             frequency_tracker: self.frequency_tracker,
             event_manager: self.event_manager,
+            branch_oracle: self.branch_oracle,
             prt: Arc::new(PositionalRadixTree::new()),
         }
     }
@@ -111,6 +120,7 @@ pub struct BlockRegistry {
     frequency_tracker: Option<Arc<dyn FrequencyTracker<u128>>>,
     // TODO(delegate): Replace direct EventsManager field with a delegate/observer trait.
     event_manager: Option<Arc<EventsManager>>,
+    branch_oracle: Option<Arc<dyn BranchOracle>>,
 }
 
 impl BlockRegistry {
@@ -246,6 +256,9 @@ impl BlockRegistry {
             tracing::warn!("Failed to register block with event manager: {}", e);
         }
         self.touch(seq_hash);
+        if let Some(oracle) = &self.branch_oracle {
+            oracle.on_block_registered(seq_hash);
+        }
 
         handle
     }
@@ -260,7 +273,18 @@ impl BlockRegistry {
         match weak.upgrade() {
             Some(inner) => BlockRegistrationHandle::from_inner(inner),
             None => {
-                let inner = self.create_registration(seq_hash);
+                // A transfer is a pool-to-pool move, not a new access: it deliberately
+                // skips frequency tracking, and — unlike `register_sequence_hash` — it
+                // does NOT fire `on_block_registered`. A fresh inner must therefore be
+                // created WITHOUT a branch oracle; otherwise its `Drop` would fire an
+                // *unpaired* `on_block_removed` (fanout underflow / phantom-record
+                // delete), because no matching registration was ever observed. See
+                // `registry/handle.rs`'s `Drop` impl, which fires the oracle.
+                let inner = Arc::new(BlockRegistrationHandleInner::new(
+                    seq_hash,
+                    Arc::downgrade(&self.prt),
+                    None,
+                ));
                 *weak = Arc::downgrade(&inner);
                 BlockRegistrationHandle::from_inner(inner)
             }
@@ -271,6 +295,7 @@ impl BlockRegistry {
         Arc::new(BlockRegistrationHandleInner::new(
             seq_hash,
             Arc::downgrade(&self.prt),
+            self.branch_oracle.clone(),
         ))
     }
 
@@ -314,6 +339,11 @@ impl BlockRegistry {
     /// Get the frequency tracker if frequency tracking is enabled.
     pub fn frequency_tracker(&self) -> Option<Arc<dyn FrequencyTracker<u128>>> {
         self.frequency_tracker.clone()
+    }
+
+    /// Get the branch oracle if branch-point tracking is enabled.
+    pub fn branch_oracle(&self) -> Option<Arc<dyn BranchOracle>> {
+        self.branch_oracle.clone()
     }
 }
 
