@@ -145,6 +145,12 @@ fn self_as_parent_key(hash: SequenceHash) -> ParentKey {
 /// that is already live) and idempotent/out-of-order removal (removing an unknown hash
 /// is a no-op). [`NoOpBranchOracle`] is the fail-closed default when nothing is
 /// attached, matching the registry's `frequency_tracker` pattern.
+///
+/// **Non-reentrancy:** a callback must not re-enter the [`BlockRegistry`](crate::registry)
+/// it is attached to (no `register_sequence_hash` / `match_sequence_hash` / `is_registered`
+/// / `remove_batch` on the same registry). The singular removal path fires
+/// `on_block_removed` while holding the entry's position-radix guard, so re-entry
+/// deadlocks. [`BranchPointTracker`] honors this — it only touches its own internal mutex.
 pub trait BranchOracle: Send + Sync {
     /// Called when a block is newly registered in the registry.
     fn on_block_registered(&self, hash: SequenceHash);

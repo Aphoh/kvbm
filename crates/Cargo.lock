@@ -2698,6 +2698,7 @@ dependencies = [
  "bincode 2.0.1",
  "bytes",
  "criterion",
+ "dashmap",
  "derive_builder",
  "dynamo-tokens",
  "futures",
