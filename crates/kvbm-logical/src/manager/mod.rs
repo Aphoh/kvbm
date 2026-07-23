@@ -159,6 +159,26 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
             .release_blocks(blocks, ReleaseOpts { reset_on_release });
     }
 
+    /// Mark the single-owner inactive lineage suffix ending at the leaf
+    /// `seq_hash` for evict-first (compaction poison). Membership-based: a
+    /// no-op unless the leaf is currently resident-inactive, and only the
+    /// valued lineage backend acts on it — every other backend ignores it.
+    /// The walk stops at (without poisoning) the first shared branch point, so
+    /// blocks a live sibling still needs are never demoted. Wired to a client
+    /// compaction hint at the runtime layer (EV-PR4); mirrors the additive
+    /// [`release_blocks`](Self::release_blocks) / `has_inactive` wrappers.
+    pub fn poison_lineage(&self, seq_hash: SequenceHash) {
+        self.store.poison_lineage(seq_hash);
+    }
+
+    /// Test-only: whether `seq_hash`'s resident inactive node is marked
+    /// poisoned. Lets tests observe [`Self::poison_lineage`] reaching the
+    /// valued backend end-to-end (EV-PR4).
+    #[cfg(test)]
+    pub(crate) fn test_is_poisoned(&self, seq_hash: SequenceHash) -> bool {
+        self.store.test_is_poisoned(seq_hash)
+    }
+
     /// Register a single completed block and return an immutable handle.
     pub fn register_block(&self, block: CompleteBlock<T>) -> ImmutableBlock<T> {
         self.metrics.inc_registrations();

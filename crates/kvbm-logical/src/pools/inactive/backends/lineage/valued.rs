@@ -359,7 +359,6 @@ impl ValuedPolicy {
     /// it joins the poison set immediately; if interior, it joins when it next re-leafs.
     /// No-op for an untracked (ghost/free) slot.
     // Production caller is EV-PR4 (`BlockManager::poison_lineage`); exercised by tests now.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn mark_poisoned(&mut self, idx: u32) {
         let is_leaf = {
             let Some(state) = self.slots.get_mut(idx as usize).and_then(|s| s.as_mut()) else {
@@ -379,7 +378,6 @@ impl ValuedPolicy {
     /// Peak fan-out for `seq_hash` treated as a parent, via the attached oracle (`None` if
     /// no oracle, or no record). The backend's poison walk stops at the first ancestor with
     /// `max_fanout ≥ 2` (a shared branch point is never poisoned).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn max_fanout_of(&self, seq_hash: SequenceHash) -> Option<u32> {
         self.oracle.as_ref().and_then(|o| o.max_fanout(seq_hash))
     }

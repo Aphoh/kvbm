@@ -452,9 +452,8 @@ impl LineageBackend {
     ///
     /// Interior shared ancestors are structurally unevictable non-leaves and are never
     /// poisoned; the walk halts at the first ancestor that is a branch point.
-    // Reached in production via `InactiveIndex::poison` once EV-PR4 wires the compaction
-    // hint; exercised by tests now.
-    #[cfg_attr(not(test), allow(dead_code))]
+    // Reached in production via `InactiveIndex::poison`, wired to the client compaction
+    // hint through `BlockManager::poison_lineage` (EV-PR4).
     fn poison_suffix(&mut self, seq_hash: SequenceHash) {
         let position = seq_hash.position();
         let fragment = seq_hash.parent_fragment_for_child_position(position + 1);
@@ -493,7 +492,6 @@ impl LineageBackend {
     /// A node is a (shared) branch point if it currently has ≥ 2 children, or — for a
     /// `Real` node — its monotone high-water `max_fanout` is ≥ 2 (a re-leafed branch point
     /// that may re-fork). A ghost has no hash, so only its current child count counts.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn is_branch_point(&self, idx: u32) -> bool {
         if let Some(first) = self.slots[idx as usize].first_child
             && self.slots[first as usize].next_sibling.is_some()
@@ -601,6 +599,16 @@ impl InactiveIndex for LineageBackend {
 
     fn poison(&mut self, seq_hash: SequenceHash) {
         self.poison_suffix(seq_hash);
+    }
+
+    #[cfg(test)]
+    fn test_is_poisoned(&self, seq_hash: SequenceHash) -> bool {
+        let position = seq_hash.position();
+        let fragment = seq_hash.parent_fragment_for_child_position(position + 1);
+        match self.index.get(&(position, fragment)) {
+            Some(&idx) => self.leaves.test_is_poisoned(idx),
+            None => false,
+        }
     }
 }
 

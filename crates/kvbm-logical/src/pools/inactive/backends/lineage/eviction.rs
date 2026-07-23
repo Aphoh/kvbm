@@ -125,7 +125,6 @@ impl LeafPolicy {
 
     /// Mark slot `idx` poisoned (evict-first). No-op for `Fifo`/`Tick`, which do not
     /// support poisoning.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn mark_poisoned(&mut self, idx: u32) {
         if let Self::Valued(p) = self {
             p.mark_poisoned(idx);
@@ -134,7 +133,6 @@ impl LeafPolicy {
 
     /// Peak fan-out for `seq_hash` as a parent, via `Valued`'s oracle; `None` otherwise.
     /// The backend's poison walk stops at the first `≥ 2` ancestor.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn max_fanout_of(&self, seq_hash: SequenceHash) -> Option<u32> {
         match self {
             Self::Valued(p) => p.max_fanout_of(seq_hash),

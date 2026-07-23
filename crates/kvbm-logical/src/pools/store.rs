@@ -97,9 +97,18 @@ pub(crate) trait InactiveIndex: Send + Sync {
     /// (compaction poison). Default is a no-op — only the lineage backend's valued leaf
     /// policy acts on it; every other backend ignores it. Wired to a client compaction
     /// hint through `BlockManager::poison_lineage` (EV-PR4).
-    #[allow(dead_code)]
     fn poison(&mut self, seq_hash: SequenceHash) {
         let _ = seq_hash;
+    }
+
+    /// Test-only: whether the resident node for `seq_hash` is marked poisoned.
+    /// Default `false` — only the lineage backend's valued policy tracks poison
+    /// marks. Mirrors [`Self::has`] so `BlockManager::test_is_poisoned` can
+    /// observe the compaction-poison wiring end-to-end (EV-PR4).
+    #[cfg(test)]
+    fn test_is_poisoned(&self, seq_hash: SequenceHash) -> bool {
+        let _ = seq_hash;
+        false
     }
 
     /// Drain the entire index.
@@ -438,6 +447,25 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
 
     pub(crate) fn has_inactive(&self, seq_hash: SequenceHash) -> bool {
         self.inner.lock().inactive.has(seq_hash)
+    }
+
+    /// Mark the single-owner inactive lineage suffix ending at `seq_hash` for
+    /// evict-first (compaction poison). Membership-based: a no-op unless the
+    /// leaf is currently resident-inactive, and only the valued lineage backend
+    /// acts on the marks — every other backend ignores them (see
+    /// [`InactiveIndex::poison`]). The additive inverse of the
+    /// [`BlockManager::poison_lineage`](crate::manager::BlockManager::poison_lineage)
+    /// wrapper (EV-PR4); mirrors [`Self::has_inactive`].
+    pub(crate) fn poison_lineage(&self, seq_hash: SequenceHash) {
+        self.inner.lock().inactive.poison(seq_hash);
+    }
+
+    /// Test-only: whether the inactive backend has `seq_hash`'s resident node
+    /// marked poisoned. Mirrors [`Self::has_inactive`]; lets `BlockManager`
+    /// tests observe the compaction-poison wiring (EV-PR4).
+    #[cfg(test)]
+    pub(crate) fn test_is_poisoned(&self, seq_hash: SequenceHash) -> bool {
+        self.inner.lock().inactive.test_is_poisoned(seq_hash)
     }
 
     pub(crate) fn slot_block_size(&self, block_id: BlockId) -> usize {
