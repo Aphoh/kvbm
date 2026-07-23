@@ -25,7 +25,7 @@ use parking_lot::RwLock;
 
 use crate::blocks::{BlockMetadata, CompleteBlock, ImmutableBlock, MutableBlock};
 use crate::metrics::BlockPoolMetrics;
-use crate::pools::{BlockDuplicationPolicy, BlockStore, SequenceHash};
+use crate::pools::{BlockDuplicationPolicy, BlockStore, ReleaseOpts, SequenceHash};
 use crate::registry::BlockRegistry;
 
 /// Manages the full block lifecycle over the unified [`BlockStore`].
@@ -139,6 +139,24 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
             .into_iter()
             .map(|block| self.register_block(block))
             .collect()
+    }
+
+    /// Release a batch of immutable blocks under a *single* store-mutex
+    /// acquisition — the batched inverse of [`register_blocks`](Self::register_blocks).
+    ///
+    /// Dropping N `ImmutableBlock`s one-at-a-time takes the store lock N
+    /// times (once per `Drop` → `release_primary`); routing them through
+    /// here takes it once. `reset_on_release`, when `Some(v)`, overrides
+    /// every released block's per-slot reset flag *inside that same
+    /// critical section* — `Some(true)` sends them straight to `Reset`
+    /// (an eviction teardown), `Some(false)` forces the inactive pool,
+    /// `None` leaves each slot's existing override (or the store-wide
+    /// default) untouched (an ordinary finish). This replaces a separate
+    /// per-block `ImmutableBlock::set_evict_on_reset` traversal that would
+    /// otherwise take the lock once more per block.
+    pub fn release_blocks(&self, blocks: Vec<ImmutableBlock<T>>, reset_on_release: Option<bool>) {
+        self.store
+            .release_blocks(blocks, ReleaseOpts { reset_on_release });
     }
 
     /// Register a single completed block and return an immutable handle.
