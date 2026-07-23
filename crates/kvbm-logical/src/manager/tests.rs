@@ -996,6 +996,145 @@ mod registration_tests {
         }
     }
 
+    /// E5 (load-bearing): the two-phase prefix-caching path can register the SAME hash
+    /// twice in one scheduling window (both requests prefill before either registers). Under
+    /// `Allow` on the valued lineage backend, both prefilled pages must stay pinned on
+    /// DISTINCT slots — `Reject` would free the loser's still-referenced page (a
+    /// use-after-free). Also drives allocate → complete → register → drop → re-allocate
+    /// end-to-end against the valued backend (builder wiring, hook flow, no spurious
+    /// allocate_atomic rollback).
+    #[test]
+    fn valued_backend_allow_duplicate_registration_no_use_after_free() {
+        let registry = BlockRegistry::new();
+        let manager = BlockManager::<TestBlockData>::builder()
+            .block_count(10)
+            .block_size(4)
+            .registry(registry)
+            .duplication_policy(BlockDuplicationPolicy::Allow)
+            .with_valued_lineage_backend(ScorerParams::default())
+            .build()
+            .expect("Should build valued-backend manager");
+
+        let token_block = create_test_token_block_from_iota(400);
+        let seq_hash = token_block.kvbm_sequence_hash();
+
+        // Same hash prefilled twice, then both registered — the reachable G1 duplicate case.
+        let cb1 = manager
+            .allocate_blocks(1)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .complete(&token_block)
+            .unwrap();
+        let cb2 = manager
+            .allocate_blocks(1)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .complete(&token_block)
+            .unwrap();
+        let ib1 = manager.register_blocks(vec![cb1]);
+        let ib2 = manager.register_blocks(vec![cb2]);
+
+        assert_eq!(ib1[0].sequence_hash(), seq_hash);
+        assert_eq!(ib2[0].sequence_hash(), seq_hash);
+        assert_ne!(
+            ib1[0].block_id(),
+            ib2[0].block_id(),
+            "Allow must keep both prefilled pages pinned on distinct slots (no use-after-free)"
+        );
+        assert_eq!(manager.metrics().snapshot().duplicate_blocks, 1);
+
+        // The registration is matchable while alive.
+        let matched = manager.match_blocks(&[seq_hash]);
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].sequence_hash(), seq_hash);
+
+        // Drop everything → primary lands in the valued inactive pool, duplicate resets; a
+        // full re-allocation drains cleanly (no rollback storm, counts consistent).
+        drop((ib1, ib2, matched));
+        assert!(
+            manager.allocate_blocks(10).is_some(),
+            "all slots reclaimable through the valued backend"
+        );
+    }
+
+    /// The valued backend's public `ScorerParams` are validated at build time so a bad
+    /// value (NaN γ, out-of-range γ, zero exponent, `t_blocks=Some(0)`) fails fast instead
+    /// of producing runtime NaN scores that stall eviction into a rollback.
+    #[test]
+    fn valued_backend_rejects_invalid_scorer_params() {
+        let base = ScorerParams::default();
+        let bad = [
+            ScorerParams {
+                gamma: f64::NAN,
+                ..base.clone()
+            },
+            ScorerParams {
+                gamma: 1.5,
+                ..base.clone()
+            },
+            ScorerParams {
+                gamma: -0.1,
+                ..base.clone()
+            },
+            ScorerParams {
+                n: 0,
+                ..base.clone()
+            },
+            ScorerParams {
+                t_blocks: Some(0),
+                ..base.clone()
+            },
+        ];
+        for params in bad {
+            let res = BlockManager::<TestBlockData>::builder()
+                .block_count(4)
+                .block_size(4)
+                .registry(BlockRegistry::new())
+                .with_valued_lineage_backend(params)
+                .build();
+            assert!(res.is_err(), "invalid scorer params must fail build");
+        }
+
+        let ok = BlockManager::<TestBlockData>::builder()
+            .block_count(4)
+            .block_size(4)
+            .registry(BlockRegistry::new())
+            .with_valued_lineage_backend(ScorerParams {
+                gamma: 0.6,
+                n: 2,
+                k_sample: 16,
+                t_blocks: Some(1000),
+                seed: 1,
+            })
+            .build();
+        assert!(ok.is_ok(), "valid scorer params must build");
+    }
+
+    /// Regression: a later non-valued backend selector overrides an earlier
+    /// `with_valued_lineage_backend`, so the now-unused (even invalid) scorer params must
+    /// NOT fail the build — validation is gated on the *selected* backend.
+    #[test]
+    fn later_backend_selector_ignores_stale_scorer_params() {
+        let res = BlockManager::<TestBlockData>::builder()
+            .block_count(4)
+            .block_size(4)
+            .registry(BlockRegistry::new())
+            .with_valued_lineage_backend(ScorerParams {
+                gamma: f64::NAN,
+                ..ScorerParams::default()
+            })
+            .with_lineage_backend() // overrides to a non-valued backend
+            .build();
+        assert!(
+            res.is_ok(),
+            "a later non-valued backend must ignore stale scorer params"
+        );
+    }
+
     #[test]
     fn test_register_mutable_block_from_existing_reject_returns_block_to_reset_pool() {
         let registry = BlockRegistry::new();

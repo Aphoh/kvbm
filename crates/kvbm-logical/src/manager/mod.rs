@@ -12,6 +12,7 @@ mod builder;
 #[cfg(test)]
 mod tests;
 
+pub use crate::pools::backends::ScorerParams;
 pub use builder::{
     BlockManagerBuilderError, BlockManagerConfigBuilder, BlockManagerResetError,
     FrequencyTrackingCapacity, InactiveBackendConfig, LineageEviction,

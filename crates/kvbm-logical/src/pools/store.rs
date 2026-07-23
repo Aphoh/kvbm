@@ -93,6 +93,15 @@ pub(crate) trait InactiveIndex: Send + Sync {
     #[allow(dead_code)]
     fn take(&mut self, seq_hash: SequenceHash, block_id: BlockId) -> bool;
 
+    /// Mark the single-owner lineage suffix ending at `seq_hash` for evict-first
+    /// (compaction poison). Default is a no-op — only the lineage backend's valued leaf
+    /// policy acts on it; every other backend ignores it. Wired to a client compaction
+    /// hint through `BlockManager::poison_lineage` (EV-PR4).
+    #[allow(dead_code)]
+    fn poison(&mut self, seq_hash: SequenceHash) {
+        let _ = seq_hash;
+    }
+
     /// Drain the entire index.
     fn allocate_all(&mut self) -> Vec<(SequenceHash, BlockId)> {
         let n = self.len();
