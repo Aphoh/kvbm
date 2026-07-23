@@ -35,6 +35,8 @@
 //! tail instead; it is opt-in via `with_lineage_backend_eviction`.
 
 mod eviction;
+#[cfg(test)]
+mod trace_tests;
 mod valued;
 
 pub(crate) use eviction::LeafPolicy;
@@ -145,6 +147,12 @@ pub(crate) struct LineageBackend {
     leaves: LeafPolicy,
     /// Number of `Real` nodes (ghosts excluded).
     count: usize,
+    /// Test-only: total prune-loop iterations executed by `remove_node_at`
+    /// since the last reset. Basis for the machine-independent O(depth)
+    /// amortization proof (see the `trace_tests` deep-chain test). Zero cost
+    /// and absent in non-test builds.
+    #[cfg(test)]
+    prune_iters: u64,
 }
 
 impl Default for LineageBackend {
@@ -180,6 +188,8 @@ impl LineageBackend {
             index: HashMap::with_capacity_and_hasher(capacity, PairBuildHasher),
             leaves,
             count: 0,
+            #[cfg(test)]
+            prune_iters: 0,
         }
     }
 
@@ -392,6 +402,10 @@ impl LineageBackend {
         // simply stays as a Ghost.
         let mut cur = idx;
         loop {
+            #[cfg(test)]
+            {
+                self.prune_iters += 1;
+            }
             if self.slots[cur as usize].first_child.is_some() {
                 break;
             }
@@ -587,6 +601,22 @@ impl InactiveIndex for LineageBackend {
 
     fn poison(&mut self, seq_hash: SequenceHash) {
         self.poison_suffix(seq_hash);
+    }
+}
+
+#[cfg(test)]
+impl LineageBackend {
+    /// Test-only: total prune-loop iterations executed by `remove_node_at`
+    /// since the last [`reset_prune_iters`](Self::reset_prune_iters) — the
+    /// operation-count basis for the O(depth) amortization proof. Visible to
+    /// the sibling `trace_tests` module (hence module-level, not in `tests`).
+    pub(crate) fn prune_iters(&self) -> u64 {
+        self.prune_iters
+    }
+
+    /// Test-only: reset the prune-iteration counter to zero.
+    pub(crate) fn reset_prune_iters(&mut self) {
+        self.prune_iters = 0;
     }
 }
 

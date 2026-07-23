@@ -57,3 +57,11 @@ tracing-subscriber = { workspace = true }
 name = "block_manager"
 harness = false
 required-features = ["testing"]
+
+# Criterion benchmark for the valued leaf-eviction policy (EV-PR3): per-event
+# cost, flat-with-n `next_victim`, and deep-chain eviction. Also needs the
+# `testing` feature for `create_test_manager_with_backend`.
+[[bench]]
+name = "eviction_policy"
+harness = false
+required-features = ["testing"]
