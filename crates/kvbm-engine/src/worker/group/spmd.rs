@@ -3,6 +3,7 @@
 
 use super::*;
 
+mod object_aggregation;
 mod replicated_onboard;
 mod resources;
 
@@ -20,6 +21,7 @@ use futures::future::BoxFuture;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use object_aggregation::{aggregate_object_presence, aggregate_object_results};
 use replicated_onboard::{ReplicatedOnboardCoordinator, dispatch_collective_aborts};
 
 /// SPMD (Single Program, Multiple Data) parallel worker group.
@@ -129,8 +131,8 @@ impl SpmdParallelWorkers {
     ///
     /// # Arguments
     /// * `workers` - The underlying workers (one per rank)
-    /// * `events` - The event system for aggregating completion notifications
-    /// * `runtime` - The tokio runtime handle for spawning aggregation tasks
+    /// * `events` - The shared event manager
+    /// * `runtime` - The shared tokio runtime handle
     pub fn new(
         workers: Vec<Arc<dyn Worker>>,
         events: Arc<::velo::EventManager>,
@@ -1191,18 +1193,13 @@ impl ObjectBlockOps for SpmdParallelWorkers {
         &self,
         keys: Vec<SequenceHash>,
     ) -> BoxFuture<'static, Vec<(SequenceHash, Option<usize>)>> {
-        // For has_blocks, we query all workers and verify consistency.
-        // All workers should agree on block presence for SPMD semantics.
-        // We return the results from worker 0 but verify all workers agree.
         let workers = self.workers.clone();
-        let _runtime = self.runtime.clone();
 
         Box::pin(async move {
             if workers.is_empty() {
                 return keys.into_iter().map(|k| (k, None)).collect();
             }
 
-            // Query all workers in parallel
             let futures: Vec<_> = workers
                 .iter()
                 .map(|worker| worker.has_blocks(keys.clone()))
@@ -1210,10 +1207,7 @@ impl ObjectBlockOps for SpmdParallelWorkers {
 
             let results: Vec<Vec<(SequenceHash, Option<usize>)>> =
                 futures::future::join_all(futures).await;
-
-            // Return results from first worker (all should agree in SPMD)
-            // In debug mode, we could verify consistency across workers
-            results.into_iter().next().unwrap_or_default()
+            aggregate_object_presence(&keys, results)
         })
     }
 
@@ -1242,27 +1236,7 @@ impl ObjectBlockOps for SpmdParallelWorkers {
 
             let results: Vec<Vec<Result<SequenceHash, SequenceHash>>> =
                 futures::future::join_all(futures).await;
-
-            // Aggregate: a key succeeded only if ALL workers succeeded
-            let num_keys = keys.len();
-            let mut aggregated = Vec::with_capacity(num_keys);
-
-            for (key_idx, key) in keys.iter().enumerate() {
-                let all_succeeded = results.iter().all(|worker_results| {
-                    worker_results
-                        .get(key_idx)
-                        .map(|r| r.is_ok())
-                        .unwrap_or(false)
-                });
-
-                if all_succeeded {
-                    aggregated.push(Ok(*key));
-                } else {
-                    aggregated.push(Err(*key));
-                }
-            }
-
-            aggregated
+            aggregate_object_results(&keys, results)
         })
     }
 
@@ -1291,27 +1265,7 @@ impl ObjectBlockOps for SpmdParallelWorkers {
 
             let results: Vec<Vec<Result<SequenceHash, SequenceHash>>> =
                 futures::future::join_all(futures).await;
-
-            // Aggregate: a key succeeded only if ALL workers succeeded
-            let num_keys = keys.len();
-            let mut aggregated = Vec::with_capacity(num_keys);
-
-            for (key_idx, key) in keys.iter().enumerate() {
-                let all_succeeded = results.iter().all(|worker_results| {
-                    worker_results
-                        .get(key_idx)
-                        .map(|r| r.is_ok())
-                        .unwrap_or(false)
-                });
-
-                if all_succeeded {
-                    aggregated.push(Ok(*key));
-                } else {
-                    aggregated.push(Err(*key));
-                }
-            }
-
-            aggregated
+            aggregate_object_results(&keys, results)
         })
     }
 }
