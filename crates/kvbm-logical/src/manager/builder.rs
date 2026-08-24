@@ -6,6 +6,8 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use crate::metrics::{BlockPoolMetrics, MetricsAggregator, short_type_name};
 use crate::tinylfu::TinyLFUTracker;
 
@@ -15,13 +17,13 @@ use crate::{
         BlockDuplicationPolicy, BlockStore, InactiveIndex,
         backends::{
             FifoReusePolicy, HashMapBackend, LeafPolicy, LineageBackend, LruBackend,
-            MultiLruBackend,
+            MultiLruBackend, ScorerParams,
         },
     },
     registry::BlockRegistry,
 };
 
-use super::BlockManager;
+use super::{BlockManager, EvictionNotifier};
 
 /// Capacity settings for the TinyLFU frequency tracker used by
 /// [`BlockRegistry`] and the multi-level LRU backend.
@@ -52,7 +54,9 @@ impl FrequencyTrackingCapacity {
     }
 }
 
-/// Configuration for the inactive pool backend.
+/// Serializable construction policy for the inactive pool backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "backend", rename_all = "snake_case")]
 pub enum InactiveBackendConfig {
     /// HashMap with FIFO reuse order.
     HashMap,
@@ -69,11 +73,27 @@ pub enum InactiveBackendConfig {
         /// Leaf-eviction ordering. Default: [`LineageEviction::Tick`].
         eviction: LineageEviction,
     },
+    /// Lineage backend with the sampled-min **valued** leaf policy: frequency × recency ×
+    /// proximity-to-compaction discount × fan-out boost, plus a poison FIFO. Scorer
+    /// constants ride a private builder field ([`ScorerParams`]), deliberately NOT this
+    /// `Copy + Eq + Serialize` enum. `#[non_exhaustive]` so it can gain a sub-selector later
+    /// without a breaking change.
+    #[non_exhaustive]
+    ValuedLineage {},
+}
+
+impl Default for InactiveBackendConfig {
+    fn default() -> Self {
+        Self::Lineage {
+            eviction: LineageEviction::default(),
+        }
+    }
 }
 
 /// Leaf-eviction ordering for the [`Lineage`](InactiveBackendConfig::Lineage)
 /// inactive backend.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LineageEviction {
     /// `BTreeMap` ordered by a per-node insertion tick — a node that
     /// re-becomes a leaf returns to its original position. Historical
@@ -130,6 +150,11 @@ pub struct BlockManagerConfigBuilder<T: BlockMetadata> {
     /// Inactive pool backend configuration
     inactive_backend: Option<InactiveBackendConfig>,
 
+    /// Scorer constants for the valued lineage backend. Kept OFF
+    /// `InactiveBackendConfig` (which derives `Copy + Eq + Serialize`) because
+    /// [`ScorerParams`] carries an `f64` γ — the eviction plan's guardrail 1.
+    scorer_params: Option<ScorerParams>,
+
     /// Policy for handling duplicate sequence hashes
     duplication_policy: Option<BlockDuplicationPolicy>,
 
@@ -154,6 +179,7 @@ impl<T: BlockMetadata> Default for BlockManagerConfigBuilder<T> {
             block_size: Some(16), // Default to 16 tokens per block
             registry: None,
             inactive_backend: None,
+            scorer_params: None,
             duplication_policy: None,
             aggregator: None,
             default_reset_on_release: None,
@@ -206,6 +232,12 @@ impl<T: BlockMetadata> BlockManagerConfigBuilder<T> {
     /// Set the block registry.
     pub fn registry(mut self, registry: BlockRegistry) -> Self {
         self.registry = Some(registry);
+        self
+    }
+
+    /// Select the inactive backend from serializable policy data.
+    pub fn inactive_backend(mut self, policy: InactiveBackendConfig) -> Self {
+        self.inactive_backend = Some(policy);
         self
     }
 
@@ -290,6 +322,16 @@ impl<T: BlockMetadata> BlockManagerConfigBuilder<T> {
     }
 
     /// Use the lineage backend with an explicit leaf-eviction policy.
+    /// Use the lineage backend with the sampled-min **valued** leaf policy. `params`
+    /// carries the scorer constants (defaults: γ=0.6, n=2, K=16, T unset). At `build`, the
+    /// backend draws the TinyLFU sketch and branch oracle from the configured registry if
+    /// present; with neither, scoring degenerates to recency (LRU).
+    pub fn with_valued_lineage_backend(mut self, params: ScorerParams) -> Self {
+        self.inactive_backend = Some(InactiveBackendConfig::ValuedLineage {});
+        self.scorer_params = Some(params);
+        self
+    }
+
     pub fn with_lineage_backend_eviction(mut self, eviction: LineageEviction) -> Self {
         self.inactive_backend = Some(InactiveBackendConfig::Lineage { eviction });
         self
@@ -365,6 +407,38 @@ impl<T: BlockMetadata> BlockManagerConfigBuilder<T> {
             }
         }
 
+        // Validate the valued-lineage scorer constants so that misconfiguration is a
+        // build-time error rather than a runtime NaN that stalls eviction. `ScorerParams`
+        // is public (serve time sets `t_blocks`), so the bounds are enforced here, not
+        // assumed. See `ScorerParams` / the scorer contract. Gated on the *selected* backend
+        // so a later `with_lru_backend()`/etc. that overrides an earlier
+        // `with_valued_lineage_backend` does not fail the build over now-unused params.
+        if matches!(
+            self.inactive_backend,
+            Some(InactiveBackendConfig::ValuedLineage {})
+        ) && let Some(params) = &self.scorer_params
+        {
+            if !params.gamma.is_finite() || !(0.0..=1.0).contains(&params.gamma) {
+                return Err(format!(
+                    "Invalid scorer gamma {}: must be finite and in [0.0, 1.0]",
+                    params.gamma
+                ));
+            }
+            if params.n == 0 || params.n > 16 {
+                return Err(format!(
+                    "Invalid scorer exponent n={}: must be in 1..=16",
+                    params.n
+                ));
+            }
+            if matches!(params.t_blocks, Some(0)) {
+                return Err(
+                    "Invalid scorer t_blocks=Some(0): use None to disable the compaction \
+                     penalty, or a positive budget"
+                        .to_string(),
+                );
+            }
+        }
+
         Ok(())
     }
 
@@ -389,21 +463,22 @@ impl<T: BlockMetadata> BlockManagerConfigBuilder<T> {
 
         metrics.set_reset_pool_size(block_count as i64);
 
-        // Create backend based on configuration
-        let backend: Box<dyn InactiveIndex> = match self.inactive_backend.take() {
-            Some(InactiveBackendConfig::HashMap) => {
+        // Create backend based on configuration.
+        let inactive_backend = self.inactive_backend.take().unwrap_or_default();
+        let backend: Box<dyn InactiveIndex> = match inactive_backend {
+            InactiveBackendConfig::HashMap => {
                 tracing::info!("Using HashMap for inactive pool");
                 Box::new(HashMapBackend::new(Box::new(FifoReusePolicy::new())))
             }
-            Some(InactiveBackendConfig::Lru) => {
+            InactiveBackendConfig::Lru => {
                 // Capacity automatically set to block_count
                 let capacity = NonZeroUsize::new(block_count).expect("block_count must be > 0");
                 tracing::info!("Using LRU for inactive pool");
                 Box::new(LruBackend::new(capacity))
             }
-            Some(InactiveBackendConfig::MultiLru {
+            InactiveBackendConfig::MultiLru {
                 frequency_thresholds,
-            }) => {
+            } => {
                 // Require frequency tracker for MultiLRU
                 let frequency_tracker = registry.frequency_tracker().ok_or_else(|| {
                     BlockManagerBuilderError::InvalidBackend(
@@ -429,19 +504,32 @@ impl<T: BlockMetadata> BlockManagerConfigBuilder<T> {
                     .map_err(|e| BlockManagerBuilderError::InvalidBackend(e.to_string()))?,
                 )
             }
-            Some(InactiveBackendConfig::Lineage { eviction }) => {
+            InactiveBackendConfig::Lineage { eviction } => {
                 tracing::info!("Using Lineage inactive backend ({eviction:?})");
                 Box::new(LineageBackend::with_policy(
                     block_count,
                     lineage_leaf_policy(eviction, block_count),
                 ))
             }
-            None => {
-                let eviction = LineageEviction::default();
-                tracing::info!("Using default inactive backend: Lineage ({eviction:?})");
+            InactiveBackendConfig::ValuedLineage {} => {
+                // Sketch and oracle are OPTIONAL: with neither, the scorer degenerates to
+                // pure recency (LRU). No hard requirement like MultiLRU's tracker.
+                let params = self.scorer_params.take().unwrap_or_default();
+                tracing::info!(
+                    "Using valued Lineage inactive backend (γ={}, n={}, K={}, T_blocks={:?})",
+                    params.gamma,
+                    params.n,
+                    params.k_sample,
+                    params.t_blocks,
+                );
                 Box::new(LineageBackend::with_policy(
                     block_count,
-                    lineage_leaf_policy(eviction, block_count),
+                    LeafPolicy::valued(
+                        block_count,
+                        registry.frequency_tracker(),
+                        registry.branch_oracle(),
+                        params,
+                    ),
                 ))
             }
         };
@@ -463,12 +551,14 @@ impl<T: BlockMetadata> BlockManagerConfigBuilder<T> {
         Ok(BlockManager {
             store,
             block_registry: registry,
+            inactive_backend,
             duplication_policy: self
                 .duplication_policy
                 .unwrap_or(BlockDuplicationPolicy::Allow),
             total_blocks: block_count,
             block_size,
             metrics,
+            eviction_notifier: EvictionNotifier::default(),
         })
     }
 }

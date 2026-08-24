@@ -617,15 +617,15 @@ fn spawn_worker_thread(
         .name(format!("bench-gpu-{device_id}"))
         .spawn(move || {
             // Pin to device's NUMA node
-            if let Some(cpus) = dynamo_memory::numa::get_device_cpu_set(device_id) {
+            if let Some(cpus) = kvbm_memory::numa::get_device_cpu_set(device_id) {
                 eprintln!(
                     "[GPU {device_id}] Worker pinned to CPUs: {}",
                     format_cpu_set(&cpus)
                 );
                 pin_thread_to_cpus(&cpus);
-            } else if let Some(node) = dynamo_memory::numa::get_device_numa_node(device_id) {
+            } else if let Some(node) = kvbm_memory::numa::get_device_numa_node(device_id) {
                 eprintln!("[GPU {device_id}] Worker pinned to NUMA node {node}");
-                let _ = dynamo_memory::numa::pin_thread_to_numa_node(node);
+                let _ = kvbm_memory::numa::pin_thread_to_numa_node(node);
             } else {
                 eprintln!("[GPU {device_id}] No NUMA pinning (node unknown)");
             }
@@ -833,8 +833,6 @@ impl BenchInstance {
         // Build OffloadEngine if requested
         let offload_engine = if config.offload {
             let mut engine_builder = OffloadEngine::builder(Arc::new(leader.clone()))
-                .with_registry(Arc::new(registry.clone()))
-                .with_g2_manager(g2_manager.clone())
                 .with_runtime(tokio::runtime::Handle::current());
 
             if let Some(ref g3m) = g3_manager {

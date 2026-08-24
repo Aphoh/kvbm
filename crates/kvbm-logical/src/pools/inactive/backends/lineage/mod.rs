@@ -34,9 +34,16 @@
 //! variant is O(1) and allocation-free but appends a re-leafed node at the
 //! tail instead; it is opt-in via `with_lineage_backend_eviction`.
 
+#[cfg(test)]
+mod advice_tests;
 mod eviction;
+mod hold;
+#[cfg(test)]
+mod trace_tests;
+mod valued;
 
 pub(crate) use eviction::LeafPolicy;
+pub use valued::ScorerParams;
 
 use std::collections::HashMap;
 use std::hash::{BuildHasher, Hasher};
@@ -45,7 +52,8 @@ use dynamo_tokens::PositionalLineageHash;
 
 use crate::BlockId;
 use crate::blocks::SequenceHash;
-use crate::pools::store::InactiveIndex;
+use crate::pools::advice::{InactiveFeatures, evict_rank_for};
+use crate::pools::store::{ExactReclaimPlanError, InactiveIndex};
 
 // ---------------------------------------------------------------------------
 // `(position, fragment)` index hasher
@@ -143,6 +151,12 @@ pub(crate) struct LineageBackend {
     leaves: LeafPolicy,
     /// Number of `Real` nodes (ghosts excluded).
     count: usize,
+    /// Test-only: total prune-loop iterations executed by `remove_node_at`
+    /// since the last reset. Basis for the machine-independent O(depth)
+    /// amortization proof (see the `trace_tests` deep-chain test). Zero cost
+    /// and absent in non-test builds.
+    #[cfg(test)]
+    prune_iters: u64,
 }
 
 impl Default for LineageBackend {
@@ -178,6 +192,8 @@ impl LineageBackend {
             index: HashMap::with_capacity_and_hasher(capacity, PairBuildHasher),
             leaves,
             count: 0,
+            #[cfg(test)]
+            prune_iters: 0,
         }
     }
 
@@ -261,7 +277,7 @@ impl LineageBackend {
                     SlotData::Ghost => {
                         self.slots[idx as usize].data = SlotData::Real { block_id, seq_hash };
                         self.count += 1;
-                        self.leaves.on_node_inserted(idx);
+                        self.leaves.on_node_inserted(idx, seq_hash);
                     }
                     SlotData::Real {
                         seq_hash: existing, ..
@@ -300,7 +316,7 @@ impl LineageBackend {
                 });
                 self.index.insert((position, fragment), idx);
                 self.count += 1;
-                self.leaves.on_node_inserted(idx);
+                self.leaves.on_node_inserted(idx, seq_hash);
                 idx
             }
         };
@@ -390,6 +406,10 @@ impl LineageBackend {
         // simply stays as a Ghost.
         let mut cur = idx;
         loop {
+            #[cfg(test)]
+            {
+                self.prune_iters += 1;
+            }
             if self.slots[cur as usize].first_child.is_some() {
                 break;
             }
@@ -426,6 +446,94 @@ impl LineageBackend {
             }
         }
         payload
+    }
+
+    /// Poison the single-owner suffix ending at the leaf `seq_hash`: walk leaf → parent,
+    /// marking each node poisoned in the leaf policy (so it is evicted first once it is a
+    /// leaf), and stop at — **without** poisoning — the first shared branch point. A no-op
+    /// unless `seq_hash` names a resident `Real` node; the leaf policy itself ignores the
+    /// marks unless it is the [`Valued`](eviction::LeafPolicy::Valued) arm.
+    ///
+    /// Interior shared ancestors are structurally unevictable non-leaves and are never
+    /// poisoned; the walk halts at the first ancestor that is a branch point.
+    // Reached in production via `InactiveIndex::poison`, wired to the client compaction
+    // hint through `BlockManager::poison_lineage` (EV-PR4).
+    fn poison_suffix(&mut self, seq_hash: SequenceHash) {
+        let position = seq_hash.position();
+        let fragment = seq_hash.parent_fragment_for_child_position(position + 1);
+        let Some(&start) = self.index.get(&(position, fragment)) else {
+            return;
+        };
+        // Only the Real node stored under the FULL hash is a valid poison target (the
+        // `(position, fragment)` key alone can collide across distinct PLHs).
+        match self.slots[start as usize].data {
+            SlotData::Real {
+                seq_hash: stored, ..
+            } if stored == seq_hash => {}
+            _ => return,
+        }
+
+        let mut cur = start;
+        loop {
+            // Stop at a ghost placeholder: it has no stored hash, so its high-water branch
+            // identity is unknowable (a formerly-shared branch point that was evicted becomes
+            // a ghost). Walking past it could poison a real shared ancestor above. Ghosts are
+            // absent in the common in-order case; stopping here only ever *under*-poisons.
+            if matches!(self.slots[cur as usize].data, SlotData::Ghost) {
+                break;
+            }
+            if self.is_branch_point(cur) {
+                break; // shared branch point — never poisoned
+            }
+            self.leaves.mark_poisoned(cur);
+            match self.slots[cur as usize].parent {
+                Some(parent) => cur = parent,
+                None => break,
+            }
+        }
+    }
+
+    /// `(seq_hash, block_id)` of the `Real` node at `idx`; `None` for a ghost or
+    /// freed slot.
+    fn real_payload(&self, idx: u32) -> Option<(SequenceHash, BlockId)> {
+        match self.slots.get(idx as usize)?.data {
+            SlotData::Real { seq_hash, block_id } => Some((seq_hash, block_id)),
+            _ => None,
+        }
+    }
+
+    /// Read-only feature snapshot for the `Real` node at `idx`: the leaf
+    /// policy's per-node advice plus the graph's own structural `is_leaf`, with
+    /// the caller-supplied peek-relative rank. Mutates nothing.
+    fn features_for(&self, idx: u32, evict_rank: Option<u8>) -> InactiveFeatures {
+        let advice = self.leaves.advice_for(idx);
+        InactiveFeatures {
+            poisoned: advice.poisoned,
+            // Structural truth from the graph, not from policy membership: an
+            // interior node is unevictable no matter what the policy thinks.
+            is_leaf: self.slots[idx as usize].is_leaf(),
+            age_ticks: advice.age_ticks,
+            freq_estimate: advice.freq_estimate,
+            max_fanout: advice.max_fanout,
+            evict_rank,
+        }
+    }
+
+    /// A node is a (shared) branch point if it currently has ≥ 2 children, or — for a
+    /// `Real` node — its monotone high-water `max_fanout` is ≥ 2 (a re-leafed branch point
+    /// that may re-fork). A ghost has no hash, so only its current child count counts.
+    fn is_branch_point(&self, idx: u32) -> bool {
+        if let Some(first) = self.slots[idx as usize].first_child
+            && self.slots[first as usize].next_sibling.is_some()
+        {
+            return true; // ≥ 2 live children right now
+        }
+        match self.slots[idx as usize].data {
+            SlotData::Real { seq_hash, .. } => {
+                self.leaves.max_fanout_of(seq_hash).is_some_and(|f| f >= 2)
+            }
+            _ => false,
+        }
     }
 }
 
@@ -498,6 +606,25 @@ impl InactiveIndex for LineageBackend {
         })
     }
 
+    #[cfg(test)]
+    fn contains(&self, seq_hash: SequenceHash, block_id: BlockId) -> bool {
+        let position = seq_hash.position();
+        let fragment = seq_hash.parent_fragment_for_child_position(position + 1);
+        self.index.get(&(position, fragment)).is_some_and(|&idx| {
+            match self.slots[idx as usize].data {
+                SlotData::Real {
+                    seq_hash: stored,
+                    block_id: stored_id,
+                } => {
+                    stored == seq_hash
+                        && stored_id == block_id
+                        && self.slots[idx as usize].is_leaf()
+                }
+                _ => false,
+            }
+        })
+    }
+
     fn take(&mut self, seq_hash: SequenceHash, block_id: BlockId) -> bool {
         // Match on the full `SequenceHash` AND the block id — the
         // `(position, fragment)` key alone can collide across distinct PLHs.
@@ -518,6 +645,139 @@ impl InactiveIndex for LineageBackend {
             false
         }
     }
+
+    fn take_complete_lineage(
+        &mut self,
+        seq_hash: SequenceHash,
+        block_id: BlockId,
+    ) -> Option<Vec<(SequenceHash, BlockId)>> {
+        self.take_exact_complete_lineage(seq_hash, block_id)
+    }
+
+    fn complete_lineage(
+        &self,
+        seq_hash: SequenceHash,
+        block_id: BlockId,
+    ) -> Option<Vec<(SequenceHash, BlockId)>> {
+        self.exact_complete_lineage(seq_hash, block_id)
+    }
+
+    fn supports_exact_reclaim(&self) -> bool {
+        true
+    }
+
+    fn exact_block_id(&self, seq_hash: SequenceHash) -> Option<BlockId> {
+        let position = seq_hash.position();
+        let fragment = seq_hash.parent_fragment_for_child_position(position + 1);
+        let index = *self.index.get(&(position, fragment))?;
+        match self.slots[index as usize].data {
+            SlotData::Real {
+                seq_hash: stored,
+                block_id,
+            } if stored == seq_hash => Some(block_id),
+            _ => None,
+        }
+    }
+
+    fn preflight_exact_reclaim(
+        &self,
+        victims: &[crate::ExactInactiveVictim],
+    ) -> Result<(), ExactReclaimPlanError> {
+        LineageBackend::preflight_exact_reclaim(self, victims)
+    }
+
+    fn poison(&mut self, seq_hash: SequenceHash) {
+        self.poison_suffix(seq_hash);
+    }
+
+    #[cfg(test)]
+    fn test_is_poisoned(&self, seq_hash: SequenceHash) -> bool {
+        let position = seq_hash.position();
+        let fragment = seq_hash.parent_fragment_for_child_position(position + 1);
+        match self.index.get(&(position, fragment)) {
+            Some(&idx) => self.leaves.test_is_poisoned(idx),
+            None => false,
+        }
+    }
+
+    /// Up to `max` of the *currently evictable* leaves, worst-first by the
+    /// leaf policy's ranking, with their features. Only leaves are ever
+    /// returned — an interior node is structurally unevictable — so a consumer
+    /// must reach interior nodes through [`Self::advice`] instead.
+    ///
+    /// # Why this is not a drain preview
+    ///
+    /// The ranking covers the leaf set as it stands. Evicting a leaf can
+    /// re-leaf its parent (`on_leaf_added`) — a node this peek could not have
+    /// listed, since it was interior at the time. `Tick`/`Fifo` re-admit it at
+    /// its own older position, ahead of leaves listed behind it; `Valued`
+    /// restamps `last_touch` there, so it re-enters as the *freshest* leaf and
+    /// sinks to the back instead. Either way the drain diverges, so only the
+    /// *head* is comparable to a real [`InactiveIndex::allocate`], and only where the
+    /// policy is exact: `Tick` and `Fifo` always, `Valued` for its poison
+    /// prefix (`Valued`'s unpoisoned pick is sampled, this scan is not). A
+    /// result shorter than `max` means "no more candidates were ranked", never
+    /// "the pool is empty" — `len` counts interior nodes too, and `Valued`
+    /// scores only a bounded window of `leaf_dense` per call.
+    ///
+    /// `evict_rank` is the entry's position *within this returned slice*
+    /// scaled to `[0, 255]`; it says nothing about the rest of the pool.
+    /// Read-only: no clock stamp, no RNG draw, no reordering (R7a §3.4).
+    fn peek_victims(&self, max: usize) -> Vec<(SequenceHash, BlockId, InactiveFeatures)> {
+        let slots = self.leaves.peek_slots(max);
+        let len = slots.len();
+        slots
+            .into_iter()
+            .enumerate()
+            .filter_map(|(rank, idx)| {
+                let Some((seq_hash, block_id)) = self.real_payload(idx) else {
+                    // The policy only ever holds `Real` leaves the backend
+                    // announced; a ghost/free slot here is a bookkeeping bug.
+                    debug_assert!(false, "leaf policy peeked a non-Real slot {idx}");
+                    return None;
+                };
+                let features = self.features_for(idx, evict_rank_for(rank, len));
+                Some((seq_hash, block_id, features))
+            })
+            .collect()
+    }
+
+    /// Point advice for `seq_hash`, O(1) through the `(position, fragment)`
+    /// index. Membership is the same rule `poison_suffix` uses: the node must
+    /// be `Real` *and* its stored full hash must equal `seq_hash` (the index
+    /// key alone can collide across distinct PLHs). A ghost placeholder, a hash
+    /// mismatch, or an absent key all report `None`.
+    ///
+    /// Interior nodes are visible here (with `is_leaf: false`) even though they
+    /// never appear in [`Self::peek_victims`]. `evict_rank` is always `None` —
+    /// rank is only defined within one peek batch.
+    fn advice(&self, seq_hash: SequenceHash) -> Option<InactiveFeatures> {
+        let position = seq_hash.position();
+        let fragment = seq_hash.parent_fragment_for_child_position(position + 1);
+        let &idx = self.index.get(&(position, fragment))?;
+        match self.slots[idx as usize].data {
+            SlotData::Real {
+                seq_hash: stored, ..
+            } if stored == seq_hash => Some(self.features_for(idx, None)),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+impl LineageBackend {
+    /// Test-only: total prune-loop iterations executed by `remove_node_at`
+    /// since the last [`reset_prune_iters`](Self::reset_prune_iters) — the
+    /// operation-count basis for the O(depth) amortization proof. Visible to
+    /// the sibling `trace_tests` module (hence module-level, not in `tests`).
+    pub(crate) fn prune_iters(&self) -> u64 {
+        self.prune_iters
+    }
+
+    /// Test-only: reset the prune-iteration counter to zero.
+    pub(crate) fn reset_prune_iters(&mut self) {
+        self.prune_iters = 0;
+    }
 }
 
 #[cfg(test)]
@@ -529,6 +789,16 @@ mod tests {
         /// Test-only: number of currently-evictable leaves.
         fn get_queue_len(&self) -> usize {
             self.leaves.len()
+        }
+
+        /// Test-only: whether the resident `Real` node for `seq_hash` is marked poisoned.
+        fn test_is_poisoned(&self, seq_hash: SequenceHash) -> bool {
+            let position = seq_hash.position();
+            let fragment = seq_hash.parent_fragment_for_child_position(position + 1);
+            match self.index.get(&(position, fragment)) {
+                Some(&idx) => self.leaves.test_is_poisoned(idx),
+                None => false,
+            }
         }
 
         /// Test-only: no live slots remain (all real + ghost nodes gone).
@@ -894,6 +1164,193 @@ mod tests {
         let order: Vec<BlockId> = backend.allocate(4).into_iter().map(|(_, id)| id).collect();
         // B; A re-leafs→tail; Y; X re-leafs→tail; A; X.
         assert_eq!(order, vec![b_id, y_id, a_id, x_id]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Valued leaf policy: neutral recency, poison suffix, branch-point stops.
+    // -----------------------------------------------------------------------
+
+    use crate::branch_tracker::BranchOracle;
+    use std::collections::HashMap as StdHashMap;
+    use std::sync::Arc;
+
+    /// Oracle returning a caller-fixed `max_fanout` per hash (unset ⇒ `None`).
+    #[derive(Default)]
+    struct StubOracle {
+        fanout: StdHashMap<SequenceHash, u32>,
+    }
+    impl BranchOracle for StubOracle {
+        fn on_block_registered(&self, _hash: SequenceHash) {}
+        fn on_block_removed(&self, _hash: SequenceHash) {}
+        fn max_fanout(&self, hash: SequenceHash) -> Option<u32> {
+            self.fanout.get(&hash).copied()
+        }
+    }
+
+    fn valued_backend(oracle: Option<Arc<dyn BranchOracle>>) -> LineageBackend {
+        let params = ScorerParams {
+            gamma: 0.6,
+            n: 2,
+            k_sample: 16,
+            t_blocks: None,
+            seed: 0x51,
+        };
+        LineageBackend::with_policy(0, LeafPolicy::valued(0, None, oracle, params))
+    }
+
+    /// With no sketch/oracle and T unset the valued score is pure recency, so independent
+    /// leaves evict oldest-first — parity with the recency `Tick`/`Fifo` behavior.
+    #[test]
+    fn valued_neutral_params_evict_oldest_first() {
+        let mut backend = valued_backend(None);
+        let a = create_block(1);
+        let b = create_block(2);
+        let c = create_block(3);
+        backend.insert(a.1, a.0); // inserted first ⇒ oldest ⇒ evicted first
+        backend.insert(b.1, b.0);
+        backend.insert(c.1, c.0);
+        assert_eq!(backend.len(), 3);
+        let order: Vec<BlockId> = backend.allocate(3).into_iter().map(|(_, id)| id).collect();
+        assert_eq!(order, vec![a.0, b.0, c.0], "recency order (oldest first)");
+    }
+
+    /// A poisoned single-owner suffix drains before any scored leaf, and the whole chain
+    /// drains (the interior node re-leafs already poisoned).
+    #[test]
+    fn valued_poison_drains_single_owner_suffix_first() {
+        let mut backend = valued_backend(None);
+        // Chain A: a0 -> a1 (a1 leaf). Independent chain B: b0 -> b1.
+        let chain_a = create_chain(2, 0);
+        let chain_b = create_chain(2, 5000);
+        for (id, h) in &chain_a {
+            backend.insert(*h, *id);
+        }
+        for (id, h) in &chain_b {
+            backend.insert(*h, *id);
+        }
+        // Poison chain A via its leaf a1: walk marks a1 (leaf) and a0 (interior single-owner).
+        backend.poison(chain_a[1].1);
+
+        // Even though chain B's leaf is older (would win on recency), the poisoned suffix
+        // drains first, fully (a1 then re-leafed a0), before chain B.
+        let order: Vec<BlockId> = backend.allocate(2).into_iter().map(|(_, id)| id).collect();
+        assert_eq!(
+            order,
+            vec![chain_a[1].0, chain_a[0].0],
+            "poisoned suffix drains leaf-then-root before any other chain"
+        );
+    }
+
+    /// The poison walk halts at a *current* branch point (≥ 2 live children); the shared
+    /// prefix and the sibling lineage are never poisoned.
+    #[test]
+    fn valued_poison_stops_at_current_branch_point() {
+        let mut backend = valued_backend(None);
+        // Shared prefix [t0, t1]; divergent leaves at position 2 (t2 vs t2').
+        let chain1 = create_chain(3, 0); // tokens 0,1,2
+        let mut b2 = BlockSequenceBuilder::from_tokens(vec![0, 1, 99])
+            .with_block_size(1)
+            .build();
+        let leaf2 = b2.remove(2); // (id, hash) for the divergent block at position 2
+        for (id, h) in &chain1 {
+            backend.insert(*h, *id);
+        }
+        backend.insert(leaf2.1, leaf2.0); // second child of the position-1 block
+
+        // Poison chain1's leaf (position 2). The walk marks only that leaf; its parent (the
+        // position-1 block) has two live children ⇒ branch point ⇒ walk stops there.
+        backend.poison(chain1[2].1);
+
+        // Load-bearing: the poisoned suffix is EXACTLY the leaf. The shared prefix, its root,
+        // and the sibling lineage must NOT be poisoned (deleting the branch-point stop would
+        // poison the shared prefix and fail here).
+        assert!(
+            backend.test_is_poisoned(chain1[2].1),
+            "the leaf is poisoned"
+        );
+        assert!(
+            !backend.test_is_poisoned(chain1[1].1),
+            "the shared prefix (branch point) must not be poisoned"
+        );
+        assert!(
+            !backend.test_is_poisoned(chain1[0].1),
+            "the shared root must not be poisoned"
+        );
+        assert!(
+            !backend.test_is_poisoned(leaf2.1),
+            "the sibling lineage must not be poisoned"
+        );
+
+        // First victim is the poisoned leaf; the sibling survives.
+        let first = backend.allocate(1);
+        assert_eq!(
+            first[0].1, chain1[2].0,
+            "only the poisoned suffix leaf goes first"
+        );
+        assert!(
+            backend.has(leaf2.1),
+            "the sibling lineage was not poisoned away"
+        );
+    }
+
+    /// The walk also halts at a *re-leafed* branch point identified only by the monotone
+    /// high-water `max_fanout` (current children == 1). Exercises `max_fanout_of`.
+    #[test]
+    fn valued_poison_stops_at_high_water_branch_point() {
+        // Chain L(pos2) -> m(pos1) -> root(pos0); m currently has one child but a stub
+        // oracle reports max_fanout = 2 (it forked and re-leafed), so it must be protected.
+        let chain = create_chain(3, 0);
+        let mid_hash = chain[1].1;
+        let mut oracle = StubOracle::default();
+        oracle.fanout.insert(mid_hash, 2);
+        let mut backend = valued_backend(Some(Arc::new(oracle)));
+        for (id, h) in &chain {
+            backend.insert(*h, *id);
+        }
+
+        backend.poison(chain[2].1); // poison the leaf
+
+        // Load-bearing: only the leaf is poisoned. The mid block (high-water branch point,
+        // current fanout 1) and the root must NOT be poisoned — deleting the high-water stop
+        // would poison the mid block and fail here.
+        assert!(backend.test_is_poisoned(chain[2].1), "the leaf is poisoned");
+        assert!(
+            !backend.test_is_poisoned(mid_hash),
+            "the high-water branch point must not be poisoned"
+        );
+        assert!(
+            !backend.test_is_poisoned(chain[0].1),
+            "the root must not be poisoned"
+        );
+
+        let first = backend.allocate(1);
+        assert_eq!(first[0].1, chain[2].0, "only the leaf was poisoned");
+        assert!(
+            backend.has(mid_hash),
+            "the high-water branch point was not poisoned away"
+        );
+    }
+
+    /// The walk halts at a ghost placeholder (a resurrected interior node) rather than
+    /// poisoning the real ancestor above it — a ghost's high-water branch identity is
+    /// unknowable. Load-bearing: without the ghost stop the walk would poison b0.
+    #[test]
+    fn valued_poison_stops_at_ghost_ancestor() {
+        let mut backend = valued_backend(None);
+        let chain = create_chain(3, 0); // b0(pos0) -> b1(pos1) -> b2(pos2)
+        for (id, h) in &chain {
+            backend.insert(*h, *id);
+        }
+        // Resurrect the interior b1: it becomes a Ghost (still has child b2), so the chain
+        // is now b2(Real leaf) -> ghost(b1) -> b0(Real root).
+        assert!(backend.take(chain[1].1, chain[1].0), "b1 resurrected out");
+
+        backend.poison(chain[2].1);
+        assert!(backend.test_is_poisoned(chain[2].1), "the leaf is poisoned");
+        assert!(
+            !backend.test_is_poisoned(chain[0].1),
+            "the walk must stop at the ghost, not poison the real ancestor b0"
+        );
     }
 
     #[test]

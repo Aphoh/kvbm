@@ -27,11 +27,10 @@ use super::protocol::{
 };
 use crate::protocol::PrefillRequest;
 
-/// Wall-clock guard on a single velo unary call. Caps the wait in case a
-/// worker dies between heartbeat sweeps so a single request can't pin the
-/// dispatcher task indefinitely; the TTL reaper is what eventually evicts
-/// the dead peer.
-const VELO_DISPATCH_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bounds connection establishment before an HTTP request can reach a worker.
+/// Once delivered, the response remains pending until the worker reports its
+/// execution terminal because there is no end-to-end cancellation protocol.
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Transport-specific delivery of a single [`PrefillRequest`].
 ///
@@ -90,7 +89,7 @@ impl HttpExecutionBackend {
     /// slashes on `base_url` are stripped.
     pub fn new(instance_id: InstanceId, endpoint: VllmHttpEndpoint) -> Result<Arc<Self>> {
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(60))
+            .connect_timeout(HTTP_CONNECT_TIMEOUT)
             .build()
             .context("build reqwest client for HttpExecutionBackend")?;
         Ok(Arc::new(Self {
@@ -213,22 +212,16 @@ impl PrefillExecutionBackend for VeloExecutionBackend {
             .instance(self.instance_id)
             .send();
 
-        let result = tokio::time::timeout(VELO_DISPATCH_TIMEOUT, call).await;
-        let resp = match result {
-            Ok(Ok(resp)) => resp,
-            Ok(Err(err)) => {
+        // Do not impose a post-delivery timeout here. Dropping the unary call
+        // cannot cancel an already-enqueued worker request, and the router's
+        // capacity permit must remain charged until the worker terminal or a
+        // definitive transport failure.
+        let resp = match call.await {
+            Ok(resp) => resp,
+            Err(err) => {
                 return Ok(DispatchOutcome::Rejected {
                     reason: format!(
                         "velo unary to {target} failed: {err}",
-                        target = self.instance_id
-                    ),
-                });
-            }
-            Err(_) => {
-                return Ok(DispatchOutcome::Rejected {
-                    reason: format!(
-                        "velo unary to {target} timed out after {:?}",
-                        VELO_DISPATCH_TIMEOUT,
                         target = self.instance_id
                     ),
                 });
@@ -268,6 +261,7 @@ mod tests {
             num_provided_tokens: 0,
             request: KvHashingRequestEnvelope::default(),
             expected_hash_digest: None,
+            bundle: None,
         }
     }
 
@@ -372,6 +366,51 @@ mod tests {
         .unwrap();
         let outcome = backend.execute(make_request("r1")).await.unwrap();
         assert!(matches!(outcome, DispatchOutcome::Rejected { .. }));
+    }
+
+    #[tokio::test]
+    async fn http_backend_waits_past_legacy_overall_timeout_for_worker_terminal() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            assert!(stream.read(&mut request).unwrap() > 0);
+            let _ = started_tx.send(());
+            release_rx.recv().unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .unwrap();
+        });
+        let backend = HttpExecutionBackend::new(
+            InstanceId::new_v4(),
+            VllmHttpEndpoint {
+                base_url: format!("http://{addr}"),
+                model: "m".into(),
+            },
+        )
+        .unwrap();
+        let execution = tokio::spawn(async move { backend.execute(make_request("slow")).await });
+
+        started_rx.await.unwrap();
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(61)).await;
+        tokio::task::yield_now().await;
+        let remained_pending = !execution.is_finished();
+
+        release_tx.send(()).unwrap();
+        let outcome = execution.await.unwrap().unwrap();
+        server.join().unwrap();
+
+        assert!(
+            remained_pending,
+            "HTTP execution returned before the worker terminal"
+        );
+        assert_eq!(outcome, DispatchOutcome::Accepted);
     }
 
     // ============================================================

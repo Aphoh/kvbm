@@ -6,7 +6,7 @@
 //! This module provides utilities to compute checksums of blocks for
 //! round-trip test verification.
 
-use dynamo_memory::StorageKind;
+use kvbm_memory::StorageKind;
 
 use super::PhysicalLayout;
 

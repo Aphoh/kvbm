@@ -5,6 +5,7 @@
 
 use derive_builder::Builder;
 use dynamo_tokens::{Tokens, compute_hash_v2};
+use kvbm_protocols::cache_manifest::CacheScope;
 use kvbm_protocols::disagg::{RemotePrefillParams, TransferParams};
 use serde::Serialize;
 
@@ -20,6 +21,8 @@ pub struct RequestMetadata {
     /// scheduler protocol. `None` when the upstream request did not
     /// supply any (the common case for non-disaggregated requests).
     pub kv_transfer_params: Option<serde_json::Value>,
+    /// Explicit cache compatibility scope for this request.
+    pub cache: CacheScope,
 }
 
 impl RequestMetadata {
@@ -27,7 +30,12 @@ impl RequestMetadata {
     pub fn with_kv_transfer_params(value: serde_json::Value) -> Self {
         Self {
             kv_transfer_params: Some(value),
+            cache: CacheScope::LegacyPrimary,
         }
+    }
+
+    pub fn set_cache(&mut self, cache: CacheScope) {
+        self.cache = cache;
     }
 
     /// Parse raw `kv_transfer_params` as disaggregation transfer

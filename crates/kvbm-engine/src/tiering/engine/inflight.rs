@@ -24,11 +24,13 @@
 //! The guard exists to dedup loads INTO G1 — so it records exactly when a load
 //! is committed (USAA) and holds until the loaded blocks are connector-visible
 //! (the lifecycle handle's release). It is NOT cleared at the engine action
-//! terminal: a load that is engine-terminal but not yet vLLM-registered is
-//! still a duplicate-load hazard, and the eviction drain-holder deliberately
-//! keeps the deferral alive past the terminal until the held lifecycle drops.
+//! terminal for search/prefill lifecycles: a load that is engine-terminal but
+//! not yet vLLM-registered is still a duplicate-load hazard, and the eviction
+//! drain-holder deliberately keeps the deferral alive past the terminal until
+//! the held lifecycle drops. Direct bundle actions use the same rule when the
+//! handle is live; an early handle drop clears only after the transfer terminal.
 //!
-//! ### Record sites (the three onboard mints, one per lifecycle kind)
+//! ### Record sites
 //!
 //! 1. **local onboard** — `LocalConnectorEngine::local_onboard`, keyed
 //!    [`InflightKey::Search`] by the driving search generation, recording the
@@ -46,6 +48,9 @@
 //!    EXTERNAL suffix of the decode-provided window
 //!    `expected_hashes[len - external_blocks ..]` — exactly the hashes the
 //!    USAA kick copies into G1.
+//! 4. **direct bundle onboard** — `start_bundle_onboard`, keyed
+//!    [`InflightKey::Action`] by the parent action generation, recording every
+//!    hash pinned by the all-resource bundle lease.
 //!
 //! One record per lifecycle is structural: the engine refuses a second onboard
 //! per latched generation (`local_onboard` consumes the search latch;
@@ -54,7 +59,7 @@
 //! fall-through's INTERNAL search records under its own `Search` key when its
 //! delegated onboard mints.
 //!
-//! ### Clear sites: the two release funnels
+//! ### Clear sites: the release funnels
 //!
 //! `release_search` clears `Search` keys; `release_prefill_session`
 //! (`prefill_release`) clears `Prefill` keys — unconditionally at function
@@ -64,8 +69,11 @@
 //! handle drop must still clear. Clearing by the releasing handle's OWN
 //! generation id keeps a stale release harmless: it can only touch its own
 //! (already-cleared) entry, never a fresh re-latch's.
+//! Direct bundle onboards clear their `Action` key from the shared action-record
+//! remover. An early action-handle drop defers that removal until the transfer
+//! terminal; a live terminal handle retains the guard until connector release.
 //!
-//! Every path a recorded lifecycle can end funnels through one of the two:
+//! Every path a recorded lifecycle can end funnels through its matching release:
 //!
 //! * connector handle drop (reap — inline or finishing sweep — and leader
 //!   teardown) → kind-routed RAII → `release_search` /
@@ -85,6 +93,8 @@
 //!   different dest (the vLLM race tolerance above);
 //! * the zero-external fall-through's internal binding →
 //!   `prefill_release`'s `take_local_search` → `release_search`.
+//! * direct bundle onboard handle release → `release_action`; an early release
+//!   marks the action record dropped and lets the driver terminal remove it.
 //!
 //! Residual exposure: a connector that leaks a handle (never drops it) leaks
 //! the entry — the same exposure class as a leaked never-terminal action.
@@ -106,7 +116,7 @@
 use std::collections::HashMap;
 
 use kvbm_common::SequenceHash;
-use kvbm_protocols::connector::{AcceptId, SearchId};
+use kvbm_protocols::connector::{AcceptId, ActionId, SearchId};
 
 /// Generation key for one recorded match lifecycle — the same id the
 /// lifecycle's RAII release carries, so record and clear bind to the same
@@ -118,6 +128,9 @@ pub(super) enum InflightKey {
     /// A dispatched remote-prefill lifecycle; cleared by
     /// `release_prefill_session`.
     Prefill(AcceptId),
+    /// A direct multi-resource bundle onboard, cleared by the parent action's
+    /// release or by its terminal after an early handle drop.
+    Action(ActionId),
 }
 
 /// Refcounted multiset of hashes under in-flight onboard, keyed for clearing
@@ -255,19 +268,22 @@ mod tests {
         assert!(!guard.overlaps(&[hash(0), hash(1)]));
     }
 
-    /// Both key kinds key independent entries: a prefill generation's clear
-    /// never touches a search generation's record.
+    /// Every key kind owns an independent entry.
     #[test]
-    fn search_and_prefill_keys_are_independent() {
+    fn search_prefill_and_action_keys_are_independent() {
         let mut guard = InflightOnboards::new();
         let s = InflightKey::Search(SearchId::new());
         let p = InflightKey::Prefill(AcceptId::new());
+        let a = InflightKey::Action(ActionId::new());
         guard.record(s, vec![hash(0)]);
         guard.record(p, vec![hash(1)]);
+        guard.record(a, vec![hash(2)]);
 
         assert!(guard.clear(&p));
         assert!(guard.overlaps(&[hash(0)]), "the search record survives");
         assert!(!guard.overlaps(&[hash(1)]));
+        assert!(guard.overlaps(&[hash(2)]), "the action record survives");
+        assert!(guard.clear(&a));
         assert!(guard.clear(&s));
         assert!(guard.is_empty());
     }

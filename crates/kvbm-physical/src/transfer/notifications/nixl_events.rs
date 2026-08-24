@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use dynamo_memory::nixl::{Agent as NixlAgent, NotificationMap, XferRequest};
+use kvbm_memory::nixl::{Agent as NixlAgent, NotificationMap, XferRequest};
 use tokio::sync::mpsc;
 use tokio::time::interval;
 use tracing::{error, warn};

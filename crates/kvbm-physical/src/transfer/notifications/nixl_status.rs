@@ -4,7 +4,7 @@
 //! NIXL status polling-based completion checker.
 
 use anyhow::{Result, anyhow};
-use dynamo_memory::nixl::{Agent as NixlAgent, XferRequest};
+use kvbm_memory::nixl::{Agent as NixlAgent, XferRequest};
 
 use super::CompletionChecker;
 

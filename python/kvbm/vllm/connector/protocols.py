@@ -17,6 +17,32 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Protocol, Set, Tuple, runtime_checkable
 
+BlockIdGroups = Tuple[List[int], ...]
+
+
+@runtime_checkable
+class SupportsHMAProtocol(Protocol):
+    """Narrow surface required by vLLM's optional ``SupportsHMA`` mixin."""
+
+    def request_finished_all_groups(
+        self, request: Any, block_ids: BlockIdGroups
+    ) -> tuple[bool, dict[str, Any] | None]: ...
+
+
+@runtime_checkable
+class LayerHooksProtocol(Protocol):
+    """Layer-wise load/save hooks used by the hybrid model runner."""
+
+    def wait_for_layer_load(self, layer_name: str) -> None: ...
+
+    def save_kv_layer(
+        self,
+        layer_name: str,
+        kv_layer: Any,
+        attn_metadata: Any,
+        **kwargs: Any,
+    ) -> None: ...
+
 
 @runtime_checkable
 class NewRequestDataProtocol(Protocol):
@@ -32,7 +58,7 @@ class NewRequestDataProtocol(Protocol):
     mm_features: List[Any]  # List[MultiModalFeatureSpec]
     sampling_params: Any | None  # SamplingParams | None
     pooling_params: Any | None  # PoolingParams | None
-    block_ids: Tuple[List[int], ...]
+    block_ids: BlockIdGroups
     num_computed_tokens: int
     lora_request: Any | None  # LoRARequest | None
     prompt_embeds: Any | None  # torch.Tensor | None

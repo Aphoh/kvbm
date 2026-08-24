@@ -255,15 +255,20 @@ Puller-side. Pulls each `hashes[i]` from peer into `dst[i]`.
   (`velo.rs:1029-1056`).
 - Then drives `InstanceLeader::rdma_pull_with_opts` with the
   pair-zipped refs.
-- Then enqueues `Frame::PullAck { pull_id }` so holder releases
-  pins (`velo.rs:1093-1101`).
+- After the physical pull reaches a terminal result, enqueues
+  `Frame::PullAck { pull_id }` so the holder can release pins. An
+  RDMA failure is terminal proof too, so it is acknowledged before
+  the error is returned.
 
 **Pin lifecycle (holder side):**
 - Holder records inbound `Frame::Pull { pull_id, hashes }` in
   `inbound_pulls[pull_id]` (`velo.rs:572-591`).
 - Holder drops pins for those hashes when `Frame::PullAck`
-  arrives (`velo.rs:606-619`).
-- Pinned by `velo_session_loopback.rs::pull_ack_drops_holder_pins`.
+  arrives. If two pull IDs reference the same hash, the pin remains
+  until the final overlapping authorization is acknowledged.
+- Pinned by `velo_session_loopback.rs::pull_ack_drops_holder_pins`,
+  `overlapping_pull_ids_hold_a_shared_hash_until_the_last_ack`, and
+  `failed_rdma_terminal_still_acks_and_releases_holder_pin`.
 
 **Out of scope (deferred — needs worker-equipped infra):**
 - Full RDMA happy path with data landing at `dst`. The
@@ -312,13 +317,18 @@ Either-side cooperative shutdown. Idempotent.
 
 ### 2.14 `close(reason: Option<String>)` (`mod.rs:337`)
 
-Either-side abort. Implies `finish_commits` + `finish_availability`
-(`velo.rs:1168+`), then calls velo's `StreamSender::finalize`
-directly. Does NOT wait for peer to rendezvous. Use for
-fatal-error / aborted-request scenarios.
+Either-side abort. Rejects new `Pull` authorization and implies
+`finish_commits` + `finish_availability`. With no authorized pull in
+flight, it releases pins and finalizes the velo stream immediately;
+otherwise it quarantines the holder's source pins and defers wire
+finalization until the final `PullAck`. If terminal wire loss makes
+that Ack impossible, the quarantine may be retained indefinitely for
+memory safety. Use for fatal-error / aborted-request scenarios.
 
 - Pinned by `velo_session_loopback.rs::close_from_holder_terminates_streams`
-  (peer sees Detached + Closed + Drained).
+  (peer sees Detached + Closed + Drained),
+  `close_quarantines_unacked_holder_pins_and_rejects_new_pulls`, and
+  `close_racing_pull_admission_never_releases_an_authorized_source_pin`.
 
 ---
 
@@ -329,7 +339,10 @@ fatal-error / aborted-request scenarios.
 2. **Monotonic-add sets** — committed and available only grow
    within a session lifetime; never remove.
 3. **Pin lifecycle** — `make_available` pins (strong G2 ref);
-   PullAck drops per-hash; `close` drains remaining pins.
+   `PullAck` drops a per-hash pin after its final overlapping
+   authorization. `close` drains pins only when no pull is authorized;
+   otherwise it quarantines them until the final Ack. Terminal wire
+   loss may retain the quarantine for safety.
 4. **Subscribe-once per stream** — second `commits()` /
    `availability()` / `lifecycle()` call panics.
 5. **Stream replay-on-subscribe** — coalesces consecutive Added /
@@ -409,10 +422,10 @@ reach the wire (Frame::Pull → PullComplete → rdma step).
 | Path | Method | Effect on peer |
 |---|---|---|
 | Cooperative shutdown | `finalize` on both sides | Both observe `LifecycleEvent::Detached` after rendezvous |
-| Abort | `close` on one side | Peer observes `LifecycleEvent::Detached` + `CommitDelta::Closed` + `AvailabilityDelta::Drained` |
+| Abort | `close` on one side | Rejects new pulls; peer observes `LifecycleEvent::Detached` + `CommitDelta::Closed` + `AvailabilityDelta::Drained`; authorized source pins remain quarantined until final `PullAck` |
 | Peer crash | velo heartbeat loss | Surviving side observes `LifecycleEvent::Detached` |
 | Protocol error | inbound `Frame::Error` | Observer pushes `LifecycleEvent::Failed` |
-| Watchdog timeout | `SessionManager` (default 30s) | Evicts un-terminated sessions; the held `Arc` drops |
+| Watchdog timeout | `SessionManager` (default 30s) | Closes an un-terminated session, then evicts it only after `has_inflight_pulls()` clears; an unacknowledged authorization after wire loss retains the session and source-pin quarantine indefinitely |
 
 Existing tests:
 - `close_from_holder_terminates_streams` — abort propagation.
@@ -421,6 +434,10 @@ Existing tests:
 - `active_session_count_returns_to_zero` — clean teardown via
   rendezvous + drop; no Arc leaks.
 - `pull_ack_drops_holder_pins` — pin release on PullAck.
+- `close_quarantines_unacked_holder_pins_and_rejects_new_pulls` —
+  close-time source quarantine and admission rejection.
+- `failed_rdma_terminal_still_acks_and_releases_holder_pin` —
+  failed physical pulls still provide terminal proof via PullAck.
 - `lifecycle_stream_replay_preserves_order` (`velo.rs`
   unit-internal) — replay ordering.
 

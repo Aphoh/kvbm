@@ -14,6 +14,11 @@ use pyo3::types::PyDict;
 
 use kvbm_connector::config::{AttentionConfig, ModelExecutorBackend, ParallelConfig};
 use kvbm_connector::vllm::{KvbmVllmConfig, VllmAttentionConfig, VllmParallelConfig};
+use kvbm_protocols::cache_manifest::CacheManifest;
+
+pub(crate) fn parse_cache_manifest(document: &str) -> Result<CacheManifest, serde_json::Error> {
+    serde_json::from_str(document)
+}
 
 /// Python-facing parallel configuration.
 ///
@@ -201,6 +206,51 @@ impl PyAttentionConfig {
                 .extract()?,
             device_id,
         })
+    }
+}
+
+#[cfg(test)]
+mod cache_manifest_tests {
+    use super::parse_cache_manifest;
+
+    const MODEL: &str = r#"{
+        "architecture":"fake_dsv4",
+        "revision":"test",
+        "weights_digest":[7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7]
+    }"#;
+
+    #[test]
+    fn manifest_json_rejects_duplicate_resources() {
+        let json = format!(
+            r#"{{"schema_version":1,"model":{MODEL},"cache_abi":"test","resources":[
+                {{"resource":10,"role":"prefix_history","native_block_tokens":4}},
+                {{"resource":10,"role":"boundary_capsule","native_block_tokens":8}}
+            ],"attributes":{{}}}}"#
+        );
+
+        let error = parse_cache_manifest(&json).expect_err("duplicates must fail");
+        assert!(error.to_string().contains("duplicate resource"));
+    }
+
+    #[test]
+    fn equivalent_manifest_json_has_identical_canonical_bytes() {
+        let first = format!(
+            r#"{{"schema_version":1,"model":{MODEL},"cache_abi":"test","resources":[
+                {{"resource":11,"role":"boundary_capsule","native_block_tokens":8}},
+                {{"resource":10,"role":"prefix_history","native_block_tokens":4}}
+            ],"attributes":{{"z":"last","a":"first"}}}}"#
+        );
+        let second = format!(
+            r#"{{"attributes":{{"a":"first","z":"last"}},"resources":[
+                {{"native_block_tokens":4,"role":"prefix_history","resource":10}},
+                {{"native_block_tokens":8,"role":"boundary_capsule","resource":11}}
+            ],"cache_abi":"test","model":{MODEL},"schema_version":1}}"#
+        );
+
+        assert_eq!(
+            parse_cache_manifest(&first).unwrap().canonical_bytes(),
+            parse_cache_manifest(&second).unwrap().canonical_bytes()
+        );
     }
 }
 

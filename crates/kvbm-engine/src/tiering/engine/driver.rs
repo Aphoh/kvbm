@@ -12,18 +12,15 @@
 //! [`super::local::LocalConnectorEngine::poll_action`] upgrades the `Weak` for
 //! the (M3) remote path. When a driver task reaches a terminal state it calls
 //! [`LocalConnectorEngine::finish_load_action`], which writes the terminal into
-//! the cell, **drops the map guard**, and only then fires the worker sink (the
-//! REFACTOR.md §3 "no engine lock held" contract).
+//! the cell and **drops the map guard** before any worker notification. A
+//! physically draining bundle defers that notification to
+//! [`LocalConnectorEngine::finish_physical_load_action`]; both phases preserve
+//! the REFACTOR.md §3 "no engine lock held" contract.
 //!
-//! Retention: there is **no** status-based prune. The action's `actions` entry
-//! and its `by_request` link both live until the handle's RAII drop fires
-//! [`LocalConnectorEngine::release_action`] (the action analogue of
-//! `release_search`), which removes the entry from both maps — so a terminal
-//! action's bookkeeping frees on handle drop rather than leaking a key, and the
-//! strong completion cell (RAII-owned by the handle) frees with it regardless of
-//! terminal category (success, failure, or evicted). `poll_action`'s dead-`Weak`
-//! self-prune remains only as a backstop for the (M3) remote path, where no
-//! local handle drop occurs.
+//! Retention follows handle and physical-work ownership. Handle drop calls
+//! [`LocalConnectorEngine::release_action`]. Pending physical work keeps the
+//! record until its driver terminal. That terminal removes a dropped record
+//! and scrubs both indexes. `poll_action` never owns record removal.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -136,32 +133,45 @@ pub(super) struct ActionRecord {
     pub(super) request_id: RequestId,
     /// `Weak` to the completion cell owned by the live `OnboardHandle` /
     /// `OffloadHandle`. The engine writes the terminal through this `Weak`;
-    /// `poll_action` reads it for the by-id path (and self-prunes a dead `Weak`
-    /// as a backstop). The strong cell lives in the handle, so the map never pins
-    /// completion state alive.
+    /// `poll_action` reads it for the by-id path. The strong cell lives in the
+    /// handle, so the map never pins completion state alive.
     pub(super) cell: Weak<Mutex<ActionStatus>>,
     /// A clone of the shared [`FenceBarrier`], set by [`LocalConnectorEngine::evict`]
     /// when this action is armed cancelled-for-emission. While held, the action's
-    /// terminal fires no `mark_load_finished`/`mark_save_finished`; instead
-    /// `finish_*_action` *takes* this clone and drops it, completing the shared
-    /// fence only once it is the last armed action to drain. The terminal status is
-    /// still written to the cell, so the by-id path stays correct.
+    /// terminal fires no `mark_load_finished`/`mark_save_finished`; instead the
+    /// action's drain terminal (logical for ordinary actions, physical for a
+    /// bundle onboard) *takes* this clone and drops it, completing the shared
+    /// fence only once it is the last armed action to drain. The
+    /// logical terminal status is still written to the cell promptly, so the
+    /// by-id path stays correct.
     pub(super) fence: Option<Arc<FenceBarrier>>,
     /// A clone of the shared [`DrainBarrier`], set by
     /// [`LocalConnectorEngine::arm_drain_emission`] when the connector committed
     /// the finishing request's drain while this action was still pending.
-    /// `finish_*_action` *takes* and drops it after its sink notify; the last
-    /// armed action's drop fires the request's single `finished_sending`.
+    /// The action's drain terminal *takes* and drops it; the last armed action's
+    /// drop fires the request's single `finished_sending`.
     /// Independent of `fence` — an action can be both (evicted, then the
     /// restored request finishes while the old drain is still in flight).
     pub(super) drain: Option<Arc<DrainBarrier>>,
     /// Set `true` if the handle's RAII drop fired [`LocalConnectorEngine::release_action`]
-    /// while `fence` or `drain` was still armed (the driver had not reached terminal).
+    /// while `fence`, `drain`, or physical work was still pending.
     /// Removal of the `actions` entry is then DEFERRED to the driver's terminal:
     /// dropping the record — and with it the live barrier clone(s) — now would
     /// complete the fence / fire the emission before the transfer drained. The
     /// terminal removes the record once it observes this flag.
     pub(super) dropped_by_handle: bool,
+    /// Optional in-flight onboard generation cleared with this action record.
+    /// While present, an early handle drop defers removal until terminal.
+    pub(super) inflight: Option<super::inflight::InflightKey>,
+    /// True while a bundle onboard owns launched transfer notifications.
+    /// Logical completion can occur before this physical state clears.
+    pub(super) physical_pending: bool,
+    /// The action type and its terminal state.
+    kind: ActionKind,
+    /// Logical cancellation source for a physically draining bundle onboard.
+    /// Cancelling never aborts submitted DMA; it only lets the action leave
+    /// `Pending` while the physical task and its fence keep G1 quarantined.
+    pub(super) cancel: Option<tokio_util::sync::CancellationToken>,
 }
 
 impl ActionRecord {
@@ -173,8 +183,117 @@ impl ActionRecord {
             fence: None,
             drain: None,
             dropped_by_handle: false,
+            inflight: None,
+            physical_pending: false,
+            kind: ActionKind::Load(LoadTerminalState::Pending),
+            cancel: None,
         }
     }
+
+    /// Create a save record before its physical work enters the buffer.
+    pub(super) fn new_save(request_id: RequestId, cell: Weak<Mutex<ActionStatus>>) -> Self {
+        Self {
+            request_id,
+            cell,
+            fence: None,
+            drain: None,
+            dropped_by_handle: false,
+            inflight: None,
+            physical_pending: false,
+            kind: ActionKind::Save(SaveTerminalState::Pending),
+            cancel: None,
+        }
+    }
+
+    pub(super) fn with_inflight(mut self, key: super::inflight::InflightKey) -> Self {
+        self.inflight = Some(key);
+        self
+    }
+
+    pub(super) fn with_physical_drain(
+        mut self,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Self {
+        assert!(
+            matches!(self.kind, ActionKind::Load(_)),
+            "physical load state requires a load action"
+        );
+        self.physical_pending = true;
+        self.cancel = Some(cancel);
+        self
+    }
+
+    /// Report physical work that can outlive the action handle.
+    pub(super) fn has_pending_physical_work(&self) -> bool {
+        self.physical_pending || matches!(self.kind, ActionKind::Save(SaveTerminalState::Pending))
+    }
+
+    /// Report work that must hold an eviction or request-drain barrier.
+    pub(super) fn has_pending_work(&self) -> bool {
+        self.cell.upgrade().is_some_and(|cell| {
+            matches!(
+                *cell.lock().expect("action-status mutex poisoned"),
+                ActionStatus::Pending
+            )
+        }) || self.has_pending_physical_work()
+    }
+
+    /// Report whether handle drop must leave this record for its terminal.
+    pub(super) fn must_retain_after_handle_drop(&self) -> bool {
+        self.fence.is_some()
+            || self.drain.is_some()
+            || self.has_pending_physical_work()
+            || (self.inflight.is_some() && self.has_pending_work())
+    }
+
+    /// Return the cancellation source for a physical load.
+    pub(super) fn physical_load_cancel(&self) -> Option<tokio_util::sync::CancellationToken> {
+        (self.physical_pending && matches!(self.kind, ActionKind::Load(_)))
+            .then(|| self.cancel.clone())
+            .flatten()
+    }
+
+    /// Settle the first save terminal and preserve all later terminals.
+    fn settle_save_once(&mut self, outcome: ActionStatus) -> bool {
+        let ActionKind::Save(terminal) = &mut self.kind else {
+            debug_assert!(false, "save terminal requires a save action");
+            return false;
+        };
+        if matches!(terminal, SaveTerminalState::Settled) {
+            return false;
+        }
+        if let Some(cell) = self.cell.upgrade() {
+            *cell.lock().expect("action-status mutex poisoned") = outcome;
+        }
+        *terminal = SaveTerminalState::Settled;
+        true
+    }
+}
+
+/// The action type owns only its valid terminal state.
+enum ActionKind {
+    Load(LoadTerminalState),
+    Save(SaveTerminalState),
+}
+
+/// Two-phase load-terminal state owned by one action record.
+enum LoadTerminalState {
+    /// No logical load terminal has landed.
+    Pending,
+    /// The handle is terminal, but the worker must not reuse the named G1
+    /// destinations until the physical phase drains.
+    Deferred(LoadOutcome),
+    /// Worker notification was emitted or deliberately suppressed by an
+    /// eviction/request-drain barrier.
+    Settled,
+}
+
+/// Save-terminal state owned by one action record.
+enum SaveTerminalState {
+    /// The physical save has not reported a terminal state.
+    Pending,
+    /// The first save terminal settled the cell and any barriers.
+    Settled,
 }
 
 /// Project a terminal [`ActionStatus`] onto the load-completion the worker sink
@@ -197,6 +316,11 @@ fn load_outcome_of(status: &ActionStatus) -> LoadOutcome {
         ActionStatus::Failed(ActionFailure::Partial { block_ids }) => LoadOutcome::FailedPartial {
             block_ids: block_ids.clone(),
         },
+        ActionStatus::Failed(ActionFailure::Resource { block_ids, .. }) => {
+            LoadOutcome::FailedPartial {
+                block_ids: block_ids.clone().unwrap_or_default(),
+            }
+        }
     }
 }
 
@@ -209,11 +333,8 @@ impl LocalConnectorEngine {
     /// either the per-eviction `mark_fence_complete` tokens or the single
     /// `mark_load_finished`.
     ///
-    /// No prune here: the action's `actions` entry and its `by_request` link both
-    /// live until the handle's RAII drop fires
-    /// [`LocalConnectorEngine::release_action`] (the action analogue of
-    /// `release_search`). A dropped handle (dead `Weak`) has no observer — the
-    /// cell write is skipped but the worker is still notified.
+    /// A live handle retains the record after this terminal. A prior handle
+    /// drop defers removal to this terminal when physical work is pending.
     ///
     /// `dest_ids` is the load's G1 dest set, demanded by the signature because
     /// the terminal needs it to resolve a total failure: vLLM invalidates
@@ -243,6 +364,13 @@ impl LocalConnectorEngine {
                     block_ids: dest_ids,
                 })
             }
+            ActionStatus::Failed(ActionFailure::Resource {
+                resource,
+                block_ids: None,
+            }) => ActionStatus::Failed(ActionFailure::Resource {
+                resource,
+                block_ids: Some(dest_ids),
+            }),
             other => other,
         };
 
@@ -250,20 +378,41 @@ impl LocalConnectorEngine {
         // TAKE any armed fence/drain clones, and learn whether the handle already
         // dropped (so this terminal must remove the record). Release the guard
         // before any sink call or barrier-clone drop.
-        let (fence, drain, remove_now) = {
+        let (fence, drain, worker_terminal, remove_now) = {
             let mut guard = self.actions.get_mut(&action_id);
             match guard.as_deref_mut() {
                 Some(record) => {
+                    if !matches!(record.kind, ActionKind::Load(LoadTerminalState::Pending)) {
+                        tracing::debug!(
+                            ?action_id,
+                            %request_id,
+                            "ignoring duplicate load terminal"
+                        );
+                        return;
+                    }
                     if let Some(cell) = record.cell.upgrade() {
                         *cell.lock().expect("action-status mutex poisoned") = outcome.clone();
                     }
-                    (
-                        record.fence.take(),
-                        record.drain.take(),
-                        record.dropped_by_handle,
-                    )
+                    let suppress_terminal = record.fence.is_some() || record.drain.is_some();
+                    if record.physical_pending {
+                        let terminal = if suppress_terminal {
+                            LoadTerminalState::Settled
+                        } else {
+                            LoadTerminalState::Deferred(load_outcome_of(&outcome))
+                        };
+                        record.kind = ActionKind::Load(terminal);
+                        (None, None, None, false)
+                    } else {
+                        record.kind = ActionKind::Load(LoadTerminalState::Settled);
+                        (
+                            record.fence.take(),
+                            record.drain.take(),
+                            (!suppress_terminal).then(|| load_outcome_of(&outcome)),
+                            record.dropped_by_handle,
+                        )
+                    }
                 }
-                None => (None, None, false),
+                None => (None, None, Some(load_outcome_of(&outcome)), false),
             }
         };
 
@@ -275,9 +424,8 @@ impl LocalConnectorEngine {
         // hit — surfacing `finished_recving` alongside the request's eventual
         // `finished_sending` would assert in the scheduler. The load's
         // completion folds into the drain emission instead.
-        if fence.is_none() && drain.is_none() {
-            self.sink
-                .mark_load_finished(request_id, load_outcome_of(&outcome));
+        if let Some(worker_terminal) = worker_terminal {
+            self.sink.mark_load_finished(request_id, worker_terminal);
         }
         drop(fence);
         drop(drain);
@@ -296,6 +444,75 @@ impl LocalConnectorEngine {
         }
     }
 
+    /// Mark only the physical-drain half of a bundle onboard complete.
+    ///
+    /// The logical terminal is deliberately owned by [`Self::finish_load_action`].
+    /// This method never writes the handle cell. It releases eviction/request-
+    /// drain barriers, publishes the observational physical fence, and emits
+    /// an unfenced worker terminal that the logical phase deferred. Keeping
+    /// the handle write in the logical phase preserves prompt failure while
+    /// keeping failed destination ids quarantined until DMA has settled; the
+    /// stored outcome also prevents a late completion from overwriting it.
+    pub(super) fn finish_physical_load_action(
+        &self,
+        action_id: ActionId,
+        physical_drain: &Arc<AtomicBool>,
+    ) {
+        let (request_id, worker_terminal, fence, drain, remove_now) = {
+            let mut guard = self.actions.get_mut(&action_id);
+            match guard.as_deref_mut() {
+                Some(record) => {
+                    record.physical_pending = false;
+                    record.cancel = None;
+                    let suppress_terminal = record.fence.is_some() || record.drain.is_some();
+                    let prior_terminal = match &mut record.kind {
+                        ActionKind::Load(terminal) => {
+                            std::mem::replace(terminal, LoadTerminalState::Settled)
+                        }
+                        ActionKind::Save(_) => {
+                            debug_assert!(false, "physical load terminal requires a load action");
+                            return;
+                        }
+                    };
+                    let worker_terminal = match prior_terminal {
+                        LoadTerminalState::Deferred(outcome) if !suppress_terminal => Some(outcome),
+                        LoadTerminalState::Pending => {
+                            tracing::error!(
+                                ?action_id,
+                                "physical load settled before its logical terminal"
+                            );
+                            record.kind = ActionKind::Load(LoadTerminalState::Pending);
+                            None
+                        }
+                        LoadTerminalState::Deferred(_) | LoadTerminalState::Settled => None,
+                    };
+                    (
+                        Some(record.request_id.clone()),
+                        worker_terminal,
+                        record.fence.take(),
+                        record.drain.take(),
+                        record.dropped_by_handle,
+                    )
+                }
+                None => (None, None, None, None, false),
+            }
+        };
+
+        // Worker-side barriers first; once the leader-side physical fence is
+        // observed complete, every other release signal for this drain has
+        // already been emitted.
+        drop(fence);
+        drop(drain);
+        physical_drain.store(true, Ordering::Release);
+        if let (Some(request_id), Some(worker_terminal)) = (request_id, worker_terminal) {
+            self.sink.mark_load_finished(&request_id, worker_terminal);
+        }
+
+        if remove_now {
+            self.remove_action_record(&action_id);
+        }
+    }
+
     /// Terminal for a save (offload) action.
     ///
     /// Writes the terminal status into the handle's completion cell (via the
@@ -308,9 +525,8 @@ impl LocalConnectorEngine {
     /// cancel-for-emission (eviction) path still fires `mark_fence_complete`,
     /// exactly as the load terminal does.
     ///
-    /// No prune here (same as the load terminal): the `actions` entry and its
-    /// `by_request` link live until the handle's RAII drop fires
-    /// [`LocalConnectorEngine::release_action`].
+    /// A live handle retains the record after this terminal. A prior handle
+    /// drop makes this terminal remove the record and both index entries.
     pub(super) fn finish_save_action(
         &self,
         action_id: ActionId,
@@ -320,21 +536,30 @@ impl LocalConnectorEngine {
         // Under the per-action guard: write the terminal into the handle's cell,
         // TAKE any armed fence/drain clones, and learn whether the handle already
         // dropped. Release the guard before any sink call or barrier-clone drop.
-        let (fence, drain, remove_now) = {
+        let settled = {
             let mut guard = self.actions.get_mut(&action_id);
             match guard.as_deref_mut() {
                 Some(record) => {
-                    if let Some(cell) = record.cell.upgrade() {
-                        *cell.lock().expect("action-status mutex poisoned") = outcome;
+                    if record.settle_save_once(outcome) {
+                        Some((
+                            record.fence.take(),
+                            record.drain.take(),
+                            record.dropped_by_handle,
+                        ))
+                    } else {
+                        None
                     }
-                    (
-                        record.fence.take(),
-                        record.drain.take(),
-                        record.dropped_by_handle,
-                    )
                 }
-                None => (None, None, false),
+                None => None,
             }
+        };
+        let Some((fence, drain, remove_now)) = settled else {
+            tracing::debug!(
+                ?action_id,
+                %request_id,
+                "ignoring missing or duplicate save terminal"
+            );
+            return;
         };
 
         // Notify with NO engine lock held. The non-fenced offload terminal fires
@@ -359,12 +584,10 @@ impl LocalConnectorEngine {
     }
 
     /// Arm the finished-request drain emission (the `RequestOffloadDrain::commit`
-    /// target — D semantics). Mints one shared [`DrainBarrier`] and, for every
-    /// action of `req` still `Pending`, stores a clone under the SAME per-action
-    /// `get_mut` guard that `finish_*_action` serializes on — so a terminal
-    /// cannot land between the pending check and the arm. The local guard clone
-    /// drops at return: if nothing was armed (every action already terminal, or
-    /// none exist), that drop IS the immediate emission.
+    /// target — D semantics). Mints one shared [`DrainBarrier`] for each action
+    /// with logical or physical work. It stores each clone under the same
+    /// per-action guard that serializes terminal updates. The local guard clone
+    /// drops at return. That drop emits immediately when no action was armed.
     pub(super) fn arm_drain_emission(&self, req: &RequestId) {
         let emission = Arc::new(DrainBarrier::new(req.clone(), self.sink.clone()));
         let action_ids: Vec<ActionId> = self
@@ -374,16 +597,10 @@ impl LocalConnectorEngine {
             .unwrap_or_default();
         for id in &action_ids {
             if let Some(mut record) = self.actions.get_mut(id) {
-                let still_pending = record.cell.upgrade().is_some_and(|cell| {
-                    matches!(
-                        *cell.lock().expect("action-status mutex poisoned"),
-                        ActionStatus::Pending
-                    )
-                });
                 // `drain.is_none()` mirrors the evict arming guard: the drain is
                 // consume-once so a second commit can't reach here for the same
                 // registration, but a strict guard is cheap.
-                if still_pending && record.drain.is_none() {
+                if record.has_pending_work() && record.drain.is_none() {
                     record.drain = Some(Arc::clone(&emission));
                 }
             }
@@ -407,6 +624,12 @@ impl LocalConnectorEngine {
     /// fence-armed action's record outlives a premature handle drop.
     pub(super) fn remove_action_record(&self, id: &ActionId) {
         if let Some((_id, record)) = self.actions.remove(id) {
+            if let Some(key) = record.inflight {
+                self.inflight
+                    .lock()
+                    .expect("inflight-guard mutex poisoned")
+                    .clear(&key);
+            }
             self.untrack_action(&record.request_id, *id);
         }
     }

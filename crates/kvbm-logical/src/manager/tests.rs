@@ -9,6 +9,15 @@ use crate::testing::{
 };
 use rstest::rstest;
 
+mod exact_inactive_allocation;
+mod exact_reclaim_allocation;
+mod exact_reclaim_by_hash;
+mod inactive_lineage_hold;
+mod opaque_exact_reclaim;
+mod registered_presence;
+mod registration_provenance;
+mod reset_only_allocation;
+
 // Type alias for backward compatibility
 type TestBlockData = TestMeta;
 
@@ -108,6 +117,27 @@ mod builder_tests {
         let blocks = manager.allocate_blocks(4);
         assert!(blocks.is_some());
         assert_eq!(blocks.unwrap().len(), 4);
+    }
+
+    #[test]
+    fn inactive_backend_policy_round_trips_and_is_applied_at_build() {
+        let policy = InactiveBackendConfig::MultiLru {
+            frequency_thresholds: [2, 6, 12],
+        };
+        let json = serde_json::to_string(&policy).unwrap();
+        let decoded: InactiveBackendConfig = serde_json::from_str(&json).unwrap();
+        let manager = BlockManager::<TestBlockData>::builder()
+            .block_count(8)
+            .registry(
+                BlockRegistry::builder()
+                    .frequency_tracker(FrequencyTrackingCapacity::Small.create_tracker())
+                    .build(),
+            )
+            .inactive_backend(decoded)
+            .build()
+            .unwrap();
+
+        assert_eq!(manager.inactive_backend(), &decoded);
     }
 
     #[test]
@@ -973,6 +1003,145 @@ mod registration_tests {
             let snap = manager.metrics().snapshot();
             assert_eq!(snap.duplicate_blocks, 1);
         }
+    }
+
+    /// E5 (load-bearing): the two-phase prefix-caching path can register the SAME hash
+    /// twice in one scheduling window (both requests prefill before either registers). Under
+    /// `Allow` on the valued lineage backend, both prefilled pages must stay pinned on
+    /// DISTINCT slots — `Reject` would free the loser's still-referenced page (a
+    /// use-after-free). Also drives allocate → complete → register → drop → re-allocate
+    /// end-to-end against the valued backend (builder wiring, hook flow, no spurious
+    /// allocate_atomic rollback).
+    #[test]
+    fn valued_backend_allow_duplicate_registration_no_use_after_free() {
+        let registry = BlockRegistry::new();
+        let manager = BlockManager::<TestBlockData>::builder()
+            .block_count(10)
+            .block_size(4)
+            .registry(registry)
+            .duplication_policy(BlockDuplicationPolicy::Allow)
+            .with_valued_lineage_backend(ScorerParams::default())
+            .build()
+            .expect("Should build valued-backend manager");
+
+        let token_block = create_test_token_block_from_iota(400);
+        let seq_hash = token_block.kvbm_sequence_hash();
+
+        // Same hash prefilled twice, then both registered — the reachable G1 duplicate case.
+        let cb1 = manager
+            .allocate_blocks(1)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .complete(&token_block)
+            .unwrap();
+        let cb2 = manager
+            .allocate_blocks(1)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .complete(&token_block)
+            .unwrap();
+        let ib1 = manager.register_blocks(vec![cb1]);
+        let ib2 = manager.register_blocks(vec![cb2]);
+
+        assert_eq!(ib1[0].sequence_hash(), seq_hash);
+        assert_eq!(ib2[0].sequence_hash(), seq_hash);
+        assert_ne!(
+            ib1[0].block_id(),
+            ib2[0].block_id(),
+            "Allow must keep both prefilled pages pinned on distinct slots (no use-after-free)"
+        );
+        assert_eq!(manager.metrics().snapshot().duplicate_blocks, 1);
+
+        // The registration is matchable while alive.
+        let matched = manager.match_blocks(&[seq_hash]);
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].sequence_hash(), seq_hash);
+
+        // Drop everything → primary lands in the valued inactive pool, duplicate resets; a
+        // full re-allocation drains cleanly (no rollback storm, counts consistent).
+        drop((ib1, ib2, matched));
+        assert!(
+            manager.allocate_blocks(10).is_some(),
+            "all slots reclaimable through the valued backend"
+        );
+    }
+
+    /// The valued backend's public `ScorerParams` are validated at build time so a bad
+    /// value (NaN γ, out-of-range γ, zero exponent, `t_blocks=Some(0)`) fails fast instead
+    /// of producing runtime NaN scores that stall eviction into a rollback.
+    #[test]
+    fn valued_backend_rejects_invalid_scorer_params() {
+        let base = ScorerParams::default();
+        let bad = [
+            ScorerParams {
+                gamma: f64::NAN,
+                ..base.clone()
+            },
+            ScorerParams {
+                gamma: 1.5,
+                ..base.clone()
+            },
+            ScorerParams {
+                gamma: -0.1,
+                ..base.clone()
+            },
+            ScorerParams {
+                n: 0,
+                ..base.clone()
+            },
+            ScorerParams {
+                t_blocks: Some(0),
+                ..base.clone()
+            },
+        ];
+        for params in bad {
+            let res = BlockManager::<TestBlockData>::builder()
+                .block_count(4)
+                .block_size(4)
+                .registry(BlockRegistry::new())
+                .with_valued_lineage_backend(params)
+                .build();
+            assert!(res.is_err(), "invalid scorer params must fail build");
+        }
+
+        let ok = BlockManager::<TestBlockData>::builder()
+            .block_count(4)
+            .block_size(4)
+            .registry(BlockRegistry::new())
+            .with_valued_lineage_backend(ScorerParams {
+                gamma: 0.6,
+                n: 2,
+                k_sample: 16,
+                t_blocks: Some(1000),
+                seed: 1,
+            })
+            .build();
+        assert!(ok.is_ok(), "valid scorer params must build");
+    }
+
+    /// Regression: a later non-valued backend selector overrides an earlier
+    /// `with_valued_lineage_backend`, so the now-unused (even invalid) scorer params must
+    /// NOT fail the build — validation is gated on the *selected* backend.
+    #[test]
+    fn later_backend_selector_ignores_stale_scorer_params() {
+        let res = BlockManager::<TestBlockData>::builder()
+            .block_count(4)
+            .block_size(4)
+            .registry(BlockRegistry::new())
+            .with_valued_lineage_backend(ScorerParams {
+                gamma: f64::NAN,
+                ..ScorerParams::default()
+            })
+            .with_lineage_backend() // overrides to a non-valued backend
+            .build();
+        assert!(
+            res.is_ok(),
+            "a later non-valued backend must ignore stale scorer params"
+        );
     }
 
     #[test]
@@ -1921,6 +2090,58 @@ mod capacity_lifecycle_tests {
         manager.register_blocks(complete)
     }
 
+    #[test]
+    fn inactive_eviction_never_selects_an_active_block() {
+        let manager = create_backend_manager(2, |builder| builder.with_lru_backend());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_for_callback = std::sync::Arc::clone(&observed);
+        let observer: std::sync::Arc<dyn BlockEvictionObserver> =
+            std::sync::Arc::new(move |hashes: &[SequenceHash]| {
+                observed_for_callback
+                    .lock()
+                    .unwrap()
+                    .extend_from_slice(hashes);
+            });
+        manager.observe_evictions(&observer);
+        let mut registered = allocate_complete_register_all(&manager, 2, 4_000);
+        let inactive = registered.pop().unwrap();
+        let inactive_hash = inactive.sequence_hash();
+        let active = registered.pop().unwrap();
+        let active_hash = active.sequence_hash();
+        drop(inactive);
+
+        let (_allocated, evicted) = manager
+            .allocate_blocks_with_evictions(1)
+            .expect("the inactive slot is available");
+
+        assert_eq!(evicted, vec![inactive_hash]);
+        assert_eq!(*observed.lock().unwrap(), vec![inactive_hash]);
+        assert_eq!(active.sequence_hash(), active_hash);
+        assert_eq!(manager.match_blocks(&[active_hash]).len(), 1);
+    }
+
+    #[test]
+    fn resetting_inactive_pool_notifies_dependency_observers() {
+        let manager = create_backend_manager(1, |builder| builder.with_lru_backend());
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_for_callback = std::sync::Arc::clone(&observed);
+        let observer: std::sync::Arc<dyn BlockEvictionObserver> =
+            std::sync::Arc::new(move |hashes: &[SequenceHash]| {
+                observed_for_callback
+                    .lock()
+                    .unwrap()
+                    .extend_from_slice(hashes);
+            });
+        manager.observe_evictions(&observer);
+        let registered = allocate_complete_register_all(&manager, 1, 8_000);
+        let hash = registered[0].sequence_hash();
+        drop(registered);
+
+        manager.reset_inactive_pool().unwrap();
+
+        assert_eq!(*observed.lock().unwrap(), vec![hash]);
+    }
+
     // ====================================================================
     // 1. Full capacity register and return to inactive
     // ====================================================================
@@ -2817,8 +3038,10 @@ mod audit_counter_tests {
             .into_iter()
             .next()
             .unwrap();
+        let block_id = immutable.block_id();
 
         let store = manager.store_for_test();
+        let inactive_epoch_before = store.slot_inactive_epoch_for_test(block_id);
 
         let snap_before = manager.metrics().snapshot();
         assert_eq!(snap_before.eager_primary_to_inactive_total, 0);
@@ -2850,6 +3073,11 @@ mod audit_counter_tests {
         assert_eq!(
             snap_mid.eager_primary_to_inactive_total, 1,
             "eager-transition counter must tick exactly once"
+        );
+        assert_eq!(
+            store.slot_inactive_epoch_for_test(block_id),
+            inactive_epoch_before + 1,
+            "the eager path starts a new inactive tenure before resurrection"
         );
 
         // Release the gate FIRST so the parked drop_t can run. We
@@ -3941,5 +4169,487 @@ mod reset_on_release_tests {
             s.reset_pool_size, 4,
             "reset gauge incremented, not inactive"
         );
+    }
+}
+
+// ============================================================================
+// COMPACTION POISON (EV-PR4): BlockManager::poison_lineage reaches the valued
+// lineage backend and is membership + branch-point safe.
+// ============================================================================
+mod poison_lineage_tests {
+    use super::*;
+    use crate::ImmutableBlock;
+    use crate::testing::{TEST_SALT, create_test_manager_with_backend};
+    use dynamo_tokens::TokenBlockSequence;
+
+    /// A `block_size = 1` manager on the **valued** lineage backend — the only
+    /// arm that acts on poison marks. (`test_block_manager` / the default LRU
+    /// would make every poison assertion vacuous.)
+    fn valued_manager(pages: usize) -> BlockManager<TestBlockData> {
+        create_test_manager_with_backend(pages, |builder| {
+            builder
+                .block_size(1)
+                .with_valued_lineage_backend(ScorerParams::default())
+        })
+    }
+
+    /// Block-boundary sequence hashes for `tokens` at block_size 1.
+    fn hashes(tokens: &[u32]) -> Vec<SequenceHash> {
+        TokenBlockSequence::from_slice(tokens, 1, Some(TEST_SALT))
+            .blocks()
+            .iter()
+            .map(|tb| tb.kvbm_sequence_hash())
+            .collect()
+    }
+
+    /// Register the whole `tokens` chain through the manager and return the live
+    /// `ImmutableBlock` handles (still active until the caller drops them).
+    fn register_chain(
+        manager: &BlockManager<TestBlockData>,
+        tokens: &[u32],
+    ) -> Vec<ImmutableBlock<TestBlockData>> {
+        let seq = TokenBlockSequence::from_slice(tokens, 1, Some(TEST_SALT));
+        seq.blocks()
+            .iter()
+            .map(|tb| {
+                let mutable = manager.allocate_blocks(1).expect("allocate one page");
+                let complete = mutable
+                    .into_iter()
+                    .next()
+                    .unwrap()
+                    .complete(tb)
+                    .expect("complete block");
+                manager
+                    .register_blocks(vec![complete])
+                    .into_iter()
+                    .next()
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    /// Register only the block at `position` of `tokens` (its parent must
+    /// already be resident) and return its live handle.
+    fn register_divergent(
+        manager: &BlockManager<TestBlockData>,
+        tokens: &[u32],
+        position: usize,
+    ) -> ImmutableBlock<TestBlockData> {
+        let seq = TokenBlockSequence::from_slice(tokens, 1, Some(TEST_SALT));
+        let tb = &seq.blocks()[position];
+        let mutable = manager.allocate_blocks(1).expect("allocate one page");
+        let complete = mutable
+            .into_iter()
+            .next()
+            .unwrap()
+            .complete(tb)
+            .expect("complete block");
+        manager
+            .register_blocks(vec![complete])
+            .into_iter()
+            .next()
+            .unwrap()
+    }
+
+    /// The additive `BlockManager::poison_lineage` wrapper reaches the valued
+    /// backend: the single-owner suffix (leaf + interior) is poisoned, and the
+    /// walk stops at the first shared branch point so neither the shared prefix
+    /// nor the sibling lineage is demoted.
+    ///
+    /// Inactive graph built here (block_size 1):
+    /// `a0 → a1 → { a2 → a3 , b2 }` — `a1` is the branch point.
+    #[test]
+    fn poison_lineage_marks_single_owner_suffix_and_spares_shared_ancestors() {
+        let manager = valued_manager(8);
+        let a = hashes(&[0, 1, 2, 3]); // a0..a3
+        let b = hashes(&[0, 1, 99]); // shares a0,a1; diverges at b2
+        let b2_hash = b[2];
+
+        let chain_a = register_chain(&manager, &[0, 1, 2, 3]);
+        // Divergent sibling at position 2; its parent a1 is (still active) resident.
+        let b2 = register_divergent(&manager, &[0, 1, 99], 2);
+
+        // Drop every handle to the inactive pool. Drop chain_a first so a1 is
+        // resident when b2 lands under it and makes a1 a two-child branch point.
+        drop(chain_a);
+        drop(b2);
+
+        // Poison the compacted request's leaf a3.
+        manager.poison_lineage(a[3]);
+
+        assert!(
+            manager.test_is_poisoned(a[3]),
+            "the leaf of the single-owner suffix is poisoned"
+        );
+        assert!(
+            manager.test_is_poisoned(a[2]),
+            "the interior single-owner block is poisoned"
+        );
+        assert!(
+            !manager.test_is_poisoned(a[1]),
+            "the shared branch point must NOT be poisoned"
+        );
+        assert!(
+            !manager.test_is_poisoned(a[0]),
+            "the shared root must NOT be poisoned"
+        );
+        assert!(
+            !manager.test_is_poisoned(b2_hash),
+            "the sibling lineage must NOT be poisoned"
+        );
+    }
+
+    /// Reuse clears poison. A compaction-poisoned inactive block that is later
+    /// matched (cache hit → promoted active) and re-released comes back
+    /// UN-poisoned: `on_node_removed` clears the slot's sticky poison bit on
+    /// eviction/resurrection, so a fresh occupant of the recycled slot starts
+    /// with a clean (evict-last) score. Semantics: poison is a one-shot,
+    /// this-tenancy hint — a subsequent reuser is not penalized for the prior
+    /// request's compaction.
+    #[test]
+    fn reuse_clears_compaction_poison() {
+        let manager = valued_manager(8);
+        let a = hashes(&[0, 1, 2]); // a0 → a1 → a2 (single-owner chain)
+
+        let chain_a = register_chain(&manager, &[0, 1, 2]);
+        drop(chain_a);
+
+        manager.poison_lineage(a[2]);
+        assert!(manager.test_is_poisoned(a[2]), "leaf poisoned before reuse");
+        assert!(
+            manager.test_is_poisoned(a[1]),
+            "interior poisoned before reuse"
+        );
+
+        // Cache hit: resurrect the whole chain active, then re-release it.
+        let rematched = manager.match_blocks(&a);
+        assert_eq!(
+            rematched.len(),
+            a.len(),
+            "the whole chain matched from inactive"
+        );
+        drop(rematched);
+
+        assert!(
+            !manager.test_is_poisoned(a[2]),
+            "reuse (match → re-release) clears the leaf's poison"
+        );
+        assert!(
+            !manager.test_is_poisoned(a[1]),
+            "reuse clears the interior block's poison"
+        );
+    }
+
+    /// A non-resident (never-inactive) leaf is a poison no-op: the membership
+    /// guard in `poison_suffix` returns early, so nothing is marked.
+    #[test]
+    fn poison_lineage_on_absent_leaf_is_a_noop() {
+        let manager = valued_manager(8);
+        let a = hashes(&[0, 1, 2]);
+        // Never registered/dropped → not resident-inactive.
+        manager.poison_lineage(a[2]);
+        assert!(!manager.test_is_poisoned(a[2]));
+        assert!(!manager.test_is_poisoned(a[1]));
+        assert!(!manager.test_is_poisoned(a[0]));
+    }
+
+    /// Two-holder IDENTICAL tail: a second live request B holds the *exact same*
+    /// blocks A does (`a0..a2`, no divergence). This is the degenerate boundary
+    /// of the two-holder case: when A releases, B keeps EVERY block active, so
+    /// NONE enter the inactive pool and the poison walk never runs —
+    /// `poison_lineage(a2)` hits the resident-inactive membership guard and
+    /// early-returns. It therefore proves exactly two narrow things and no more:
+    /// (a) poisoning a live (non-resident-inactive) leaf is a pure membership
+    /// no-op, and (b) no sticky mark is leaked across the active→inactive
+    /// transition when B later releases. It does NOT exercise the interior walk
+    /// or the ghost-STOP; the non-degenerate *overlapping*-tail sibling test
+    /// [`compacting_holder_poisons_only_its_own_inactive_tail_over_a_live_overlap`]
+    /// covers the case where the walk actually runs over an inactive tail.
+    #[test]
+    fn compacting_one_holder_never_poisons_a_live_second_holders_blocks() {
+        let manager = valued_manager(8);
+        let a = hashes(&[0, 1, 2]); // shared chain a0 → a1 → a2
+
+        // Holder A registers the chain (blocks active).
+        let holder_a = register_chain(&manager, &[0, 1, 2]);
+        // Holder B resurrects the SAME slots via a cache match (a second live
+        // owner of the identical blocks).
+        let holder_b = manager.match_blocks(&a);
+        assert_eq!(holder_b.len(), a.len(), "B matched the shared active chain");
+
+        // A releases; the blocks stay ACTIVE because B still holds them.
+        drop(holder_a);
+        assert_eq!(
+            manager.metrics().snapshot().inactive_pool_size,
+            0,
+            "the shared blocks are still active (held by B), not inactive"
+        );
+
+        // A "compacts": poison the shared leaf while B is live. Membership guard
+        // early-returns — the leaf is not resident-inactive — so no mark is set.
+        manager.poison_lineage(a[2]);
+        assert!(
+            !manager.test_is_poisoned(a[2]),
+            "half (a): a live second holder's blocks must NOT be poisoned"
+        );
+
+        // B now releases naturally; the blocks enter inactive.
+        drop(holder_b);
+        assert_eq!(
+            manager.metrics().snapshot().inactive_pool_size,
+            a.len() as i64,
+            "B's blocks entered the inactive pool on release"
+        );
+        // Half (b), load-bearing: no sticky poison leaked onto the active
+        // blocks, so they enter inactive UN-poisoned.
+        assert!(
+            !manager.test_is_poisoned(a[2]),
+            "half (b): B's leaf enters inactive un-poisoned"
+        );
+        assert!(!manager.test_is_poisoned(a[1]));
+        assert!(!manager.test_is_poisoned(a[0]));
+    }
+
+    /// Two-holder OVERLAPPING tail — the non-degenerate case where the poison
+    /// walk actually runs over an interior block. Holder A owns the full chain
+    /// `a0..a5`; holder B is a second live owner of only the `a0..a3` prefix.
+    /// When A releases, its UNIQUE tail `a4,a5` (which B never held) drops to
+    /// the inactive pool, and `a3` — still active in B's hands — is left behind
+    /// only as a ghost placeholder anchoring `a4`. `a0..a2` are not in the
+    /// inactive arena at all.
+    ///
+    /// So when A compacts (poisons its leaf `a5`), the walk covers an interior
+    /// block: BOTH `a4` and the leaf `a5` are poisoned — the load-bearing
+    /// property. It halts before B's live overlap: `a3` (ghost) is not marked,
+    /// and when B later releases, `a0..a3` enter inactive UN-poisoned with no
+    /// sticky mark leaked onto them.
+    ///
+    /// Note on what protects B's overlap here: `a3` is a ghost, so
+    /// `ValuedPolicy::mark_poisoned` no-ops on it and membership keeps `a0..a2`
+    /// out of the walk entirely — this is NOT the ghost-STOP. The ghost-STOP
+    /// (walk halts below a *Real inactive* ancestor of a ghost) requires a
+    /// suffix-hold that violates prefix-contiguity and cannot arise from a live
+    /// second holder; it is covered at the backend layer by
+    /// `lineage::tests::valued_poison_stops_at_ghost_ancestor`.
+    #[test]
+    fn compacting_holder_poisons_only_its_own_inactive_tail_over_a_live_overlap() {
+        let manager = valued_manager(8);
+        let a = hashes(&[0, 1, 2, 3, 4, 5]); // a0..a5
+
+        // Holder A registers the full chain a0..a5 (all active).
+        let holder_a = register_chain(&manager, &[0, 1, 2, 3, 4, 5]);
+        // Holder B acquires ONLY the prefix a0..a3 — a second live owner of the
+        // exact physical blocks A also holds.
+        let holder_b = manager.match_blocks(&a[..4]);
+        assert_eq!(
+            holder_b.len(),
+            4,
+            "B matched exactly the shared prefix a0..a3"
+        );
+
+        // A releases: a0..a3 stay ACTIVE (B holds them); only A's unique tail
+        // a4,a5 enters inactive, and a3 becomes a ghost anchor for a4.
+        drop(holder_a);
+        assert_eq!(
+            manager.metrics().snapshot().inactive_pool_size,
+            2,
+            "only A's unique tail a4,a5 entered inactive"
+        );
+
+        // A "compacts": poison its own tail leaf a5.
+        manager.poison_lineage(a[5]);
+
+        // Load-bearing: the walk runs over an interior block, not just the leaf.
+        assert!(
+            manager.test_is_poisoned(a[5]),
+            "A's tail leaf a5 is poisoned"
+        );
+        assert!(
+            manager.test_is_poisoned(a[4]),
+            "A's interior tail block a4 is poisoned (the walk actually ran)"
+        );
+        // Stops before B's live overlap: a3 (ghost) is untouched.
+        assert!(
+            !manager.test_is_poisoned(a[3]),
+            "B's live boundary block a3 must NOT be poisoned"
+        );
+
+        // B releases: a0..a3 now enter inactive. No sticky poison leaked onto
+        // them while they were live (a3's ghost promotes to Real un-poisoned).
+        drop(holder_b);
+        assert_eq!(
+            manager.metrics().snapshot().inactive_pool_size,
+            6,
+            "B's a0..a3 joined A's a4,a5 in the inactive pool"
+        );
+        // Half (b) is load-bearing: assert EVERY block B held enters inactive
+        // un-poisoned (no sticky mark leaked onto the live overlap). Without the
+        // per-block checks this collapses back to the vacuous case.
+        assert!(
+            !manager.test_is_poisoned(a[3]),
+            "half (b): B's boundary block a3 enters inactive un-poisoned"
+        );
+        assert!(
+            !manager.test_is_poisoned(a[2]),
+            "half (b): a2 enters inactive un-poisoned"
+        );
+        assert!(
+            !manager.test_is_poisoned(a[1]),
+            "half (b): a1 enters inactive un-poisoned"
+        );
+        assert!(
+            !manager.test_is_poisoned(a[0]),
+            "half (b): a0 enters inactive un-poisoned"
+        );
+    }
+}
+
+// ============================================================================
+// INACTIVE SNAPSHOT API (R7a): BlockManager::inactive_candidates /
+// inactive_advice / inactive_len / reset_len over the store's single lock.
+// ============================================================================
+mod inactive_snapshot_tests {
+    use super::*;
+    use crate::ImmutableBlock;
+    use crate::testing::{TEST_SALT, create_test_manager_with_backend};
+    use dynamo_tokens::TokenBlockSequence;
+
+    /// A `block_size = 1` manager on the **valued** lineage backend — the arm
+    /// that carries poison marks and a value order.
+    fn valued_manager(pages: usize) -> BlockManager<TestBlockData> {
+        create_test_manager_with_backend(pages, |builder| {
+            builder
+                .block_size(1)
+                .with_valued_lineage_backend(ScorerParams::default())
+        })
+    }
+
+    /// Block-boundary sequence hashes for `tokens` at block_size 1.
+    fn hashes(tokens: &[u32]) -> Vec<SequenceHash> {
+        TokenBlockSequence::from_slice(tokens, 1, Some(TEST_SALT))
+            .blocks()
+            .iter()
+            .map(|tb| tb.kvbm_sequence_hash())
+            .collect()
+    }
+
+    /// Register the whole `tokens` chain through the manager and return the live
+    /// `ImmutableBlock` handles (still active until the caller drops them).
+    fn register_chain(
+        manager: &BlockManager<TestBlockData>,
+        tokens: &[u32],
+    ) -> Vec<ImmutableBlock<TestBlockData>> {
+        let seq = TokenBlockSequence::from_slice(tokens, 1, Some(TEST_SALT));
+        seq.blocks()
+            .iter()
+            .map(|tb| {
+                let mutable = manager.allocate_blocks(1).expect("allocate one page");
+                let complete = mutable
+                    .into_iter()
+                    .next()
+                    .unwrap()
+                    .complete(tb)
+                    .expect("complete block");
+                manager
+                    .register_blocks(vec![complete])
+                    .into_iter()
+                    .next()
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    /// End-to-end through the public manager surface: candidates come back in
+    /// eviction order with the poison bit set, advice distinguishes
+    /// resident-inactive from active and absent, and the occupancy getters
+    /// agree with `total_blocks`.
+    #[test]
+    fn candidates_and_advice_reach_the_valued_backend() {
+        let manager = valued_manager(8);
+        let a = hashes(&[0, 1, 2]); // a0 → a1 → a2, single-owner chain
+        let b = hashes(&[50, 51]); // independent chain, kept ACTIVE
+
+        let chain_a = register_chain(&manager, &[0, 1, 2]);
+        let held_b = register_chain(&manager, &[50, 51]);
+        drop(chain_a); // a0..a2 fall into the inactive pool; b0,b1 stay active
+
+        // Pool *depth*, not free-able supply: all three chain-A blocks are
+        // resident-inactive, but the two interior ones are structurally
+        // unevictable and never appear as candidates below. The gap is the
+        // documented contract of `inactive_len`, not an accounting slip.
+        assert_eq!(manager.inactive_len(), 3, "chain A is resident-inactive");
+        assert_eq!(
+            manager.reset_len() + manager.inactive_len() + held_b.len(),
+            manager.total_blocks(),
+            "every page is accounted for across reset / inactive / active"
+        );
+
+        manager.poison_lineage(a[2]);
+
+        let candidates = manager.inactive_candidates(4);
+        assert_eq!(
+            candidates.len(),
+            1,
+            "only the leaf of the chain is an eviction candidate"
+        );
+        let leaf = candidates[0];
+        assert_eq!(leaf.seq_hash, a[2]);
+        assert!(
+            leaf.features.poisoned,
+            "the compaction hint reached the API"
+        );
+        assert!(leaf.features.is_leaf);
+        assert_eq!(
+            leaf.features.evict_rank,
+            Some(0),
+            "rank 0 heads the returned batch"
+        );
+        assert!(
+            leaf.features.freq_estimate.is_some(),
+            "the test registry has a frequency tracker attached"
+        );
+
+        // Point advice: interior inactive → Some(is_leaf: false); active → None;
+        // never-registered → None. Positional, one lock for the batch.
+        let absent = hashes(&[77])[0];
+        let advice = manager.inactive_advice(&[a[1], b[1], absent]);
+        assert_eq!(advice.len(), 3, "one answer per requested hash");
+        let interior = advice[0].expect("an inactive interior node is visible");
+        assert!(!interior.is_leaf);
+        assert!(interior.poisoned, "the suffix walk poisoned it");
+        assert!(
+            advice[1].is_none(),
+            "an ACTIVE block is not resident-inactive"
+        );
+        assert!(advice[2].is_none(), "an absent hash has no advice");
+
+        // Non-destructive: nothing was evicted or resurrected by the reads.
+        assert_eq!(manager.inactive_len(), 3);
+        drop(held_b);
+    }
+
+    /// A non-lineage backend degrades to no signal at all — empty candidates and
+    /// `None` advice — so a consumer must not depend on it (R7a §4). The default
+    /// test manager is LRU.
+    #[test]
+    fn non_lineage_backend_degrades_to_no_candidates() {
+        let manager = create_test_manager(8);
+        let block = manager
+            .allocate_blocks(1)
+            .expect("allocate one block")
+            .into_iter()
+            .next()
+            .unwrap();
+        let token_block = create_token_block(&[1, 2, 3, 4]);
+        let hash = token_block.kvbm_sequence_hash();
+        let immutable = manager.register_block(block.complete(&token_block).unwrap());
+        drop(immutable);
+
+        assert_eq!(manager.inactive_len(), 1, "the block really is inactive");
+        assert!(
+            manager.inactive_candidates(8).is_empty(),
+            "LRU exposes no candidates"
+        );
+        assert_eq!(manager.inactive_advice(&[hash]), vec![None]);
     }
 }

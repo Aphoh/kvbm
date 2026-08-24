@@ -9,8 +9,8 @@
 //! - Outer-contiguous: [outer_dim, num_blocks, page_size, inner_dim]
 
 use anyhow::{Result, anyhow, bail};
-use dynamo_memory::StorageKind;
 use kvbm_common::{KvDim, KvDimLayout, KvDimStrides};
+use kvbm_memory::StorageKind;
 use validator::Validate;
 
 use super::serialize::{LayerSeparateDetails, LayoutTypeDetails};

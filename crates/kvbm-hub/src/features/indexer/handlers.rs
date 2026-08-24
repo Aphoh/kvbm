@@ -16,8 +16,13 @@ use uuid::Uuid;
 use velo::Handler;
 use velo_ext::InstanceId;
 
+use super::bundle::BundleDirectory;
 use super::index::PositionalIndex;
-use super::protocol::{FindBlocksHit, QUERY_HANDLER, QueryRequest};
+use super::protocol::{
+    BUNDLE_INVALIDATE_HANDLER, BUNDLE_PUBLISH_HANDLER, BUNDLE_QUERY_HANDLER,
+    BundleInvalidateRequest, BundlePublishRequest, BundleQueryOutcome, BundleQueryRequest,
+    FindBlocksHit, QUERY_HANDLER, QueryRequest,
+};
 
 /// Build the indexer-lookup velo handler over a shared [`PositionalIndex`].
 ///
@@ -44,4 +49,41 @@ pub fn create_query_handler(index: Arc<PositionalIndex>) -> Handler {
         },
     )
     .build()
+}
+
+/// Build publish, invalidate, and query handlers for the complete-bundle index.
+pub fn create_bundle_handlers(directory: Arc<BundleDirectory>) -> [Handler; 3] {
+    let publish_directory = Arc::clone(&directory);
+    let publish = Handler::typed_unary_async::<BundlePublishRequest, (), _, _>(
+        BUNDLE_PUBLISH_HANDLER,
+        move |ctx| {
+            let directory = Arc::clone(&publish_directory);
+            async move {
+                directory.publish(ctx.input).map_err(anyhow::Error::from)?;
+                Ok(())
+            }
+        },
+    )
+    .build();
+
+    let invalidate_directory = Arc::clone(&directory);
+    let invalidate = Handler::typed_unary_async::<BundleInvalidateRequest, bool, _, _>(
+        BUNDLE_INVALIDATE_HANDLER,
+        move |ctx| {
+            let directory = Arc::clone(&invalidate_directory);
+            async move { directory.invalidate(ctx.input).map_err(anyhow::Error::from) }
+        },
+    )
+    .build();
+
+    let query = Handler::typed_unary_async::<BundleQueryRequest, BundleQueryOutcome, _, _>(
+        BUNDLE_QUERY_HANDLER,
+        move |ctx| {
+            let directory = Arc::clone(&directory);
+            async move { Ok(directory.query(ctx.input)) }
+        },
+    )
+    .build();
+
+    [publish, invalidate, query]
 }

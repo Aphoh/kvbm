@@ -15,7 +15,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use kvbm_common::SequenceHash;
+use kvbm_common::{LogicalResourceId, SequenceHash};
 use kvbm_engine::leader::ControlPlane;
 use kvbm_engine::leader::InstanceLeader;
 use kvbm_engine::leader::control::TransferModule;
@@ -25,15 +25,17 @@ use kvbm_engine::p2p::session::{
 };
 use kvbm_engine::testing::managers::{TestManagerBuilder, TestRegistryBuilder};
 use kvbm_engine::{G2, G3};
+use kvbm_logical::BlockManagerSet;
 use kvbm_logical::blocks::BlockRegistry;
 use kvbm_logical::manager::BlockManager;
 use kvbm_observability::KvbmObservability;
-use kvbm_protocols::control::ModuleId;
+use kvbm_protocols::cache_manifest::RegistrationEpoch;
 use kvbm_protocols::control::client::LeaderControlClient;
 use kvbm_protocols::control::modules::transfer::{
     CloseTransferSessionRequest, FindMode, OpenTransferSessionRequest, OpenTransferSessionResponse,
     PullFromSessionRequest, SearchMode, SearchRequest, SearchResponse, TierSelection,
 };
+use kvbm_protocols::control::{ControlError, ModuleId};
 use tokio::runtime::Handle;
 use velo::transports::tcp::TcpTransportBuilder;
 
@@ -154,6 +156,58 @@ async fn leader_with_transfer_module(
     (leader, manager)
 }
 
+async fn empty_transfer_leader(messenger: Arc<velo::Messenger>) -> Arc<InstanceLeader> {
+    let registry = BlockRegistry::new();
+    let g2 = Arc::new(
+        TestManagerBuilder::<G2>::new()
+            .block_count(G2_BLOCK_COUNT)
+            .block_size(BLOCK_SIZE)
+            .registry(registry.clone())
+            .build(),
+    );
+    leader_with_transfer_module(messenger, g2, registry).await.0
+}
+
+#[tokio::test]
+async fn epoch_bearing_open_cannot_initialize_an_unregistered_holder() {
+    let fx = fixture().await;
+    let leader = empty_transfer_leader(fx.server.messenger().clone()).await;
+    let stale_epoch = RegistrationEpoch::new();
+
+    let error = leader
+        .open_transfer_session(OpenTransferSessionRequest {
+            registration_epoch: Some(stale_epoch),
+            require_payload_integrity: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+
+    assert_eq!(error, ControlError::RegistrationEpochMismatch);
+    assert!(
+        leader.set_registration_epoch(RegistrationEpoch::new()),
+        "a rejected pre-registration open must not initialize the holder epoch"
+    );
+}
+
+#[tokio::test]
+async fn integrity_open_cannot_downgrade_by_omitting_registration_epoch() {
+    let fx = fixture().await;
+    let leader = empty_transfer_leader(fx.server.messenger().clone()).await;
+    assert!(leader.set_registration_epoch(RegistrationEpoch::new()));
+
+    let error = leader
+        .open_transfer_session(OpenTransferSessionRequest {
+            registration_epoch: None,
+            require_payload_integrity: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+
+    assert_eq!(error, ControlError::RegistrationEpochMismatch);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transfer_module_opens_session_on_match() {
     let fx = fixture().await;
@@ -218,6 +272,88 @@ async fn transfer_module_opens_session_on_match() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn open_transfer_session_selects_requested_resource_manager() {
+    let fx = fixture().await;
+    let known = hashes(3);
+    let primary_registry = BlockRegistry::new();
+    let primary = Arc::new(
+        TestManagerBuilder::<G2>::new()
+            .block_count(G2_BLOCK_COUNT)
+            .block_size(BLOCK_SIZE)
+            .registry(primary_registry.clone())
+            .build(),
+    );
+    let secondary = Arc::new(
+        TestManagerBuilder::<G2>::new()
+            .block_count(G2_BLOCK_COUNT)
+            .block_size(BLOCK_SIZE)
+            .registry(BlockRegistry::new())
+            .build(),
+    );
+    populate_g2(&secondary, &known);
+
+    let mut managers = BlockManagerSet::new();
+    managers
+        .insert(LogicalResourceId(1), Arc::clone(&primary))
+        .unwrap();
+    managers
+        .insert(LogicalResourceId(7), Arc::clone(&secondary))
+        .unwrap();
+    let leader = Arc::new(
+        InstanceLeader::builder()
+            .messenger(fx.server.messenger().clone())
+            .registry(primary_registry)
+            .g2_manager_set(Arc::new(managers), LogicalResourceId(1))
+            .workers(vec![])
+            .build()
+            .unwrap(),
+    );
+    assert!(leader.set_session_factory(MockSessionFactory::new()));
+
+    let response = leader
+        .open_transfer_session(OpenTransferSessionRequest {
+            sequence_hashes: known.clone(),
+            search_mode: SearchMode::Prefix,
+            find_mode: FindMode::Sync,
+            tiers: TierSelection::default(),
+            resource: Some(LogicalResourceId(7)),
+            watchdog_ms: None,
+            registration_epoch: None,
+            require_payload_integrity: false,
+        })
+        .await
+        .unwrap();
+    let OpenTransferSessionResponse::Sync {
+        capability,
+        committed,
+        ..
+    } = response
+    else {
+        panic!("secondary resource should contain the requested prefix")
+    };
+    assert_eq!(capability.resource, LogicalResourceId(7));
+    assert_eq!(committed, known);
+
+    let primary_response = leader
+        .open_transfer_session(OpenTransferSessionRequest {
+            sequence_hashes: known,
+            search_mode: SearchMode::Prefix,
+            find_mode: FindMode::Sync,
+            tiers: TierSelection::default(),
+            resource: None,
+            watchdog_ms: None,
+            registration_epoch: None,
+            require_payload_integrity: false,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        primary_response,
+        OpenTransferSessionResponse::NoBlocksFound
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn open_transfer_session_sync_returns_committed_inline() {
     let fx = fixture().await;
 
@@ -240,7 +376,10 @@ async fn open_transfer_session_sync_returns_committed_inline() {
             search_mode: SearchMode::Prefix,
             find_mode: FindMode::Sync,
             tiers: TierSelection::default(),
+            resource: None,
             watchdog_ms: None,
+            registration_epoch: None,
+            require_payload_integrity: false,
         })
         .await
         .expect("open_transfer_session");
@@ -282,7 +421,10 @@ async fn open_transfer_session_sync_no_match_returns_no_blocks_found() {
             search_mode: SearchMode::Prefix,
             find_mode: FindMode::Sync,
             tiers: TierSelection::default(),
+            resource: None,
             watchdog_ms: None,
+            registration_epoch: None,
+            require_payload_integrity: false,
         })
         .await
         .expect("open_transfer_session");
@@ -314,7 +456,10 @@ async fn open_transfer_session_async_opens_session_with_no_matches() {
             search_mode: SearchMode::Prefix,
             find_mode: FindMode::Async,
             tiers: TierSelection::default(),
+            resource: None,
             watchdog_ms: None,
+            registration_epoch: None,
+            require_payload_integrity: false,
         })
         .await
         .expect("open_transfer_session");
@@ -373,7 +518,10 @@ async fn open_transfer_session_async_populates_then_watchdog_evicts() {
             search_mode: SearchMode::Prefix,
             find_mode: FindMode::Async,
             tiers: TierSelection::default(),
+            resource: None,
             watchdog_ms: None,
+            registration_epoch: None,
+            require_payload_integrity: false,
         })
         .await
         .expect("open_transfer_session");
@@ -429,7 +577,10 @@ async fn open_transfer_session_scatter_finds_disjoint_hits() {
             search_mode: SearchMode::Scatter,
             find_mode: FindMode::Sync,
             tiers: TierSelection::default(),
+            resource: None,
             watchdog_ms: None,
+            registration_epoch: None,
+            require_payload_integrity: false,
         })
         .await
         .expect("open_transfer_session");
@@ -517,7 +668,10 @@ async fn pull_from_session_drains_full_committed_set() {
             search_mode: SearchMode::Prefix,
             find_mode: FindMode::Sync,
             tiers: TierSelection::default(),
+            resource: None,
             watchdog_ms: None,
+            registration_epoch: None,
+            require_payload_integrity: false,
         })
         .await
         .expect("open_transfer_session")
@@ -531,6 +685,8 @@ async fn pull_from_session_drains_full_committed_set() {
             source_instance_id: cap.instance_id,
             endpoint: Some(cap.endpoint),
             selector: None,
+            resource: None,
+            require_payload_integrity: false,
         })
         .await
         .expect("pull_from_session");
@@ -548,7 +704,112 @@ async fn pull_from_session_drains_full_committed_set() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn pull_from_session_with_selector_pulls_subset() {
+async fn pull_from_session_registers_into_requested_resource_manager() {
+    let fx = fixture().await;
+    let known = hashes(4);
+    let (holder_factory, puller_factory) = MockSessionFactory::make_paired();
+
+    let holder_primary_registry = BlockRegistry::new();
+    let holder_primary = Arc::new(
+        TestManagerBuilder::<G2>::new()
+            .block_count(G2_BLOCK_COUNT)
+            .block_size(BLOCK_SIZE)
+            .registry(holder_primary_registry.clone())
+            .build(),
+    );
+    let holder_secondary = Arc::new(
+        TestManagerBuilder::<G2>::new()
+            .block_count(G2_BLOCK_COUNT)
+            .block_size(BLOCK_SIZE)
+            .registry(BlockRegistry::new())
+            .build(),
+    );
+    populate_g2(&holder_secondary, &known);
+    let mut holder_managers = BlockManagerSet::new();
+    holder_managers
+        .insert(LogicalResourceId(1), holder_primary)
+        .unwrap();
+    holder_managers
+        .insert(LogicalResourceId(7), holder_secondary)
+        .unwrap();
+    let holder = Arc::new(
+        InstanceLeader::builder()
+            .messenger(fx.server.messenger().clone())
+            .registry(holder_primary_registry)
+            .g2_manager_set(Arc::new(holder_managers), LogicalResourceId(1))
+            .workers(vec![])
+            .build()
+            .unwrap(),
+    );
+    assert!(holder.set_session_factory(holder_factory));
+
+    let puller_primary_registry = BlockRegistry::new();
+    let puller_primary = Arc::new(
+        TestManagerBuilder::<G2>::new()
+            .block_count(G2_BLOCK_COUNT)
+            .block_size(BLOCK_SIZE)
+            .registry(puller_primary_registry.clone())
+            .build(),
+    );
+    let puller_secondary = Arc::new(
+        TestManagerBuilder::<G2>::new()
+            .block_count(G2_BLOCK_COUNT)
+            .block_size(BLOCK_SIZE)
+            .registry(BlockRegistry::new())
+            .build(),
+    );
+    let mut puller_managers = BlockManagerSet::new();
+    puller_managers
+        .insert(LogicalResourceId(1), Arc::clone(&puller_primary))
+        .unwrap();
+    puller_managers
+        .insert(LogicalResourceId(7), Arc::clone(&puller_secondary))
+        .unwrap();
+    let puller = Arc::new(
+        InstanceLeader::builder()
+            .messenger(fx.client.messenger().clone())
+            .registry(puller_primary_registry)
+            .g2_manager_set(Arc::new(puller_managers), LogicalResourceId(1))
+            .workers(vec![])
+            .build()
+            .unwrap(),
+    );
+    assert!(puller.set_session_factory(puller_factory));
+
+    let capability = holder
+        .open_transfer_session(OpenTransferSessionRequest {
+            sequence_hashes: known.clone(),
+            search_mode: SearchMode::Prefix,
+            find_mode: FindMode::Sync,
+            tiers: TierSelection::default(),
+            resource: Some(LogicalResourceId(7)),
+            watchdog_ms: None,
+            registration_epoch: None,
+            require_payload_integrity: false,
+        })
+        .await
+        .unwrap()
+        .capability()
+        .cloned()
+        .unwrap();
+    puller
+        .pull_from_session(PullFromSessionRequest {
+            session_id: capability.session_id,
+            source_instance_id: capability.instance_id,
+            endpoint: Some(capability.endpoint),
+            selector: None,
+            resource: Some(capability.resource),
+            require_payload_integrity: false,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(puller_secondary.match_blocks(&known).len(), known.len());
+    assert!(puller_primary.match_blocks(&known).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pull_from_session_with_selector_pulls_subset_in_requested_order() {
     let fx = fixture().await;
     let known = hashes(5);
     let (holder, puller, puller_g2) = paired_leaders(&fx, &known).await;
@@ -559,7 +820,10 @@ async fn pull_from_session_with_selector_pulls_subset() {
             search_mode: SearchMode::Prefix,
             find_mode: FindMode::Sync,
             tiers: TierSelection::default(),
+            resource: None,
             watchdog_ms: None,
+            registration_epoch: None,
+            require_payload_integrity: false,
         })
         .await
         .expect("open")
@@ -567,27 +831,26 @@ async fn pull_from_session_with_selector_pulls_subset() {
         .cloned()
         .expect("Sync capability");
 
-    // Pull only the first two committed hashes.
-    let selector: Vec<SequenceHash> = known[0..2].to_vec();
+    // Pull a reordered subset of the committed hashes.
+    let selector = vec![known[3], known[1]];
     let pull = puller
         .pull_from_session(PullFromSessionRequest {
             session_id: cap.session_id,
             source_instance_id: cap.instance_id,
             endpoint: Some(cap.endpoint),
             selector: Some(selector.clone()),
+            resource: None,
+            require_payload_integrity: false,
         })
         .await
         .expect("pull_from_session");
 
-    use std::collections::HashSet;
-    let pulled: HashSet<_> = pull.pulled.into_iter().collect();
-    let expected: HashSet<_> = selector.iter().copied().collect();
-    assert_eq!(pulled, expected);
+    assert_eq!(pull.pulled, selector);
 
     let matched = puller_g2.match_blocks(&selector);
     assert_eq!(matched.len(), selector.len());
     // Non-selected hashes are NOT in the puller's local G2.
-    assert!(puller_g2.match_blocks(&[known[3]]).is_empty());
+    assert!(puller_g2.match_blocks(&[known[2]]).is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -602,7 +865,10 @@ async fn pull_from_session_selector_with_uncommitted_hash_errors() {
             search_mode: SearchMode::Prefix,
             find_mode: FindMode::Sync,
             tiers: TierSelection::default(),
+            resource: None,
             watchdog_ms: None,
+            registration_epoch: None,
+            require_payload_integrity: false,
         })
         .await
         .expect("open")
@@ -620,6 +886,8 @@ async fn pull_from_session_selector_with_uncommitted_hash_errors() {
             source_instance_id: cap.instance_id,
             endpoint: Some(cap.endpoint),
             selector: Some(selector),
+            resource: None,
+            require_payload_integrity: false,
         })
         .await
         .expect_err("expected error");
@@ -642,6 +910,8 @@ async fn pull_from_session_endpoint_required_in_v1() {
             source_instance_id: fx.server.instance_id(),
             endpoint: None,
             selector: None,
+            resource: None,
+            require_payload_integrity: false,
         })
         .await
         .expect_err("expected endpoint_required error");
@@ -706,7 +976,10 @@ async fn open_transfer_session_g3_without_parallel_worker_errors() {
                 g3: false,
                 g4: false,
             },
+            resource: None,
             watchdog_ms: None,
+            registration_epoch: None,
+            require_payload_integrity: false,
         })
         .await
         .expect("open");
@@ -724,7 +997,10 @@ async fn open_transfer_session_g3_without_parallel_worker_errors() {
                 g3: true,
                 g4: false,
             },
+            resource: None,
             watchdog_ms: None,
+            registration_epoch: None,
+            require_payload_integrity: false,
         })
         .await
         .expect_err("expected g3_requires_parallel_worker error");
@@ -785,7 +1061,10 @@ async fn open_transfer_session_g3_ignored_in_prefix_mode() {
                 g3: true,
                 g4: false,
             },
+            resource: None,
             watchdog_ms: None,
+            registration_epoch: None,
+            require_payload_integrity: false,
         })
         .await
         .expect("open");
@@ -815,7 +1094,10 @@ async fn close_transfer_session_is_idempotent() {
             search_mode: SearchMode::Prefix,
             find_mode: FindMode::Sync,
             tiers: TierSelection::default(),
+            resource: None,
             watchdog_ms: None,
+            registration_epoch: None,
+            require_payload_integrity: false,
         })
         .await
         .expect("open_transfer_session")
@@ -875,11 +1157,88 @@ async fn session_manager_evicts_on_watchdog_timeout() {
 
     let factory = MockSessionFactory::new();
     let session = factory.open(uuid::Uuid::new_v4()).expect("open");
+    let mock = factory.last_opened().expect("last_opened");
 
     manager.register(session);
     assert_eq!(manager.len(), 1);
 
     wait_until(|| manager.is_empty()).await;
+    assert_eq!(
+        mock.closed_reason(),
+        Some(Some("session watchdog timeout".to_owned()))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_manager_watchdog_rearms_while_an_authorized_pull_awaits_ack() {
+    let watchdog = Duration::from_millis(30);
+    let manager = SessionManager::new(Handle::current(), watchdog);
+    let factory = MockSessionFactory::new();
+    let session = factory.open(uuid::Uuid::new_v4()).expect("open");
+    let session_id = session.session_id();
+    let mock = factory.last_opened().expect("last_opened");
+    mock.set_inflight_pulls_for_test(1);
+
+    manager.register(session);
+    tokio::time::sleep(watchdog * 3).await;
+    assert!(
+        manager.get(&session_id).is_some(),
+        "watchdog must retain the holder session and its source pins before PullAck"
+    );
+
+    mock.set_inflight_pulls_for_test(0);
+    wait_until(|| manager.is_empty()).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_manager_retains_inflight_pull_after_lifecycle_stream_ends() {
+    let watchdog = Duration::from_millis(30);
+    let manager = SessionManager::new(Handle::current(), watchdog);
+    let factory = MockSessionFactory::new();
+    let session = factory.open(uuid::Uuid::new_v4()).expect("open");
+    let session_id = session.session_id();
+    let mock = factory.last_opened().expect("last_opened");
+    mock.set_inflight_pulls_for_test(1);
+
+    manager.register(session);
+    mock.end_lifecycle_for_test();
+    tokio::time::sleep(watchdog * 3).await;
+    assert!(
+        manager.get(&session_id).is_some(),
+        "ended lifecycle must not release an authorized source pin"
+    );
+
+    mock.set_inflight_pulls_for_test(0);
+    wait_until(|| manager.is_empty()).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_manager_terminal_events_recheck_inflight_without_spinning() {
+    for failed in [false, true] {
+        let watchdog = Duration::from_millis(30);
+        let manager = SessionManager::new(Handle::current(), watchdog);
+        let factory = MockSessionFactory::new();
+        let session = factory.open(uuid::Uuid::new_v4()).expect("open");
+        let session_id = session.session_id();
+        let mock = factory.last_opened().expect("last_opened");
+        mock.set_inflight_pulls_for_test(1);
+
+        manager.register(session);
+        if failed {
+            mock.inject_lifecycle(LifecycleEvent::Failed {
+                reason: "peer terminal".to_owned(),
+            });
+        } else {
+            mock.inject_lifecycle(LifecycleEvent::Detached {
+                reason: Some("peer terminal".to_owned()),
+            });
+        }
+        tokio::time::sleep(watchdog * 3).await;
+        assert!(manager.get(&session_id).is_some());
+
+        mock.set_inflight_pulls_for_test(0);
+        wait_until(|| manager.is_empty()).await;
+    }
 }
 
 // ---- metrics module --------------------------------------------------------

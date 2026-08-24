@@ -51,8 +51,8 @@ use super::protocol::{AcceptId, ActionFailure, ActionId, ActionStatus, SearchId}
 /// fires [`LeaderEngine::release_action`] to prune the engine's per-action tracking
 /// (the by-id action map + the `request_id → action_ids` index) so a terminal
 /// onboard's bookkeeping frees on handle drop rather than leaking a key. Drop
-/// does **not** cancel a healthy in-flight transfer (the engine drives it to
-/// completion regardless; eviction *drains* via `evict`, not via handle drop).
+/// never aborts submitted transfer work. An engine may end the logical wait on
+/// drop, but launched work still drains behind the optional physical fence.
 pub struct OnboardHandle {
     id: ActionId,
     engine: Weak<dyn LeaderEngine>,
@@ -63,6 +63,11 @@ pub struct OnboardHandle {
     /// failure (vLLM invalidates by block id), so `outcome()` uses this set to
     /// project an unresolved `Failed(AllBlocks)` cell onto the full dest set.
     dest_block_ids: Vec<usize>,
+    /// Optional observational fence for an onboard whose logical terminal may
+    /// precede physical transfer drain (for example, a bounded bundle
+    /// watchdog). The connector consumes this fence and gates destination G1
+    /// reuse on it; ordinary onboards leave it absent.
+    physical_drain: Option<FenceHandle>,
 }
 
 impl OnboardHandle {
@@ -83,6 +88,27 @@ impl OnboardHandle {
             engine,
             status,
             dest_block_ids,
+            physical_drain: None,
+        }
+    }
+
+    /// Engine-minted onboard with a physical-drain fence. The fence is
+    /// leader-local and never crosses the wire; a connector that observes an
+    /// early logical failure consumes it before dropping the handle.
+    #[doc(hidden)]
+    pub fn new_with_physical_drain(
+        id: ActionId,
+        engine: Weak<dyn LeaderEngine>,
+        status: Arc<Mutex<ActionStatus>>,
+        dest_block_ids: Vec<usize>,
+        physical_drain: FenceHandle,
+    ) -> Self {
+        Self {
+            id,
+            engine,
+            status,
+            dest_block_ids,
+            physical_drain: Some(physical_drain),
         }
     }
 
@@ -117,15 +143,29 @@ impl OnboardHandle {
                     block_ids: block_ids.clone(),
                 })
             }
+            ActionStatus::Failed(ActionFailure::Resource { block_ids, .. }) => {
+                Some(LoadOutcome::FailedPartial {
+                    block_ids: block_ids
+                        .clone()
+                        .unwrap_or_else(|| self.dest_block_ids.clone()),
+                })
+            }
         }
+    }
+
+    /// Consume the physical-drain fence, if this onboard can finish
+    /// logically before its launched transfer work drains.
+    #[doc(hidden)]
+    pub fn take_physical_drain_fence(&mut self) -> Option<FenceHandle> {
+        self.physical_drain.take()
     }
 }
 
 impl Drop for OnboardHandle {
     /// RAII prune of the engine's per-action tracking. Best-effort: if the
     /// engine is already gone, the `Weak` upgrade fails and the prune is
-    /// skipped. MUST NOT abort an in-flight transfer — the engine drives it to
-    /// completion regardless.
+    /// skipped. MUST NOT abort submitted transfer work; a bundle engine may
+    /// cancel only the logical wait while retaining its physical drain fence.
     fn drop(&mut self) {
         if let Some(engine) = self.engine.upgrade() {
             engine.release_action(&self.id);
@@ -310,6 +350,12 @@ impl OffloadHandle {
                     block_ids: block_ids.clone(),
                 })
             }
+            ActionStatus::Failed(ActionFailure::Resource { block_ids, .. }) => match block_ids {
+                Some(block_ids) => Some(SaveOutcome::FailedPartial {
+                    block_ids: block_ids.clone(),
+                }),
+                None => Some(SaveOutcome::FailedAllBlocks),
+            },
         }
     }
 }

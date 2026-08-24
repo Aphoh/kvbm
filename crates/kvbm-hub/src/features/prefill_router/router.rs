@@ -124,7 +124,12 @@ mod tests {
     use parking_lot::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+    use tokio::sync::Notify;
+    use velo::Handler;
+    use velo::transports::tcp::TcpTransportBuilder;
     use velo_ext::InstanceId;
+
+    use crate::{PREFILL_DISPATCH_HANDLER, PrefillDispatchRequest, PrefillDispatchResponse};
 
     /// Test backend: records hit counts per `InstanceId`, optional
     /// per-call latency.
@@ -165,6 +170,7 @@ mod tests {
             num_provided_tokens: n_hashes * 16,
             request: KvHashingRequestEnvelope::default(),
             expected_hash_digest: None,
+            bundle: None,
         }
     }
 
@@ -297,5 +303,89 @@ mod tests {
             .expect("dispatch should complete after worker added")
             .unwrap();
         assert!(poll_until(|| hits.load(Ordering::SeqCst) == 1, Duration::from_secs(1)).await);
+    }
+
+    #[tokio::test]
+    async fn capacity_stays_charged_past_legacy_velo_timeout_until_worker_terminal() {
+        let transport = |listener: std::net::TcpListener| {
+            Arc::new(
+                TcpTransportBuilder::new()
+                    .from_listener(listener)
+                    .unwrap()
+                    .build()
+                    .unwrap(),
+            )
+        };
+        let hub_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let worker_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let hub = velo::Velo::builder()
+            .add_transport(transport(hub_listener))
+            .build()
+            .await
+            .unwrap();
+        let worker = velo::Velo::builder()
+            .add_transport(transport(worker_listener))
+            .build()
+            .await
+            .unwrap();
+        hub.register_peer(worker.peer_info()).unwrap();
+        worker.register_peer(hub.peer_info()).unwrap();
+
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let started_for_handler = Arc::clone(&started);
+        let release_for_handler = Arc::clone(&release);
+        let handler =
+            Handler::typed_unary_async::<PrefillDispatchRequest, PrefillDispatchResponse, _, _>(
+                PREFILL_DISPATCH_HANDLER,
+                move |_ctx| {
+                    let started = Arc::clone(&started_for_handler);
+                    let release = Arc::clone(&release_for_handler);
+                    async move {
+                        started.notify_one();
+                        release.notified().await;
+                        Ok(PrefillDispatchResponse {
+                            ok: true,
+                            error: None,
+                        })
+                    }
+                },
+            )
+            .build();
+        worker.messenger().register_handler(handler).unwrap();
+
+        let selector = Selector::new(SelectorConfig {
+            per_worker_concurrency: 1,
+            block_size: 16,
+        });
+        selector.add_worker(
+            worker.instance_id(),
+            super::super::execution::VeloExecutionBackend::new(
+                worker.instance_id(),
+                hub.messenger().clone(),
+            ),
+        );
+        let router = PrefillRouter::new(Arc::clone(&selector));
+
+        router
+            .dispatch(make_request("long-running", 64, 0))
+            .await
+            .unwrap();
+        started.notified().await;
+        assert_eq!(selector.available_permits(), 0);
+        assert_eq!(selector.snapshot()[0].counters().inflight, 1);
+
+        // Freeze only after delivery, then cross the removed 30-second
+        // deadline without spending wall-clock time.
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(31)).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(selector.available_permits(), 0);
+        assert_eq!(selector.snapshot()[0].counters().inflight, 1);
+
+        release.notify_one();
+        assert!(poll_until(|| selector.available_permits() == 1, Duration::from_secs(1)).await);
+        assert_eq!(selector.snapshot()[0].counters().inflight, 0);
     }
 }

@@ -12,7 +12,7 @@ description = "gRPC service shell hosting kvbm-engine over a unix domain socket"
 
 [dependencies]
 # Internal
-dynamo-memory = { workspace = true }
+kvbm-memory = { workspace = true, features = ["host-pools"] }
 
 # gRPC
 tonic = { workspace = true }

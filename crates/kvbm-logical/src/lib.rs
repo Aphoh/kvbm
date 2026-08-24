@@ -11,6 +11,7 @@
 //! - Block manager orchestration
 
 pub mod blocks;
+pub mod branch_tracker;
 pub mod events;
 pub mod integrations;
 pub mod manager;
@@ -18,6 +19,7 @@ pub mod metrics;
 pub mod pools;
 pub mod pubsub;
 pub mod registry;
+pub mod resources;
 pub mod sequence;
 pub mod tinylfu;
 
@@ -34,12 +36,24 @@ pub use blocks::{
     BlockError, BlockMetadata, CompleteBlock, ImmutableBlock, LifecyclePin, LifecyclePinRef,
     MutableBlock, WeakBlock,
 };
+pub use branch_tracker::{BranchOracle, BranchPointRecord, BranchPointTracker, NoOpBranchOracle};
 pub use integrations::{
     ApplyError, DecodeOutcome, NoopDelegate, RequestSequence, SchedulableSequence,
     SchedulableSequenceBuilder, ScheduleError, SequenceDelegate, SequenceEvent, SequenceState,
 };
-pub use manager::BlockManager;
+pub use manager::{
+    BlockEvictionObserver, BlockManager, BlockRegistrationError, EvictionNotification,
+    InactiveLineageHold, InactiveLineagePreflight,
+};
+#[cfg(test)]
+pub(crate) use pools::ExactAllocationError;
+pub(crate) use pools::ExactInactiveVictim;
+pub use pools::{
+    ExactReclaimEntryPlan, ExactReclaimExecuteError, ExactReclaimNameError,
+    ExactReclaimRefreshError, FreshExactReclaimPlan, InactiveCandidate, InactiveFeatures,
+};
 pub use registry::BlockRegistry;
+pub use resources::{BlockManagerSet, DuplicateLogicalResource, LogicalResourceId};
 pub use sequence::{
     BlockSequence, BlockSequenceError, ExternalBlockAssignments, LogicalBlockAssignmentError,
     LogicalBlockAssignments, zip_assigned, zip_assigned_pending,

@@ -4,12 +4,14 @@
 //! Python bindings for the connector worker.
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
+use kvbm_common::LogicalResourceId;
 use kvbm_connector::TensorDescriptor;
+use kvbm_protocols::cache_manifest::CacheManifest;
 
 // The worker implementation behind the binding is the connector tree.
 use kvbm_connector::connector::{ConnectorWorkerInterface, Worker as ConnectorWorker};
@@ -26,6 +28,7 @@ use crate::torch::Tensor;
 #[pyclass(name = "ConnectorWorker")]
 pub struct PyConnectorWorker {
     inner: ConnectorWorker,
+    manifest: Mutex<Option<CacheManifest>>,
 }
 
 #[pymethods]
@@ -41,7 +44,24 @@ impl PyConnectorWorker {
     pub fn new(runtime: &crate::runtime::PyKvbmRuntime) -> PyResult<Self> {
         let runtime = runtime.inner();
         let inner = ConnectorWorker::new(runtime);
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            manifest: Mutex::new(None),
+        })
+    }
+
+    /// Validate and install the cache ABI for resource tensor registration.
+    pub fn register_manifest(&self, manifest_json: &str) -> PyResult<Vec<u8>> {
+        let manifest =
+            crate::vllm::config::parse_cache_manifest(manifest_json).map_err(|error| {
+                pyo3::exceptions::PyValueError::new_err(format!("invalid cache manifest: {error}"))
+            })?;
+        let digest = manifest.id().as_bytes().to_vec();
+        self.inner
+            .register_manifest(manifest.id())
+            .map_err(to_pyerr)?;
+        *self.manifest.lock().expect("manifest lock poisoned") = Some(manifest);
+        Ok(digest)
     }
 
     /// Register KV cache tensors with NIXL for RDMA transfers.
@@ -92,6 +112,66 @@ impl PyConnectorWorker {
 
         self.inner
             .register_kv_caches(
+                rust_tensors,
+                num_device_blocks,
+                dtype_width_bytes,
+                dim_layout,
+                block_layout,
+            )
+            .map_err(to_pyerr)
+    }
+
+    /// Register one manifest resource's layer tensors and ragged layout.
+    #[pyo3(signature = (resource, primary, tensors, num_device_blocks, dtype_width_bytes, dim_labels, dim_sizes, block_layout))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_resource_tensors(
+        &self,
+        resource: u16,
+        primary: bool,
+        tensors: Vec<Py<PyAny>>,
+        num_device_blocks: usize,
+        dtype_width_bytes: usize,
+        dim_labels: Vec<String>,
+        dim_sizes: Vec<usize>,
+        block_layout: String,
+    ) -> PyResult<()> {
+        let resource = LogicalResourceId(resource);
+        let known_resource = {
+            let manifest = self.manifest.lock().expect("manifest lock poisoned");
+            manifest
+                .as_ref()
+                .ok_or_else(|| {
+                    pyo3::exceptions::PyValueError::new_err(
+                        "register_manifest must be called before register_resource_tensors",
+                    )
+                })?
+                .resources()
+                .iter()
+                .any(|requirement| requirement.resource() == resource)
+        };
+        if !known_resource {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "logical resource {resource:?} is absent from the registered manifest"
+            )));
+        }
+
+        let rust_tensors = tensors
+            .into_iter()
+            .map(|py_tensor| {
+                let tensor = Tensor::new(py_tensor).map_err(to_pyerr)?;
+                Ok(Arc::new(tensor) as Arc<dyn TensorDescriptor>)
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        let dims = dim_labels
+            .iter()
+            .map(|label| parse_kv_dim(label))
+            .collect::<PyResult<Vec<_>>>()?;
+        let dim_layout = kvbm_common::KvDimLayout::new(dims, dim_sizes).map_err(to_pyerr)?;
+        let block_layout = parse_kv_block_layout(&block_layout)?;
+        self.inner
+            .register_resource_tensors(
+                resource,
+                primary,
                 rust_tensors,
                 num_device_blocks,
                 dtype_width_bytes,

@@ -16,6 +16,11 @@
 
 use std::sync::{Arc, Mutex};
 
+use kvbm_common::LogicalResourceId;
+
+use crate::cache_manifest::{
+    BundleKey, CacheManifest, CacheScope, ModelIdentity, ResourceRequirement, ResourceRole,
+};
 use crate::disagg::RemotePrefillParams;
 
 use super::actions::{EngineWorkerSink, WorkerEngineDriver};
@@ -26,8 +31,9 @@ use super::noop::NoopBlockEngine;
 use super::noop::NoopWorkerSink;
 use super::protocol::RequestId;
 use super::protocol::{
-    AcceptId, ActionFailure, ActionId, ActionStatus, EvictionFence, EvictionOutcome, FenceToken,
-    FindBlocksOutcome, FindBlocksRequest, LeaderEngineError, SearchId,
+    AcceptId, ActionFailure, ActionId, ActionStatus, BundleOffloadPlan, BundleOnboardPlan,
+    EvictionFence, EvictionOutcome, FenceToken, FindBlocksOutcome, FindBlocksRequest,
+    LeaderEngineError, OffloadMode, ResourceOffload, ResourceOnboard, SearchId,
 };
 
 fn engine() -> Arc<dyn LeaderEngine> {
@@ -64,6 +70,24 @@ fn noop_offload_handle_is_immediately_terminal() {
         .unwrap();
     assert!(offload.is_complete());
     assert_eq!(offload.outcome(), Some(SaveOutcome::Done));
+}
+
+#[test]
+fn legacy_engine_accepts_default_resource_and_rejects_other_resources() {
+    let engine = engine();
+    let offload = Arc::clone(&engine)
+        .offload_for_resource(LogicalResourceId::default(), &"r1".to_string(), vec![])
+        .unwrap();
+    assert!(offload.is_complete());
+
+    assert_eq!(
+        Arc::clone(&engine)
+            .offload_for_resource(LogicalResourceId(7), &"r1".to_string(), vec![])
+            .unwrap_err(),
+        LeaderEngineError::ResourceOffloadNotConfigured {
+            resource: LogicalResourceId(7)
+        }
+    );
 }
 
 #[test]
@@ -166,11 +190,23 @@ fn worker_delegates_are_object_safe() {
 fn find_blocks_req(id: &str) -> FindBlocksRequest {
     FindBlocksRequest {
         request_id: id.to_string(),
+        cache: CacheScope::LegacyPrimary,
         sequence_hashes: Arc::from([]),
         num_computed_tokens: 0,
         total_tokens: 0,
         transfer_params: None,
+        local_prefill_estimate: None,
     }
+}
+
+#[test]
+fn local_prefill_estimate_combines_queue_and_suffix_rate() {
+    let estimate = super::LocalPrefillEstimate::from_rate(std::time::Duration::from_millis(2), 5);
+    assert_eq!(
+        estimate.estimate(10),
+        std::time::Duration::from_millis(2_002)
+    );
+    assert_eq!(estimate.queue(), std::time::Duration::from_millis(2));
 }
 
 #[test]
@@ -207,6 +243,39 @@ fn noop_onboard_blocks_is_immediately_terminal() {
     assert_eq!(onboard.outcome(), Some(LoadOutcome::Done));
 }
 
+#[test]
+fn legacy_engine_rejects_resource_batched_onboard() {
+    let engine = engine();
+    let resource = LogicalResourceId(7);
+    let manifest = CacheManifest::new(
+        ModelIdentity::new("hybrid-cache", "revision-a", [8; 32]).unwrap(),
+        "hybrid-cache-v1",
+        vec![ResourceRequirement::new(resource, ResourceRole::PrefixHistory, 16).unwrap()],
+        Default::default(),
+    )
+    .unwrap();
+    let identity = manifest.identity();
+
+    assert_eq!(
+        engine
+            .onboard_resources(
+                &"r1".to_string(),
+                BundleOnboardPlan {
+                    key: BundleKey::new(&identity, super::protocol::SequenceHash::default(), 16,)
+                        .unwrap(),
+                    identity,
+                    resources: vec![ResourceOnboard {
+                        resource,
+                        source_block_ids: vec![2],
+                        destination_block_ids: vec![5],
+                    }],
+                },
+            )
+            .unwrap_err(),
+        LeaderEngineError::ResourceOnboardNotConfigured { resource }
+    );
+}
+
 /// `find_blocks` carries the shared hash chain + counts + the WHOLE parsed
 /// transfer params (the engine extracts `remote_prefill` internally) — and
 /// never tokens. The chain is an `Arc`: a request clone bumps a refcount, it
@@ -214,6 +283,17 @@ fn noop_onboard_blocks_is_immediately_terminal() {
 #[test]
 fn find_blocks_request_carries_chain_counts_and_transfer_params() {
     let params = RemotePrefillParams::new(uuid::Uuid::new_v4(), uuid::Uuid::new_v4().into());
+    let manifest = CacheManifest::new(
+        ModelIdentity::new("test-model", "revision-a", [3; 32]).unwrap(),
+        "test-cache-v1",
+        vec![
+            ResourceRequirement::new(LogicalResourceId(4), ResourceRole::PrefixHistory, 16)
+                .unwrap(),
+        ],
+        Default::default(),
+    )
+    .unwrap();
+    let cache_identity = manifest.identity();
     let chain: Arc<[super::protocol::SequenceHash]> = Arc::from([
         super::protocol::SequenceHash::default(),
         super::protocol::SequenceHash::default(),
@@ -221,14 +301,17 @@ fn find_blocks_request_carries_chain_counts_and_transfer_params() {
     ]);
     let req = FindBlocksRequest {
         request_id: "r1".to_string(),
+        cache: CacheScope::Manifest(cache_identity.clone()),
         sequence_hashes: Arc::clone(&chain),
         num_computed_tokens: 16,
         total_tokens: 48,
         transfer_params: Some(crate::disagg::TransferParams::remote_prefill(params)),
+        local_prefill_estimate: None,
     };
     assert_eq!(req.sequence_hashes.len(), 3);
     assert_eq!(req.num_computed_tokens, 16);
     assert_eq!(req.total_tokens, 48);
+    assert_eq!(req.cache.identity(), Some(&cache_identity));
     assert!(
         req.transfer_params
             .as_ref()
@@ -241,6 +324,79 @@ fn find_blocks_request_carries_chain_counts_and_transfer_params() {
     );
     // Plain-local construction carries no params.
     assert!(find_blocks_req("r2").transfer_params.is_none());
+    assert!(find_blocks_req("r2").cache.identity().is_none());
+}
+
+#[test]
+fn bundle_transfer_plans_carry_one_identity_key_and_exact_resource_children() {
+    let manifest = CacheManifest::new(
+        ModelIdentity::new("hybrid-cache", "revision-a", [7; 32]).unwrap(),
+        "hybrid-cache-v1",
+        vec![
+            ResourceRequirement::new(LogicalResourceId(4), ResourceRole::PrefixHistory, 16)
+                .unwrap(),
+            ResourceRequirement::new(LogicalResourceId(5), ResourceRole::BoundaryCapsule, 16)
+                .unwrap(),
+        ],
+        Default::default(),
+    )
+    .unwrap();
+    let identity = manifest.identity();
+    let key = BundleKey::new(&identity, super::protocol::SequenceHash::default(), 32).unwrap();
+    let onboard = BundleOnboardPlan {
+        identity: identity.clone(),
+        key,
+        resources: vec![
+            ResourceOnboard {
+                resource: LogicalResourceId(4),
+                source_block_ids: vec![1, 2],
+                destination_block_ids: vec![11, 12],
+            },
+            ResourceOnboard {
+                resource: LogicalResourceId(5),
+                source_block_ids: vec![3],
+                destination_block_ids: vec![13],
+            },
+        ],
+    };
+    let offload = BundleOffloadPlan {
+        identity,
+        key,
+        mode: OffloadMode::Move,
+        resources: vec![
+            ResourceOffload {
+                resource: LogicalResourceId(4),
+                blocks: vec![(super::protocol::SequenceHash::default(), 2)],
+            },
+            ResourceOffload {
+                resource: LogicalResourceId(5),
+                blocks: vec![(super::protocol::SequenceHash::default(), 3)],
+            },
+        ],
+    };
+
+    assert_eq!(onboard.key, offload.key);
+    assert_eq!(offload.mode, OffloadMode::Move);
+    assert_eq!(onboard.resources[0].resource, LogicalResourceId(4));
+    assert_eq!(offload.resources[0].resource, LogicalResourceId(4));
+    assert_eq!(onboard.resources.len(), 2);
+    assert_eq!(offload.resources.len(), 2);
+}
+
+#[test]
+fn action_failure_can_name_a_resource_without_breaking_all_blocks() {
+    let resource = LogicalResourceId(7);
+    assert_eq!(
+        ActionFailure::Resource {
+            resource,
+            block_ids: Some(vec![3, 5]),
+        },
+        ActionFailure::Resource {
+            resource,
+            block_ids: Some(vec![3, 5]),
+        }
+    );
+    assert_eq!(ActionFailure::AllBlocks, ActionFailure::AllBlocks);
 }
 
 /// The three outcome variants construct and pattern-match with the fields the

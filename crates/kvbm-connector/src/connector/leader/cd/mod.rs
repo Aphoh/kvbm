@@ -149,7 +149,21 @@ pub(super) async fn wire_disagg(
     let _ = leader.cd_hub_client.set(Arc::clone(&foundation.hub));
 
     let engine_cfg = kvbm_engine::cd::DisaggConfig::from_connector_config(disagg_cfg);
-    Ok(kvbm_engine::RemoteOps::default().with_disagg_transports(
+    let mut remote = kvbm_engine::RemoteOps::default();
+    if runtime.config().remote_search.is_some() {
+        let index = foundation
+            .hub
+            .indexer_lookup_client(velo.messenger().clone())
+            .await?
+            .ok_or_else(|| anyhow!("remote search requires the hub bundle index"))?;
+        let discovery = super::remote_discovery::HubRemoteDiscovery::new(
+            index,
+            Arc::clone(&foundation.peer_resolver)
+                as Arc<dyn kvbm_engine::p2p::session::PeerResolver>,
+        );
+        remote = kvbm_engine::RemoteOps::with_search(discovery);
+    }
+    Ok(remote.with_disagg_transports(
         foundation.session_factory,
         plane,
         tier,

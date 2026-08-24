@@ -4,6 +4,7 @@
 use anyhow::Result;
 use futures::future::{Either, Ready, ready};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::{
     pin::Pin,
     task::{Context, Poll},
@@ -11,7 +12,8 @@ use std::{
 
 pub use crate::worker::{ImportMetadataResponseAwaiter, SerializedResponseAwaiter};
 pub use crate::{BlockId, SequenceHash};
-pub use kvbm_common::LogicalLayoutHandle;
+pub use kvbm_common::{LogicalLayoutHandle, LogicalResourceId};
+use kvbm_physical::layout::LayoutConfig;
 pub use kvbm_physical::manager::{LayoutHandle, SerializedLayout};
 
 pub struct SerializedLayoutResponse {
@@ -155,6 +157,48 @@ pub enum RemoteDescriptor {
 ///
 /// This message is sent via Velo RPC during Phase 3 coordination.
 /// Workers use this to create additional cache tiers beyond G1 (GPU KV).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CollectiveBootstrap {
+    /// KVBM-owned NCCL communicator bootstrap serialized by `NcclBootstrap`.
+    Nccl { serialized: Vec<u8> },
+}
+
+/// Registration-time layout descriptions for every logical cache resource.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerCacheConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<kvbm_protocols::cache_manifest::CacheManifestId>,
+    pub primary: LogicalResourceId,
+    pub resources: BTreeMap<LogicalResourceId, LayoutConfig>,
+}
+
+impl WorkerCacheConfig {
+    pub fn legacy(layout: LayoutConfig) -> Self {
+        Self {
+            manifest: None,
+            primary: LogicalResourceId::default(),
+            resources: BTreeMap::from([(LogicalResourceId::default(), layout)]),
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(!self.resources.is_empty(), "worker cache has no resources");
+        anyhow::ensure!(
+            self.resources.contains_key(&self.primary),
+            "primary resource {:?} is not registered",
+            self.primary
+        );
+        Ok(())
+    }
+}
+
+/// Per-resource lower-tier physical capacity sent from leader to worker.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResourceTierConfig {
+    pub host_block_count: usize,
+    pub disk_block_count: Option<usize>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LeaderLayoutConfig {
     /// Leader provided rank of this worker
@@ -164,11 +208,23 @@ pub struct LeaderLayoutConfig {
     /// each worker the rank provided by the Connector framework.
     pub rank: usize,
 
-    /// Number of host/pinned blocks for G2 tier.
+    /// Number of workers participating in this cache-parallel group.
+    #[serde(default = "default_worker_count")]
+    pub worker_count: usize,
+
+    /// Number of physical host/pinned blocks contributed by this worker.
     pub host_block_count: usize,
 
     /// Number of disk blocks for G3 tier (None = no disk tier).
     pub disk_block_count: Option<usize>,
+
+    /// Resource-specific capacities. Empty preserves the legacy scalar fields.
+    #[serde(default)]
+    pub resource_tiers: BTreeMap<LogicalResourceId, ResourceTierConfig>,
+
+    /// Per-resource cache-data placement on the shared worker grid.
+    #[serde(default)]
+    pub resource_parallelism: BTreeMap<LogicalResourceId, kvbm_config::ParallelismMode>,
 
     /// Object storage configuration for G4 tier (None = no object tier).
     ///
@@ -179,10 +235,18 @@ pub struct LeaderLayoutConfig {
 
     /// Parallelism mode for this worker.
     ///
-    /// When `ReplicatedData` and rank > 0, the worker skips G2/G3 creation
-    /// since only rank 0 has host/disk storage in replicated mode.
+    /// In `ReplicatedData`, every worker contributes a disjoint stripe of
+    /// canonical lower-tier blocks while G1 remains replicated.
     #[serde(default)]
     pub parallelism: kvbm_config::ParallelismMode,
+
+    /// Optional KVBM-owned collective bootstrap for replicated cache data.
+    #[serde(default)]
+    pub collective: Option<CollectiveBootstrap>,
+}
+
+fn default_worker_count() -> usize {
+    1
 }
 
 /// Worker's response after configuring additional layouts (G2, G3).
@@ -195,4 +259,69 @@ pub struct WorkerLayoutResponse {
 
     /// Which logical layouts were successfully created in this operation.
     pub created_layouts: Vec<LogicalLayoutHandle>,
+}
+
+#[cfg(test)]
+mod leader_layout_config_tests {
+    use super::{CollectiveBootstrap, LeaderLayoutConfig, WorkerCacheConfig};
+    use kvbm_common::LogicalResourceId;
+    use kvbm_physical::layout::LayoutConfig;
+    use std::collections::BTreeMap;
+
+    fn layout(page_size: usize, inner_dim: usize) -> LayoutConfig {
+        LayoutConfig::builder()
+            .num_blocks(64)
+            .num_layers(2)
+            .outer_dim(1)
+            .page_size(page_size)
+            .inner_dim(inner_dim)
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn collective_bootstrap_round_trips_with_worker_layout_config() {
+        let config = LeaderLayoutConfig {
+            rank: 1,
+            worker_count: 2,
+            host_block_count: 128,
+            disk_block_count: None,
+            resource_tiers: BTreeMap::new(),
+            resource_parallelism: BTreeMap::new(),
+            object: None,
+            parallelism: kvbm_config::ParallelismMode::ReplicatedData,
+            collective: Some(CollectiveBootstrap::Nccl {
+                serialized: vec![1, 2, 3, 4],
+            }),
+        };
+
+        let wire = serde_json::to_vec(&config).unwrap();
+        let decoded: LeaderLayoutConfig = serde_json::from_slice(&wire).unwrap();
+        assert_eq!(decoded.worker_count, 2);
+        assert_eq!(decoded.collective, config.collective);
+    }
+
+    #[test]
+    fn resource_worker_config_round_trips_ragged_layouts() {
+        let config = WorkerCacheConfig {
+            manifest: Some(kvbm_protocols::cache_manifest::CacheManifestId::from_bytes(
+                [7; 32],
+            )),
+            primary: LogicalResourceId(10),
+            resources: BTreeMap::from([
+                (LogicalResourceId(10), layout(4, 512)),
+                (LogicalResourceId(11), layout(128, 192)),
+            ]),
+        };
+        config.validate().unwrap();
+
+        let wire = serde_json::to_vec(&config).unwrap();
+        let decoded: WorkerCacheConfig = serde_json::from_slice(&wire).unwrap();
+        assert_eq!(decoded, config);
+        assert_eq!(decoded.manifest, config.manifest);
+        assert_ne!(
+            decoded.resources[&LogicalResourceId(10)].page_size,
+            decoded.resources[&LogicalResourceId(11)].page_size
+        );
+    }
 }

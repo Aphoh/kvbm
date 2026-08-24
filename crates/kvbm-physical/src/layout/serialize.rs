@@ -9,7 +9,7 @@
 use super::physical::NixlMetadata;
 use super::{BlockDimension, KvBlockLayout, LayoutConfig};
 use anyhow::Result;
-use dynamo_memory::{MemoryRegion, StorageKind};
+use kvbm_memory::{MemoryRegion, StorageKind};
 use serde::{Deserialize, Serialize};
 
 /// Format of blocks in a fully contiguous layout.
@@ -174,7 +174,7 @@ impl LayoutDescriptor {
 
 #[cfg(all(test, feature = "testing-kvbm"))]
 mod tests {
-    use dynamo_memory::nixl::MemType;
+    use kvbm_memory::nixl::MemType;
 
     use super::*;
 

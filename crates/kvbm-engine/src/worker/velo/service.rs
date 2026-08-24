@@ -4,11 +4,12 @@
 use kvbm_physical::manager::SerializedLayout;
 
 use super::{
-    Arc, ConnectRemoteMessage, DirectWorker, ExecuteRemoteOnboardForInstanceMessage,
-    ExecuteRemoteOnboardForInstanceRankMessage, LocalTransferMessage, ObjectGetBlocksMessage,
+    AbortLocalCollectivesMessage, Arc, ConnectRemoteMessage, DirectWorker,
+    ExecuteRemoteOnboardForInstanceMessage, ExecuteRemoteOnboardForInstanceRankMessage,
+    HostPayloadDigestsMessage, LocalTransferMessage, ObjectGetBlocksMessage,
     ObjectHasBlocksMessage, ObjectHasBlocksResponse, ObjectPutBlocksMessage,
     ObjectPutGetBlocksResponse, RemoteOffloadMessage, RemoteOnboardMessage, RemotePullPlanMessage,
-    Result, TransferOptions, WorkerTransfers, handler_names,
+    Result, TransferOptions, Worker, WorkerTransfers, handler_names,
 };
 use crate::object::ObjectBlockOps;
 
@@ -28,11 +29,35 @@ use ::velo::{Handler, Messenger};
 pub struct VeloWorkerService {
     messenger: Arc<Messenger>,
     worker: Arc<DirectWorker>,
+    /// Optional transfer policy layered over the physical worker. Metadata,
+    /// bounce buffers, and object operations remain owned by `worker`.
+    #[builder(default)]
+    transfers: Option<Arc<dyn WorkerTransfers>>,
 }
 
 impl VeloWorkerService {
     pub fn new(messenger: Arc<Messenger>, worker: Arc<DirectWorker>) -> Result<Self> {
-        let service = Self { messenger, worker };
+        let service = Self {
+            messenger,
+            worker,
+            transfers: None,
+        };
+        service.register_handlers()?;
+        Ok(service)
+    }
+
+    /// Construct a service with a transfer policy layered over the physical
+    /// worker, for example replicated-G1/striped-G2 MLA routing.
+    pub fn new_with_transfers(
+        messenger: Arc<Messenger>,
+        worker: Arc<DirectWorker>,
+        transfers: Arc<dyn WorkerTransfers>,
+    ) -> Result<Self> {
+        let service = Self {
+            messenger,
+            worker,
+            transfers: Some(transfers),
+        };
         service.register_handlers()?;
         Ok(service)
     }
@@ -47,9 +72,16 @@ impl VeloWorkerService {
         &self.worker
     }
 
+    fn transfers(&self) -> Arc<dyn WorkerTransfers> {
+        self.transfers
+            .clone()
+            .unwrap_or_else(|| self.worker.clone())
+    }
+
     /// Register all worker handlers with Velo
     fn register_handlers(&self) -> Result<()> {
         self.register_local_transfer_handler()?;
+        self.register_abort_local_collectives_handler()?;
         self.register_remote_onboard_handler()?;
         self.register_remote_offload_handler()?;
         self.register_import_metadata_handler()?;
@@ -58,6 +90,7 @@ impl VeloWorkerService {
         self.register_execute_remote_onboard_for_instance_handler()?;
         self.register_execute_remote_onboard_for_instance_rank_handler()?;
         self.register_execute_remote_pull_plan_handler()?;
+        self.register_host_payload_digests_handler()?;
         // Object storage handlers
         self.register_object_has_blocks_handler()?;
         self.register_object_put_blocks_handler()?;
@@ -65,12 +98,49 @@ impl VeloWorkerService {
         Ok(())
     }
 
+    fn register_abort_local_collectives_handler(&self) -> Result<()> {
+        let transfers = self.transfers();
+        let handler =
+            Handler::unary_handler_async(handler_names::ABORT_LOCAL_COLLECTIVES, move |ctx| {
+                let transfers = Arc::clone(&transfers);
+                async move {
+                    let message: AbortLocalCollectivesMessage =
+                        serde_json::from_slice(&ctx.payload)?;
+                    transfers.abort_local_collectives(message.reason)?.await?;
+                    Ok(Some(Bytes::new()))
+                }
+            })
+            .build();
+        self.messenger.register_handler(handler)?;
+        Ok(())
+    }
+
+    fn register_host_payload_digests_handler(&self) -> Result<()> {
+        let worker = Arc::clone(&self.worker);
+        let handler =
+            Handler::unary_handler_async(handler_names::HOST_PAYLOAD_DIGESTS, move |ctx| {
+                let worker = Arc::clone(&worker);
+                async move {
+                    let message: HostPayloadDigestsMessage = serde_json::from_slice(&ctx.payload)?;
+                    let digests = worker
+                        .compute_host_payload_digests(message.resource, message.block_ids)
+                        .await?;
+                    Ok(Some(Bytes::from(serde_json::to_vec(&digests)?)))
+                }
+            })
+            .build();
+        self.messenger.register_handler(handler)?;
+        Ok(())
+    }
+
     fn register_local_transfer_handler(&self) -> Result<()> {
-        let worker = self.worker.clone();
+        let transfers = self.transfers();
+        let physical_worker = self.worker.clone();
 
         // Use unary_handler_async for explicit response (client waits for transfer completion)
         let handler = Handler::unary_handler_async(handler_names::LOCAL_TRANSFER, move |ctx| {
-            let worker = worker.clone();
+            let transfers = transfers.clone();
+            let physical_worker = physical_worker.clone();
 
             async move {
                 // Deserialize the message
@@ -80,16 +150,27 @@ impl VeloWorkerService {
                 let bounce_buffer_parts = message.options.bounce_buffer_parts();
                 let mut options: TransferOptions = message.options.into();
                 if let Some((handle, block_ids)) = bounce_buffer_parts {
-                    options.bounce_buffer = Some(worker.create_bounce_buffer(handle, block_ids)?);
+                    options.bounce_buffer =
+                        Some(physical_worker.create_bounce_buffer(handle, block_ids)?);
                 }
 
-                let notification = worker.execute_local_transfer(
-                    message.src,
-                    message.dst,
-                    Arc::from(message.src_block_ids),
-                    Arc::from(message.dst_block_ids),
-                    options,
-                )?;
+                let notification = match message.resource {
+                    Some(resource) => transfers.execute_local_transfer_for_resource(
+                        resource,
+                        message.src,
+                        message.dst,
+                        Arc::from(message.src_block_ids),
+                        Arc::from(message.dst_block_ids),
+                        options,
+                    )?,
+                    None => transfers.execute_local_transfer(
+                        message.src,
+                        message.dst,
+                        Arc::from(message.src_block_ids),
+                        Arc::from(message.dst_block_ids),
+                        options,
+                    )?,
+                };
 
                 // Await the transfer completion
                 notification.await?;
@@ -105,11 +186,13 @@ impl VeloWorkerService {
     }
 
     fn register_remote_onboard_handler(&self) -> Result<()> {
-        let worker = self.worker.clone();
+        let transfers = self.transfers();
+        let physical_worker = self.worker.clone();
 
         // Use unary_handler_async for explicit response (works with unary client)
         let handler = Handler::unary_handler_async(handler_names::REMOTE_ONBOARD, move |ctx| {
-            let worker = worker.clone();
+            let transfers = transfers.clone();
+            let physical_worker = physical_worker.clone();
 
             async move {
                 let message: RemoteOnboardMessage = serde_json::from_slice(&ctx.payload)?;
@@ -118,10 +201,11 @@ impl VeloWorkerService {
                 let bounce_buffer_parts = message.options.bounce_buffer_parts();
                 let mut options: TransferOptions = message.options.into();
                 if let Some((handle, block_ids)) = bounce_buffer_parts {
-                    options.bounce_buffer = Some(worker.create_bounce_buffer(handle, block_ids)?);
+                    options.bounce_buffer =
+                        Some(physical_worker.create_bounce_buffer(handle, block_ids)?);
                 }
 
-                let notification = worker.execute_remote_onboard(
+                let notification = transfers.execute_remote_onboard(
                     message.src,
                     message.dst,
                     Arc::from(message.dst_block_ids),
@@ -140,11 +224,13 @@ impl VeloWorkerService {
     }
 
     fn register_remote_offload_handler(&self) -> Result<()> {
-        let worker = self.worker.clone();
+        let transfers = self.transfers();
+        let physical_worker = self.worker.clone();
 
         // Use unary_handler_async for explicit response (works with unary client)
         let handler = Handler::unary_handler_async(handler_names::REMOTE_OFFLOAD, move |ctx| {
-            let worker = worker.clone();
+            let transfers = transfers.clone();
+            let physical_worker = physical_worker.clone();
 
             async move {
                 let message: RemoteOffloadMessage = serde_json::from_slice(&ctx.payload)?;
@@ -153,10 +239,11 @@ impl VeloWorkerService {
                 let bounce_buffer_parts = message.options.bounce_buffer_parts();
                 let mut options: TransferOptions = message.options.into();
                 if let Some((handle, block_ids)) = bounce_buffer_parts {
-                    options.bounce_buffer = Some(worker.create_bounce_buffer(handle, block_ids)?);
+                    options.bounce_buffer =
+                        Some(physical_worker.create_bounce_buffer(handle, block_ids)?);
                 }
 
-                let notification = worker.execute_remote_offload(
+                let notification = transfers.execute_remote_offload(
                     message.src,
                     Arc::from(message.src_block_ids),
                     message.dst,
@@ -229,11 +316,13 @@ impl VeloWorkerService {
 
     /// Register handler for execute_remote_onboard_for_instance - pulls from remote using instance ID
     fn register_execute_remote_onboard_for_instance_handler(&self) -> Result<()> {
-        let worker = self.worker.clone();
+        let transfers = self.transfers();
+        let physical_worker = self.worker.clone();
 
         let handler =
             Handler::unary_handler_async(handler_names::REMOTE_ONBOARD_FOR_INSTANCE, move |ctx| {
-                let worker = worker.clone();
+                let transfers = transfers.clone();
+                let physical_worker = physical_worker.clone();
                 async move {
                     let message: ExecuteRemoteOnboardForInstanceMessage =
                         serde_json::from_slice(&ctx.payload)?;
@@ -243,10 +332,10 @@ impl VeloWorkerService {
                     let mut options: TransferOptions = message.options.into();
                     if let Some((handle, block_ids)) = bounce_buffer_parts {
                         options.bounce_buffer =
-                            Some(worker.create_bounce_buffer(handle, block_ids)?);
+                            Some(physical_worker.create_bounce_buffer(handle, block_ids)?);
                     }
 
-                    let notification = worker.execute_remote_onboard_for_instance(
+                    let notification = transfers.execute_remote_onboard_for_instance(
                         message.instance_id,
                         message.remote_logical_type,
                         message.src_block_ids,
@@ -268,12 +357,14 @@ impl VeloWorkerService {
     /// Register handler for execute_remote_onboard_for_instance_rank — the
     /// rank-aware variant introduced by AB-1c.
     fn register_execute_remote_onboard_for_instance_rank_handler(&self) -> Result<()> {
-        let worker = self.worker.clone();
+        let transfers = self.transfers();
+        let physical_worker = self.worker.clone();
 
         let handler = Handler::unary_handler_async(
             handler_names::REMOTE_ONBOARD_FOR_INSTANCE_RANK,
             move |ctx| {
-                let worker = worker.clone();
+                let transfers = transfers.clone();
+                let physical_worker = physical_worker.clone();
                 async move {
                     let message: ExecuteRemoteOnboardForInstanceRankMessage =
                         serde_json::from_slice(&ctx.payload)?;
@@ -282,10 +373,10 @@ impl VeloWorkerService {
                     let mut options: TransferOptions = message.options.into();
                     if let Some((handle, block_ids)) = bounce_buffer_parts {
                         options.bounce_buffer =
-                            Some(worker.create_bounce_buffer(handle, block_ids)?);
+                            Some(physical_worker.create_bounce_buffer(handle, block_ids)?);
                     }
 
-                    let notification = worker.execute_remote_onboard_for_instance_rank(
+                    let notification = transfers.execute_remote_onboard_for_instance_rank(
                         message.instance_id,
                         message.remote_rank,
                         message.remote_logical_type,
@@ -309,13 +400,13 @@ impl VeloWorkerService {
     /// Register handler for execute_remote_pull_plan — the AB-3
     /// multi-shard cross-parallelism pull entrypoint.
     fn register_execute_remote_pull_plan_handler(&self) -> Result<()> {
-        let worker = self.worker.clone();
+        let transfers = self.transfers();
 
         let handler = Handler::unary_handler_async(handler_names::REMOTE_PULL_PLAN, move |ctx| {
-            let worker = worker.clone();
+            let transfers = transfers.clone();
             async move {
                 let message: RemotePullPlanMessage = serde_json::from_slice(&ctx.payload)?;
-                let notification = worker.execute_remote_pull_plan(message.plan)?;
+                let notification = transfers.execute_remote_pull_plan(message.plan)?;
                 notification.await?;
                 Ok(Some(Bytes::new()))
             }

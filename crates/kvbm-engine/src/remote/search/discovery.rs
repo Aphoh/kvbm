@@ -15,6 +15,10 @@ use std::sync::Arc;
 use anyhow::Result;
 use futures::future::BoxFuture;
 
+use super::bundle::{
+    BundleAdvertisement, BundleDiscoveryOutcome, BundleDiscoveryQuery, BundleInvalidation,
+    BundleMissReason,
+};
 use crate::{InstanceId, SequenceHash};
 
 /// Outcome of a successful remote-block discovery.
@@ -47,6 +51,31 @@ pub trait RemoteBlockDiscovery: Send + Sync {
         &self,
         hashes: Vec<SequenceHash>,
     ) -> BoxFuture<'static, Result<Option<RemoteCandidates>>>;
+
+    /// Resolve one complete manifest-scoped bundle. Legacy discovery
+    /// implementations safely report no bundle support.
+    fn discover_bundle(
+        &self,
+        _query: BundleDiscoveryQuery,
+    ) -> BoxFuture<'static, Result<BundleDiscoveryOutcome>> {
+        Box::pin(async { Ok(BundleDiscoveryOutcome::Miss(BundleMissReason::NotFound)) })
+    }
+
+    /// Publish a locally committed complete bundle. Legacy directories no-op.
+    fn advertise_bundle(
+        &self,
+        _advertisement: BundleAdvertisement,
+    ) -> BoxFuture<'static, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Remove one exact owner generation after local invalidation.
+    fn invalidate_bundle(
+        &self,
+        _invalidation: BundleInvalidation,
+    ) -> BoxFuture<'static, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 /// Convenience alias for the injected, optional discovery handle.

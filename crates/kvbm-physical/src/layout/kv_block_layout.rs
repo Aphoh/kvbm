@@ -9,7 +9,7 @@
 //! existing `crate::layout::KvBlockLayout` references.
 //!
 //! `KvBlocks` stays in this crate because it holds an `Arc<PhysicalLayout>`
-//! and depends on `dynamo-memory`, which `kvbm-common` does not.
+//! and depends on `kvbm-memory`, which `kvbm-common` does not.
 
 pub use kvbm_common::{BlockDim, InnerShape, KvBlockLayout};
 

@@ -7,10 +7,15 @@
 //!   pool state.
 //! - [`InactiveIndex`]: pluggable T-free eviction-order trait for the
 //!   inactive pool (crate-private).
+//! - [`advice`]: read-only advisory snapshot types ([`InactiveCandidate`],
+//!   [`InactiveFeatures`]) for out-of-band residency consumers.
 //! - Type-safe RAII guards (`MutableBlock`, `CompleteBlock`,
 //!   `ImmutableBlock`, `WeakBlock`) live in `crate::blocks` and return to
 //!   the store on drop.
 
+pub mod advice;
+mod exact;
+mod exact_reclaim;
 mod inactive;
 pub(crate) mod store;
 
@@ -20,8 +25,14 @@ pub mod tests;
 #[cfg(test)]
 mod block_proptest;
 
+pub use advice::{InactiveCandidate, InactiveFeatures};
+pub(crate) use exact::{ExactAllocationError, ExactInactiveVictim};
+pub use exact_reclaim::{
+    ExactReclaimEntryPlan, ExactReclaimExecuteError, ExactReclaimNameError,
+    ExactReclaimRefreshError, FreshExactReclaimPlan,
+};
 pub(crate) use inactive::backends;
-pub(crate) use store::{BlockStore, InactiveIndex};
+pub(crate) use store::{BlockStore, InactiveIndex, ReleaseOpts};
 
 pub(crate) use crate::SequenceHash;
 use crate::blocks::BlockId;

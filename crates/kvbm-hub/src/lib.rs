@@ -52,6 +52,7 @@ pub mod config;
 pub mod features;
 pub mod handlers;
 pub mod protocol;
+mod registration;
 pub mod registry;
 /// `kvbmctl` config rendering. Gated behind the `kvbmctl` feature because it
 /// depends on `kvbm-config`, which transitively pulls CUDA (cudarc) — kept out
@@ -70,8 +71,10 @@ pub use features::disagg::{
     ConditionalDisaggClient, ConditionalDisaggInstancesResponse, ConditionalDisaggManager,
 };
 pub use features::indexer::{
-    FindBlocksHit, IndexerConfigResponse, IndexerLookupClient, IndexerManager, InstancesResponse,
-    PositionalIndex, QueryRequest, QueryResponse,
+    BundleAdvertisementRecord, BundleInvalidateRequest, BundleInvalidationRecord,
+    BundlePublishRequest, BundleQueryHit, BundleQueryMissReason, BundleQueryOutcome,
+    BundleQueryRequest, FindBlocksHit, IndexerConfigResponse, IndexerLookupClient, IndexerManager,
+    InstancesResponse, PositionalIndex, QueryRequest, QueryResponse,
 };
 #[cfg(feature = "kvbmctl")]
 pub use features::p2p::cli::{p2p_command, run_p2p};
@@ -97,7 +100,10 @@ pub use protocol::{
     IndexerFeatureConfig, P2pConfig, PrefillBackendAdvertisement, PrefillRequest,
     PrefillRouterConfig, PrimaryConfig, ProbeResponse, RuntimeConfigSummary, VllmHttpEndpoint,
 };
-pub use registry::{EvictionCallback, InMemoryRegistry, PeerRegistry, RegistryError};
+pub use registry::{
+    EvictionCallback, InMemoryRegistry, PeerRegistry, RegisteredPeer, RegistryError,
+    RegistryIncarnation, RegistryRemoval,
+};
 pub use server::{HubServer, HubServerBuilder, HubServerState};
 
 /// Shorthand for [`HubClientBuilder::new`].

@@ -21,9 +21,9 @@ use super::{
 use crate::layout::serialize::BlockFormat;
 
 use anyhow::{Result, anyhow, bail};
-use dynamo_memory::{
+use kvbm_memory::{
     Buffer, DiskStorage, OffsetBuffer, StorageKind, SystemStorage, create_buffer,
-    nixl::{MemType, NixlAgent, NixlDescriptor, register_with_nixl},
+    nixl::{MemType, NixlAgent, NixlDescriptor, RegisterError, register_with_nixl},
     prelude::{NixlCompatible, RegisteredView},
 };
 #[allow(unused_imports)]
@@ -31,7 +31,7 @@ use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use dynamo_memory::{DeviceStorage, PinnedStorage};
+use kvbm_memory::{DeviceStorage, PinnedStorage};
 
 const REGION_ALIGNMENT: usize = 512;
 
@@ -385,9 +385,9 @@ impl PhysicalLayoutBuilder<HasConfig, HasLayout, NoMemory> {
     /// ```
     pub fn with_external_device_regions(
         self,
-        tensors: Vec<Arc<dyn dynamo_memory::TensorDescriptor>>,
+        tensors: Vec<Arc<dyn kvbm_memory::TensorDescriptor>>,
     ) -> Result<PhysicalLayoutBuilder<HasConfig, HasLayout, HasMemory>> {
-        use dynamo_memory::TensorDescriptorExt;
+        use kvbm_memory::TensorDescriptorExt;
 
         if tensors.is_empty() {
             bail!("with_external_device_regions requires at least one tensor");
@@ -624,7 +624,12 @@ where
             let region = Buffer::from_arc(Arc::new(registered));
             Ok(MemoryEntry::new(region, Some(descriptor)))
         }
-        Err(_storage) => bail!("failed to register memory with NIXL agent {}", agent.name()),
+        Err(RegisterError { source, .. }) => {
+            bail!(
+                "failed to register memory with NIXL agent {}: {source}",
+                agent.name()
+            )
+        }
     }
 }
 
@@ -641,7 +646,12 @@ where
             let region: Buffer = create_buffer(registered);
             Ok(MemoryEntry::new(region, Some(descriptor)))
         }
-        Err(_storage) => bail!("failed to register memory with NIXL agent {}", agent.name()),
+        Err(RegisterError { source, .. }) => {
+            bail!(
+                "failed to register memory with NIXL agent {}: {source}",
+                agent.name()
+            )
+        }
     }
 }
 
@@ -880,7 +890,7 @@ mod tests {
     use super::super::{BlockDimension, LayoutConfig};
     use super::*;
 
-    use dynamo_memory::{Buffer, MemoryDescriptor, StorageKind};
+    use kvbm_memory::{Buffer, MemoryDescriptor, StorageKind};
     use std::any::Any;
 
     #[derive(Debug)]

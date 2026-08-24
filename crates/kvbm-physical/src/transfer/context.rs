@@ -9,11 +9,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use anyhow::Result;
 use cudarc::driver::{CudaContext, CudaEvent, CudaStream};
 use derive_builder::Builder;
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use uuid::Uuid;
 
-use dynamo_memory::CudaMemPool;
-use dynamo_memory::nixl::{NixlAgent, NixlBackendConfig, XferRequest};
+use kvbm_memory::CudaMemPool;
+use kvbm_memory::nixl::{NixlAgent, NixlBackendConfig, XferRequest};
 use kvbm_observability::SharedKvbmObservability;
 use velo::EventManager;
 
@@ -30,7 +30,7 @@ use super::TransferCapabilities;
 use notifications::RegisterPollingNotification;
 
 pub(crate) use super::notifications;
-pub use super::notifications::TransferCompleteNotification;
+pub use super::notifications::{TransferCompleteNotification, TransferDrainOutcome};
 
 #[derive(Clone, Builder)]
 #[builder(pattern = "owned", build_fn(private, name = "build_internal"), public)]
@@ -38,6 +38,11 @@ pub use super::notifications::TransferCompleteNotification;
 pub struct TransferConfig {
     #[builder(default = "Arc::new(EventManager::local())")]
     event_system: Arc<EventManager>,
+
+    /// Optional layout-handle namespace. Defaults to the event-system ID.
+    /// Set this when multiple rank-local managers share one event system.
+    #[builder(default = "None", setter(strip_option))]
+    worker_id: Option<u64>,
 
     /// Optional custom name for the NIXL agent. If not provided, defaults to "worker-{worker_id}"
     #[builder(default = "None", setter(strip_option))]
@@ -77,6 +82,10 @@ pub struct TransferConfig {
     /// Maximum entries in the remote prepared-plan LRU.
     #[builder(default = "1024")]
     prepared_plan_remote_capacity: usize,
+
+    /// Maximum outstanding completion registrations of each polling kind.
+    #[builder(default = "1024")]
+    completion_registration_capacity: usize,
 }
 
 impl TransferConfigBuilder {
@@ -132,7 +141,9 @@ impl TransferConfigBuilder {
     pub fn build(self) -> Result<TransferManager> {
         let mut config = self.build_internal()?;
 
-        let worker_id = config.event_system.system_id();
+        let worker_id = config
+            .worker_id
+            .unwrap_or_else(|| config.event_system.system_id());
 
         // Merge environment backends if not explicitly configured
         if config.nixl_backend_config.backends().is_empty() {
@@ -177,6 +188,12 @@ impl TransferConfigBuilderWithAgent {
         self
     }
 
+    /// Override the layout-handle namespace after wiring a shared NIXL agent.
+    pub fn worker_id(mut self, worker_id: u64) -> Self {
+        self.builder = self.builder.worker_id(worker_id);
+        self
+    }
+
     /// Override the prepared-plan cache enabled flag after the agent
     /// has been wired. Forwarded to the underlying builder.
     pub fn prepared_plan_cache_enabled(mut self, on: bool) -> Self {
@@ -187,6 +204,12 @@ impl TransferConfigBuilderWithAgent {
     /// Override the remote-LRU capacity after the agent has been wired.
     pub fn prepared_plan_remote_capacity(mut self, capacity: usize) -> Self {
         self.builder = self.builder.prepared_plan_remote_capacity(capacity);
+        self
+    }
+
+    /// Override the per-poller outstanding-completion admission limit.
+    pub fn completion_registration_capacity(mut self, capacity: usize) -> Self {
+        self.builder = self.builder.completion_registration_capacity(capacity);
         self
     }
 }
@@ -212,6 +235,45 @@ fn get_tokio_runtime() -> TokioRuntime {
 pub enum TokioRuntime {
     Handle(tokio::runtime::Handle),
     Shared(Arc<tokio::runtime::Runtime>),
+}
+
+pub(crate) struct PollingRegistrationQueue<C: notifications::CompletionChecker> {
+    tx: mpsc::Sender<RegisterPollingNotification<C>>,
+    admission: Arc<Semaphore>,
+}
+
+impl<C: notifications::CompletionChecker> Clone for PollingRegistrationQueue<C> {
+    fn clone(&self) -> Self {
+        Self {
+            tx: self.tx.clone(),
+            admission: Arc::clone(&self.admission),
+        }
+    }
+}
+
+impl<C: notifications::CompletionChecker> PollingRegistrationQueue<C> {
+    pub(crate) fn new(capacity: usize) -> (Self, mpsc::Receiver<RegisterPollingNotification<C>>) {
+        let (tx, rx) = mpsc::channel(capacity);
+        (
+            Self {
+                tx,
+                admission: Arc::new(Semaphore::new(capacity)),
+            },
+            rx,
+        )
+    }
+
+    pub(crate) fn reserve(&self) -> Result<OwnedSemaphorePermit> {
+        Arc::clone(&self.admission)
+            .try_acquire_owned()
+            .map_err(|_| anyhow::anyhow!("completion registration capacity exhausted"))
+    }
+
+    pub(crate) fn send(&self, notification: RegisterPollingNotification<C>) -> Result<()> {
+        self.tx
+            .try_send(notification)
+            .map_err(|error| anyhow::anyhow!("completion registration queue unavailable: {error}"))
+    }
 }
 
 impl TokioRuntime {
@@ -243,8 +305,8 @@ pub struct TransferContext {
     // CUDA memory pool for kernel allocations
     cuda_pool: Arc<CudaMemPool>,
     // Channels for background notification handlers
-    tx_nixl_status: mpsc::Sender<RegisterPollingNotification<notifications::NixlStatusChecker>>,
-    tx_cuda_event: mpsc::Sender<RegisterPollingNotification<notifications::CudaEventChecker>>,
+    nixl_status_registrations: PollingRegistrationQueue<notifications::NixlStatusChecker>,
+    cuda_event_registrations: PollingRegistrationQueue<notifications::CudaEventChecker>,
     #[allow(dead_code)]
     tx_nixl_events: mpsc::Sender<notifications::RegisterNixlNotification>,
     observability: Option<SharedKvbmObservability>,
@@ -281,6 +343,7 @@ impl TransferContext {
     ) -> Result<Self> {
         let TransferConfig {
             event_system,
+            worker_id,
             tokio_runtime,
             capabilities,
             cuda_pool_reserve_size,
@@ -288,11 +351,17 @@ impl TransferContext {
             observability,
             prepared_plan_cache_enabled,
             prepared_plan_remote_capacity,
+            completion_registration_capacity,
             // Fields already consumed by the builder path before this fn runs:
             nixl_agent_name: _,
             nixl_backend_config: _,
             cuda_device_id: _,
         } = config;
+
+        anyhow::ensure!(
+            completion_registration_capacity > 0,
+            "completion_registration_capacity must be greater than zero"
+        );
 
         unsafe { cuda_context.disable_event_tracking() };
 
@@ -303,9 +372,14 @@ impl TransferContext {
         }
         let cuda_pool = Arc::new(pool_builder.build()?);
 
-        // Create channels for background notification handlers
-        let (tx_nixl_status, rx_nixl_status) = mpsc::channel(64);
-        let (tx_cuda_event, rx_cuda_event) = mpsc::channel(64);
+        // A permit is acquired before launching an asynchronous operation and
+        // remains attached to its poller entry until completion. This bounds
+        // both the channel and the handler's outstanding map without blocking
+        // a Tokio worker or silently dropping a live registration.
+        let (nixl_status_registrations, rx_nixl_status) =
+            PollingRegistrationQueue::new(completion_registration_capacity);
+        let (cuda_event_registrations, rx_cuda_event) =
+            PollingRegistrationQueue::new(completion_registration_capacity);
         let (tx_nixl_events, rx_nixl_events) = mpsc::channel(64);
 
         // Spawn background handlers
@@ -345,7 +419,7 @@ impl TransferContext {
         let current_h2d_stream = Arc::new(AtomicUsize::new(0));
 
         Ok(Self {
-            worker_id: event_system.system_id(),
+            worker_id: worker_id.unwrap_or_else(|| event_system.system_id()),
             nixl_agent,
             cuda_context: cuda_context.clone(),
             d2h_stream,
@@ -358,8 +432,8 @@ impl TransferContext {
             capabilities,
             event_system,
             cuda_pool,
-            tx_nixl_status,
-            tx_cuda_event,
+            nixl_status_registrations,
+            cuda_event_registrations,
             tx_nixl_events,
             observability,
             graph_cache: Arc::new(GraphCache::new()),
@@ -542,24 +616,32 @@ impl TransferContext {
         self.benchmark_cache.benchmark_pair(key, candidates, stream)
     }
 
-    /// Clone the CUDA-event polling channel sender.
+    /// Clone the CUDA-event polling registration queue.
     ///
     /// Used by the planner-driven Staged executor (PR-6.2) to register
     /// CUDA events from inside a `tokio::spawn`-ed chain task without
     /// holding `&TransferContext` across an `.await`.
     pub(crate) fn tx_cuda_event_clone(
         &self,
-    ) -> mpsc::Sender<RegisterPollingNotification<notifications::CudaEventChecker>> {
-        self.tx_cuda_event.clone()
+    ) -> PollingRegistrationQueue<notifications::CudaEventChecker> {
+        self.cuda_event_registrations.clone()
     }
 
-    /// Clone the NIXL status polling channel sender. Used for the same
+    /// Clone the NIXL status polling registration queue. Used for the same
     /// reason as [`Self::tx_cuda_event_clone`] — Staged-task NIXL
     /// completion registration without `&TransferContext`.
     pub(crate) fn tx_nixl_status_clone(
         &self,
-    ) -> mpsc::Sender<RegisterPollingNotification<notifications::NixlStatusChecker>> {
-        self.tx_nixl_status.clone()
+    ) -> PollingRegistrationQueue<notifications::NixlStatusChecker> {
+        self.nixl_status_registrations.clone()
+    }
+
+    pub(crate) fn reserve_nixl_status(&self) -> Result<OwnedSemaphorePermit> {
+        self.nixl_status_registrations.reserve()
+    }
+
+    pub(crate) fn reserve_cuda_event(&self) -> Result<OwnedSemaphorePermit> {
+        self.cuda_event_registrations.reserve()
     }
 
     /// Register a NIXL transfer request for status polling completion.
@@ -571,6 +653,7 @@ impl TransferContext {
         &self,
         xfer_req: XferRequest,
         telemetry: Option<notifications::XferTelemetry>,
+        admission: OwnedSemaphorePermit,
     ) -> TransferCompleteNotification {
         let event = self
             .event_system
@@ -590,14 +673,20 @@ impl TransferContext {
             ),
             event_handle: handle,
             telemetry,
+            admission,
         };
 
-        // Send to background handler — log error if channel is full or closed
-        if let Err(e) = self.tx_nixl_status.try_send(notification) {
+        // Send to the lossless registration queue. A closed queue means the
+        // completion worker is gone, so poison the event instead of returning
+        // an awaiter that can never resolve.
+        if let Err(e) = self.nixl_status_registrations.send(notification) {
             tracing::error!(
-                "Failed to enqueue NIXL status notification: channel full or closed: {}",
+                "Failed to enqueue NIXL status notification: channel closed: {}",
                 e
             );
+            let _ = self
+                .event_system
+                .poison(handle, "NIXL status completion worker stopped".to_owned());
         }
 
         TransferCompleteNotification::from_awaiter(awaiter)
@@ -607,7 +696,11 @@ impl TransferContext {
     ///
     /// This method enqueues the CUDA event to be polled for completion.
     /// Returns a notification object that can be awaited for completion.
-    pub(crate) fn register_cuda_event(&self, event: CudaEvent) -> TransferCompleteNotification {
+    pub(crate) fn register_cuda_event(
+        &self,
+        event: CudaEvent,
+        admission: OwnedSemaphorePermit,
+    ) -> TransferCompleteNotification {
         let new_event = self
             .event_system
             .new_event()
@@ -623,14 +716,20 @@ impl TransferContext {
             checker: notifications::CudaEventChecker::new(event),
             event_handle: handle,
             telemetry: None,
+            admission,
         };
 
-        // Send to background handler — log error if channel is full or closed
-        if let Err(e) = self.tx_cuda_event.try_send(notification) {
+        // Send to the lossless registration queue. A closed queue means the
+        // completion worker is gone, so poison the event instead of returning
+        // an awaiter that can never resolve.
+        if let Err(e) = self.cuda_event_registrations.send(notification) {
             tracing::error!(
-                "Failed to enqueue CUDA event notification: channel full or closed: {}",
+                "Failed to enqueue CUDA event notification: channel closed: {}",
                 e
             );
+            let _ = self
+                .event_system
+                .poison(handle, "CUDA event completion worker stopped".to_owned());
         }
 
         TransferCompleteNotification::from_awaiter(awaiter)

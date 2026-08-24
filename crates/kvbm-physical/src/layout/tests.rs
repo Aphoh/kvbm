@@ -9,8 +9,8 @@
 
 use crate::layout::physical::PhysicalLayout;
 use crate::layout::{BlockDimension, LayoutConfig, LayoutDescriptor};
-use dynamo_memory::nixl::{MemType, NixlAgent, NixlDescriptor};
-use dynamo_memory::{Buffer, MemoryDescriptor, MemoryRegion, StorageKind};
+use kvbm_memory::nixl::{MemType, NixlAgent, NixlDescriptor};
+use kvbm_memory::{Buffer, MemoryDescriptor, MemoryRegion, StorageKind};
 use std::any::Any;
 use std::sync::Arc;
 

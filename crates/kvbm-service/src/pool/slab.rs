@@ -13,7 +13,7 @@
 
 use std::fmt;
 
-use dynamo_memory::{
+use kvbm_memory::{
     HugepageTier, MmappedPinnedStorage, NumaNode,
     nixl::{NixlAgent, NixlRegistered},
 };

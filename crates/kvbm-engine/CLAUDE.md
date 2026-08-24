@@ -44,7 +44,7 @@ Leaders own block metadata and make placement decisions. Workers execute data tr
 
 - **`leader/`** — `InstanceLeader` coordinates block lookups (`find_matches`), holds blocks via RAII `BlockHolder`, and manages distributed sessions. The `Leader` trait is the core coordination interface.
 - **`worker/`** — `PhysicalWorker` owns a `TransferManager` and layout handles for actual transfers. `CoordinatedWorker` wraps any `Worker` with the leader's coordination state. The `Worker` and `WorkerTransfers` traits define the execution contract.
-- **`worker/group/`** — `SpmdParallelWorkers` broadcasts operations to all workers in parallel (SPMD model) with event aggregation.
+- **`worker/group/`** — `SpmdParallelWorkers` broadcasts operations to all workers in parallel (SPMD model) with owned receipt aggregation.
 - **`worker/velo/`** — RPC layer (`VeloWorkerService`/`VeloWorkerClient`) for remote worker execution via Velo.
 - **`tiering/offload/`** — Multi-stage async pipeline for tier demotion: PolicyEvaluator → PreconditionAwaiter → Batcher → TransferExecutor. Supports per-container cancellation tokens. **See `src/tiering/offload/AGENTS.md` for governance rules before modifying this module.**
 - **`tiering/engine/`** — The seam-facing connector engine: `LocalConnectorEngine` (the `LeaderEngine` impl) plus `WorkerEngine` and pass-plan types (`PassOffload`, `PassOnboard`) consumed by the connector path.
@@ -54,7 +54,7 @@ Leaders own block metadata and make placement decisions. Workers execute data tr
 - **`object/`** — `ObjectBlockOps` trait for G4 storage. S3 implementation with concurrent uploads/downloads. `ObjectLockManager` for distributed locking via conditional S3 PUTs.
 - **`runtime/`** — `KvbmRuntime` bundles tokio, Velo messenger, NixlAgent (RDMA), and EventManager. Built via `KvbmRuntimeBuilder` or quick constructors (`from_env_leader`, `from_env_worker`).
 - **`pubsub/`** — Publisher/Subscriber traits with NATS and in-memory stub implementations.
-- **`collectives/`** — `CollectiveOps` trait for multi-GPU sync. NCCL implementation and stub for testing. MLA pattern: only rank 0 needs G2/G3; others receive via broadcast.
+- **`collectives/`** — `CollectiveOps` trait for multi-GPU sync. NCCL implementation and stub for testing. MLA pattern: replicated G1, striped lower tiers, and owner-selected broadcast roots.
 - **`testing/`** — Feature-gated test utilities: `TestManagerBuilder`, `MessengerPair`, `TestSession`, `EventsPipelineFixture`, `MultiInstancePopulator`, `TestAgent`.
 
 ### Documentation
@@ -70,7 +70,7 @@ Module docs live in `docs/` and are included via `#[doc = include_str!("../docs/
 
 ### Workspace Dependencies
 
-Internal crates: `kvbm-common`, `kvbm-config`, `kvbm-kernels`, `kvbm-logical`, `kvbm-physical`, `velo`, `dynamo-tokens`, `dynamo-memory`.
+Internal crates: `kvbm-common`, `kvbm-config`, `kvbm-kernels`, `kvbm-logical`, `kvbm-physical`, `kvbm-memory`, `velo`, `dynamo-tokens`.
 
 ## Offload Module Governance
 

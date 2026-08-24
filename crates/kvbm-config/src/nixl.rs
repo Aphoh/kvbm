@@ -10,9 +10,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use validator::Validate;
 
-// Conversion to `dynamo_memory::nixl::NixlBackendConfig` lives in the
+// Conversion to `kvbm_memory::nixl::NixlBackendConfig` lives in the
 // `kvbm-runtime` crate (`kvbm_runtime::nixl_backend_config`) so this crate
-// stays free of the `dynamo-memory` (CUDA) dependency.
+// stays free of the `kvbm-memory` (CUDA) dependency.
 
 /// NixL backend configuration.
 ///

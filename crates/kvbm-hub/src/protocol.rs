@@ -11,6 +11,7 @@
 //! All request/response bodies are JSON.
 
 use kvbm_common::BlockLayoutMode;
+use kvbm_protocols::cache_manifest::RegistrationEpoch;
 use kvbm_protocols::control::MetricsSnapshotResponse;
 pub use kvbm_protocols::control::layout_compat::LayoutCompatPayload;
 /// Remote-prefill request payload carried by the hub's CD queue.
@@ -26,11 +27,53 @@ pub use crate::features::prefill_router::protocol::{
     PrefillBackendAdvertisement, PrefillRouterConfig, VllmHttpEndpoint,
 };
 
+/// Opaque bearer credential authorizing registration-scoped hub mutations.
+///
+/// The hub rotates this value on every successful registration. It is carried
+/// only by mutation requests and deliberately redacted from `Debug` output.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct MutationCredential(uuid::Uuid);
+
+impl MutationCredential {
+    pub(crate) fn generate() -> Self {
+        Self(uuid::Uuid::new_v4())
+    }
+
+    /// Encode this credential for the authenticated registration header.
+    pub fn to_header_value(&self) -> axum::http::HeaderValue {
+        let mut value = axum::http::HeaderValue::from_str(&self.0.to_string())
+            .expect("UUID credentials are valid HTTP header values");
+        value.set_sensitive(true);
+        value
+    }
+
+    pub(crate) fn from_header_value(value: &str) -> Result<Self, uuid::Error> {
+        uuid::Uuid::parse_str(value).map(Self)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_owner(owner: InstanceId) -> Self {
+        Self(uuid::Uuid::from_u128(owner.as_u128()))
+    }
+}
+
+impl std::fmt::Debug for MutationCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MutationCredential([REDACTED])")
+    }
+}
+
 /// Default HTTP port for peer-discovery lookups (the `PeerDiscovery` surface).
 pub const DEFAULT_DISCOVERY_PORT: u16 = 1337;
 
 /// Default HTTP port for the control plane (registration, heartbeat).
 pub const DEFAULT_CONTROL_PORT: u16 = 8337;
+
+/// Header carrying the current registration credential for authenticated
+/// re-registration and unregister operations. Credentials never appear in
+/// request URLs.
+pub const MUTATION_CREDENTIAL_HEADER: &str = "x-kvbm-mutation-credential";
 
 /// URL path fragments for the HTTP API.
 pub mod paths {
@@ -499,6 +542,15 @@ pub struct RegisterResponse {
     /// bidirectional active messaging. `None` when the hub has no velo.
     #[serde(default)]
     pub hub_instance_id: Option<InstanceId>,
+    /// Bearer credential for mutations owned by this registration. New hubs
+    /// always return one; `None` is accepted only for wire compatibility with
+    /// older discovery-only hubs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mutation_credential: Option<MutationCredential>,
+    /// Opaque lifecycle identity for this successful registration. New hubs
+    /// always return one; absence is accepted only to decode older hubs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_epoch: Option<RegistrationEpoch>,
 }
 
 /// Response body for peer-discovery lookups.
@@ -581,6 +633,9 @@ pub enum ErrorCode {
     Conflict,
     /// Request payload was malformed.
     BadRequest,
+    /// The supplied registration credential is absent, stale, or belongs to
+    /// another instance.
+    Unauthorized,
     /// Unexpected server-side failure.
     Internal,
 }
@@ -790,6 +845,7 @@ mod tests {
             num_provided_tokens: 48,
             request: KvHashingRequestEnvelope::default(),
             expected_hash_digest: Some(0xABCD_EF01_2345_6789),
+            bundle: None,
         };
         let json = serde_json::to_string(&orig).unwrap();
         let back: PrefillRequest = serde_json::from_str(&json).unwrap();
@@ -805,14 +861,20 @@ mod tests {
     fn register_response_serde_round_trip() {
         let instance_id = InstanceId::new_v4();
         let hub_instance_id = Some(InstanceId::new_v4());
+        let mutation_credential = Some(MutationCredential::generate());
+        let registration_epoch = Some(RegistrationEpoch::new());
         let orig = RegisterResponse {
             instance_id,
             hub_instance_id,
+            mutation_credential: mutation_credential.clone(),
+            registration_epoch,
         };
         let json = serde_json::to_string(&orig).unwrap();
         let back: RegisterResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(back.instance_id, instance_id);
         assert_eq!(back.hub_instance_id, hub_instance_id);
+        assert_eq!(back.mutation_credential, mutation_credential);
+        assert_eq!(back.registration_epoch, registration_epoch);
     }
 
     #[test]
@@ -822,6 +884,19 @@ mod tests {
         let back: RegisterResponse = serde_json::from_str(&legacy_json).unwrap();
         assert_eq!(back.instance_id, instance_id);
         assert!(back.hub_instance_id.is_none());
+        assert!(back.mutation_credential.is_none());
+        assert!(back.registration_epoch.is_none());
+    }
+
+    #[test]
+    fn mutation_credential_debug_is_redacted_and_header_is_sensitive() {
+        let credential = MutationCredential::generate();
+        let serialized = serde_json::to_string(&credential).unwrap();
+        let header = credential.to_header_value();
+
+        assert_eq!(format!("{credential:?}"), "MutationCredential([REDACTED])");
+        assert!(header.is_sensitive());
+        assert!(!format!("{header:?}").contains(serialized.trim_matches('"')));
     }
 
     #[test]
@@ -841,6 +916,7 @@ mod tests {
             ErrorCode::NotFound,
             ErrorCode::Conflict,
             ErrorCode::BadRequest,
+            ErrorCode::Unauthorized,
             ErrorCode::Internal,
         ] {
             let json = serde_json::to_string(&code).unwrap();

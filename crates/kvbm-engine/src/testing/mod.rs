@@ -3,7 +3,9 @@
 
 #![doc = include_str!("../../docs/testing.md")]
 
+#[cfg(feature = "testing-nixl")]
 pub mod asymmetric_tp_session;
+pub mod bundle_faults;
 pub mod distributed;
 pub mod events;
 pub mod managers;

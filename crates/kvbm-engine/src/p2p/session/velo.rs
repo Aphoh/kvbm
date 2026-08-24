@@ -31,11 +31,12 @@ use kvbm_logical::blocks::{ImmutableBlock, MutableBlock};
 use parking_lot::Mutex;
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot, watch};
+use tokio_util::sync::CancellationToken;
 
 use super::{
     AvailabilityDelta, AvailabilityStream, CommitDelta, CommitStream, CommittedBlock, Frame,
     LifecycleEvent, LifecycleStream, PeerAvailable, PeerCommitted, PeerResolver, Session,
-    SessionFactory, SessionId,
+    SessionFactory, SessionId, VerifiedCommittedBlock, VerifiedPayload,
 };
 use crate::leader::InstanceLeader;
 use crate::leader::dispatch::{PullRef, WirePullOptions};
@@ -235,6 +236,9 @@ struct VeloSessionInner {
 
     /// Set when monitor detects shutdown, used to short-circuit.
     closed: Mutex<bool>,
+    /// Cancels holder-side attach setup immediately and asks the inbound
+    /// monitor to exit once every already-authorized pull is acknowledged.
+    close_token: CancellationToken,
 
     /// Owned tokio `Handle` for spawning the outbound sender task
     /// and dispatch-side helpers.
@@ -355,6 +359,7 @@ impl VeloSession {
             peer_finished: Mutex::new(false),
             finalize_enqueued: Mutex::new(false),
             closed: Mutex::new(false),
+            close_token: CancellationToken::new(),
             runtime,
             active_count,
             peer_resolver,
@@ -369,6 +374,75 @@ impl VeloSession {
             .outbound_tx
             .send(OutboundCommand::Send(frame))
             .map_err(|_| anyhow!("session outbound channel closed"))
+    }
+
+    fn publish_available(
+        &self,
+        blocks: Vec<ImmutableBlock<G2>>,
+        payloads: Option<Vec<VerifiedPayload>>,
+    ) -> Result<()> {
+        let drained_guard = self.inner.avail_drained.lock();
+        if *drained_guard {
+            anyhow::bail!("make_available: cannot make_available after finish_availability");
+        }
+        if let Some(payloads) = &payloads {
+            anyhow::ensure!(
+                payloads.len() == blocks.len(),
+                "verified availability has {} payload records for {} blocks",
+                payloads.len(),
+                blocks.len()
+            );
+        }
+        crate::engine_audit!(
+            "session_make_available",
+            session_id = %self.inner.session_id,
+            num_blocks = blocks.len(),
+            verified = payloads.is_some()
+        );
+        if blocks.is_empty() {
+            return Ok(());
+        }
+        {
+            let committed = self.inner.committed.lock();
+            for block in &blocks {
+                let hash = block.sequence_hash();
+                if !committed.contains(&hash) {
+                    anyhow::bail!("make_available: block hash {hash:?} is not in committed set");
+                }
+            }
+        }
+
+        let available = blocks
+            .iter()
+            .map(|block| CommittedBlock {
+                hash: block.sequence_hash(),
+                peer_block_id: block.block_id(),
+            })
+            .collect::<Vec<_>>();
+        let verified = payloads.as_ref().map(|values| {
+            available
+                .iter()
+                .cloned()
+                .zip(values)
+                .map(|(block, payload)| VerifiedCommittedBlock {
+                    block,
+                    ordinal: payload.ordinal,
+                    checksum: payload.checksum,
+                })
+                .collect::<Vec<_>>()
+        });
+        {
+            let mut pins = self.inner.available_pins.lock();
+            for block in blocks {
+                pins.insert(block.sequence_hash(), block);
+            }
+        }
+        match verified {
+            Some(blocks) => self.enqueue_frame(Frame::VerifiedAvailable { blocks })?,
+            None => self.enqueue_frame(Frame::Available { blocks: available })?,
+        }
+        drop(drained_guard);
+        Ok(())
     }
 
     /// Synchronously enqueue stream finalization. After draining
@@ -402,6 +476,15 @@ impl VeloSession {
             "session_rendezvous_finalize",
             session_id = %self.inner.session_id
         );
+        let _ = self.enqueue_finalize();
+    }
+
+    fn enqueue_finalize_once(&self) {
+        let mut enqueued = self.inner.finalize_enqueued.lock();
+        if *enqueued {
+            return;
+        }
+        *enqueued = true;
         let _ = self.enqueue_finalize();
     }
 }
@@ -461,6 +544,7 @@ fn frame_kind(frame: &Frame) -> &'static str {
         Frame::Commit { .. } => "Commit",
         Frame::CommitsClosed => "CommitsClosed",
         Frame::Available { .. } => "Available",
+        Frame::VerifiedAvailable { .. } => "VerifiedAvailable",
         Frame::Drained => "Drained",
         Frame::Pull { .. } => "Pull",
         Frame::PullComplete { .. } => "PullComplete",
@@ -475,6 +559,17 @@ fn frame_kind(frame: &Frame) -> &'static str {
 // Frame handling — runs in the per-session monitor task
 // ============================================================================
 
+fn fail_attach(inner: &VeloSessionInner, reason: String) {
+    inner
+        .attach_state
+        .send_replace(AttachState::Failed(reason.clone()));
+    if !*inner.closed.lock() {
+        inner
+            .lifecycle_stream
+            .push(LifecycleEvent::Failed { reason });
+    }
+}
+
 fn dispatch_frame(inner: &Arc<VeloSessionInner>, frame: Frame, runtime: &Handle) {
     let session_id = inner.session_id;
     match frame {
@@ -487,7 +582,14 @@ fn dispatch_frame(inner: &Arc<VeloSessionInner>, frame: Frame, runtime: &Handle)
                 session_id = %session_id,
                 peer_instance_id = %instance_id
             );
-            *inner.peer_instance_id.lock() = Some(instance_id);
+            {
+                let closed = inner.closed.lock();
+                if *closed {
+                    tracing::warn!(%session_id, "Attach received after session close; rejecting");
+                    return;
+                }
+                *inner.peer_instance_id.lock() = Some(instance_id);
+            }
             // Holder side: open the outbound velo sender, deliver
             // it to the per-session sender task via the install
             // oneshot, ensure peer's worker metadata is imported,
@@ -503,11 +605,10 @@ fn dispatch_frame(inner: &Arc<VeloSessionInner>, frame: Frame, runtime: &Handle)
                     Ok(h) => h,
                     Err(err) => {
                         tracing::error!(error = %err, "decode Attach endpoint failed");
-                        inner_for_attach
-                            .lifecycle_stream
-                            .push(LifecycleEvent::Failed {
-                                reason: format!("decode Attach endpoint: {err}"),
-                            });
+                        fail_attach(
+                            &inner_for_attach,
+                            format!("decode Attach endpoint: {err}"),
+                        );
                         return;
                     }
                 };
@@ -516,72 +617,73 @@ fn dispatch_frame(inner: &Arc<VeloSessionInner>, frame: Frame, runtime: &Handle)
                 // attach_anchor. Without this, the streaming registry
                 // is empty and `attach_anchor(handle)` fails with
                 // "TCP streaming: peer X not registered".
-                if let Some(resolver) = inner_for_attach.peer_resolver.clone()
-                    && let Err(err) = resolver.resolve_and_register(instance_id).await
-                {
-                    tracing::error!(
-                        peer_instance_id = %instance_id,
-                        error = ?err,
-                        "decode Attach peer resolution failed"
-                    );
-                    inner_for_attach
-                        .lifecycle_stream
-                        .push(LifecycleEvent::Failed {
-                            reason: format!("decode Attach resolve peer {instance_id}: {err}"),
-                        });
-                    return;
-                }
-                let sender = match inner_for_attach.velo.attach_anchor::<Frame>(handle).await {
-                    Ok(s) => s,
-                    Err(err) => {
-                        tracing::error!(error = %err, "attach outbound on Attach failed");
-                        inner_for_attach
-                            .lifecycle_stream
-                            .push(LifecycleEvent::Failed {
-                                reason: format!("install outbound on Attach: {err}"),
-                            });
-                        return;
-                    }
-                };
-                let install_tx = inner_for_attach.outbound_install_tx.lock().take();
-                match install_tx {
-                    Some(tx) => {
-                        if tx.send(sender).is_err() {
-                            tracing::warn!(
-                                "outbound sender task gone before install on Frame::Attach"
-                            );
-                            return;
-                        }
-                    }
-                    None => {
-                        tracing::warn!(
-                            "outbound already installed before Frame::Attach (duplicate Attach?)"
+                if let Some(resolver) = inner_for_attach.peer_resolver.clone() {
+                    let result = tokio::select! {
+                        _ = inner_for_attach.close_token.cancelled() => return,
+                        result = resolver.resolve_and_register(instance_id) => result,
+                    };
+                    if let Err(err) = result {
+                        tracing::error!(
+                            peer_instance_id = %instance_id,
+                            error = ?err,
+                            "decode Attach peer resolution failed"
+                        );
+                        fail_attach(
+                            &inner_for_attach,
+                            format!("decode Attach resolve peer {instance_id}: {err}"),
                         );
                         return;
                     }
                 }
+                let sender_result = tokio::select! {
+                    _ = inner_for_attach.close_token.cancelled() => return,
+                    result = inner_for_attach.velo.attach_anchor::<Frame>(handle) => result,
+                };
+                let sender = match sender_result {
+                    Ok(s) => s,
+                    Err(err) => {
+                        tracing::error!(error = %err, "attach outbound on Attach failed");
+                        fail_attach(
+                            &inner_for_attach,
+                            format!("install outbound on Attach: {err}"),
+                        );
+                        return;
+                    }
+                };
                 // Skipped when this side has no workers — see
                 // matching comment in `attach()`. Stream-only
                 // callers (no pull) remain usable.
-                if inner_for_attach.leader.worker_count() > 0
-                    && let Err(err) = inner_for_attach
-                        .leader
-                        .ensure_remote_metadata(instance_id)
-                        .await
-                    {
+                if inner_for_attach.leader.worker_count() > 0 {
+                    let result = tokio::select! {
+                        _ = inner_for_attach.close_token.cancelled() => return,
+                        result = inner_for_attach.leader.ensure_remote_metadata(instance_id) => result,
+                    };
+                    if let Err(err) = result {
                         tracing::error!(error = %err, peer = %instance_id, "metadata exchange failed on Attach");
-                        let reason =
-                            format!("metadata exchange failed for {instance_id}: {err}");
-                        // `send_replace` (not `send`) so the state is stored even
-                        // when no `wait_attached` receiver is live yet.
-                        inner_for_attach
-                            .attach_state
-                            .send_replace(AttachState::Failed(reason.clone()));
-                        inner_for_attach
-                            .lifecycle_stream
-                            .push(LifecycleEvent::Failed { reason });
+                        fail_attach(
+                            &inner_for_attach,
+                            format!("metadata exchange failed for {instance_id}: {err}"),
+                        );
                         return;
                     }
+                }
+                // Serialize the final install + Attached publication against
+                // first close. No await is allowed while this admission lock
+                // is held.
+                let closed = inner_for_attach.closed.lock();
+                if *closed {
+                    return;
+                }
+                let Some(install_tx) = inner_for_attach.outbound_install_tx.lock().take() else {
+                    tracing::warn!(
+                        "outbound already installed before Frame::Attach (duplicate Attach?)"
+                    );
+                    return;
+                };
+                if install_tx.send(sender).is_err() {
+                    tracing::warn!("outbound sender task gone before install on Frame::Attach");
+                    return;
+                }
                 // Metadata import completed: release the `wait_attached` gate
                 // BEFORE pushing the lifecycle event so the CD pull pipeline can
                 // proceed. `send_replace` stores the state regardless of whether
@@ -594,6 +696,7 @@ fn dispatch_frame(inner: &Arc<VeloSessionInner>, frame: Frame, runtime: &Handle)
                     .push(LifecycleEvent::Attached {
                         peer_instance_id: instance_id,
                     });
+                drop(closed);
             });
         }
         Frame::Commit { hashes } => {
@@ -654,6 +757,28 @@ fn dispatch_frame(inner: &Arc<VeloSessionInner>, frame: Frame, runtime: &Handle)
                 .avail_stream
                 .push(AvailabilityDelta::Available(blocks));
         }
+        Frame::VerifiedAvailable { blocks } => {
+            crate::engine_audit!(
+                "session_recv_verified_available",
+                session_id = %session_id,
+                num_blocks = blocks.len()
+            );
+            if *inner.peer_avail_drained.lock() {
+                tracing::error!(
+                    session_id = %session_id,
+                    num_blocks = blocks.len(),
+                    "protocol violation: Frame::VerifiedAvailable after Frame::Drained dropped"
+                );
+                return;
+            }
+            {
+                let mut peer_available = inner.peer_available.lock();
+                for record in &blocks {
+                    peer_available.insert(record.block.hash, record.block.peer_block_id);
+                }
+            }
+            inner.avail_stream.push(AvailabilityDelta::Verified(blocks));
+        }
         Frame::Drained => {
             crate::engine_audit!(
                 "session_recv_drained",
@@ -668,18 +793,23 @@ fn dispatch_frame(inner: &Arc<VeloSessionInner>, frame: Frame, runtime: &Handle)
                 pull_id,
                 num_hashes = hashes.len()
             );
-            // We are holder. Authorize the puller's RDMA read,
-            // remember the hashes so we can drop pins on PullAck.
+            // Serialize authorization with close. Holding `closed` through
+            // both insertion and PullComplete enqueue makes admission atomic:
+            // close observes either no pull or a fully recorded one.
+            let closed = inner.closed.lock();
+            if *closed {
+                tracing::warn!(pull_id, "Pull received after session close; rejecting");
+                return;
+            }
             inner.inbound_pulls.insert(pull_id, hashes);
-            // Synchronous enqueue — preserves causal order with
-            // any concurrent Commit/Available emitted by the
-            // holder side.
             let session = VeloSession {
                 inner: Arc::clone(inner),
             };
             if let Err(err) = session.enqueue_frame(Frame::PullComplete { pull_id }) {
+                inner.inbound_pulls.remove(&pull_id);
                 tracing::error!(error = %err, pull_id, "enqueue PullComplete failed");
             }
+            drop(closed);
         }
         Frame::PullComplete { pull_id } => {
             crate::engine_audit!(
@@ -701,14 +831,33 @@ fn dispatch_frame(inner: &Arc<VeloSessionInner>, frame: Frame, runtime: &Handle)
                 session_id = %session_id,
                 pull_id
             );
-            // We are holder. Puller confirmed RDMA read settled;
-            // drop pins for the hashes correlated with this pull.
+            // Serialize Ack accounting with new admission. A hash may be
+            // referenced by more than one pull_id, so release its source pin
+            // only after the last overlapping authorization settles.
+            let closed = inner.closed.lock();
             if let Some((_, hashes)) = inner.inbound_pulls.remove(&pull_id) {
                 let mut pins = inner.available_pins.lock();
                 for h in &hashes {
-                    pins.remove(h);
+                    let still_inflight = inner
+                        .inbound_pulls
+                        .iter()
+                        .any(|pull| pull.value().contains(h));
+                    if !still_inflight {
+                        pins.remove(h);
+                    }
                 }
             }
+            if inner.inbound_pulls.is_empty() && *closed {
+                // Explicit close deferred teardown while authorized DMA was
+                // outstanding. The last Ack is terminal proof that makes the
+                // remaining holder pins safe to recycle.
+                inner.available_pins.lock().clear();
+                VeloSession {
+                    inner: Arc::clone(inner),
+                }
+                .enqueue_finalize_once();
+            }
+            drop(closed);
         }
         Frame::Finished => {
             crate::engine_audit!(
@@ -761,10 +910,10 @@ impl VeloSession {
 
     /// Test-only: count of authorized-but-unacked pull entries
     /// in `inbound_pulls` (populated by `Frame::Pull`, drained by
-    /// `Frame::PullAck`).  Symmetric with `test_available_pin_count`
-    /// — the two maps must both be empty after `close()` so that the
-    /// strong refs they hold drop and the underlying G2 blocks are
-    /// returned to the pool.  See `close()` for the drain rationale.
+    /// `Frame::PullAck`). On `close()`, these authorizations and the
+    /// corresponding source pins remain quarantined until the final Ack;
+    /// terminal wire loss may retain that quarantine indefinitely rather
+    /// than risk recycling memory still reachable by DMA.
     #[cfg(any(test, feature = "testing"))]
     pub fn test_inbound_pulls_count(&self) -> usize {
         self.inner.inbound_pulls.len()
@@ -835,6 +984,17 @@ fn fail_pending_pulls(pending: &DashMap<u64, oneshot::Sender<Result<(), String>>
     }
 }
 
+/// Maps a Velo stream error to the session lifecycle contract.
+fn lifecycle_event_for_stream_error(error: &velo::StreamError) -> LifecycleEvent {
+    let reason = format!("stream error: {error}");
+    match error {
+        velo::StreamError::SenderDropped => LifecycleEvent::Detached {
+            reason: Some(reason),
+        },
+        _ => LifecycleEvent::Failed { reason },
+    }
+}
+
 fn spawn_monitor(
     inner: Arc<VeloSessionInner>,
     mut anchor: velo::StreamAnchor<Frame>,
@@ -845,7 +1005,26 @@ fn spawn_monitor(
         // Reason carried into `fail_pending_pulls` once the monitor exits. The
         // wire is gone at that point, so every parked pull must be failed.
         let mut close_reason = "session monitor exited".to_string();
-        while let Some(frame) = anchor.next().await {
+        let mut close_requested = false;
+        loop {
+            let next = if close_requested {
+                anchor.next().await
+            } else {
+                tokio::select! {
+                    _ = inner.close_token.cancelled() => {
+                        close_requested = true;
+                        close_reason = "session close requested".to_owned();
+                        if inner.inbound_pulls.is_empty() {
+                            break;
+                        }
+                        continue;
+                    }
+                    frame = anchor.next() => frame,
+                }
+            };
+            let Some(frame) = next else {
+                break;
+            };
             match frame {
                 Ok(velo::StreamFrame::Item(frame)) => dispatch_frame(&inner, frame, &runtime),
                 Ok(velo::StreamFrame::Finalized) => {
@@ -864,12 +1043,15 @@ fn spawn_monitor(
                 }
                 Ok(_) => {}
                 Err(err) => {
-                    inner.lifecycle_stream.push(LifecycleEvent::Failed {
-                        reason: format!("stream error: {err}"),
-                    });
+                    inner
+                        .lifecycle_stream
+                        .push(lifecycle_event_for_stream_error(&err));
                     close_reason = format!("stream error: {err}");
                     break;
                 }
+            }
+            if close_requested && inner.inbound_pulls.is_empty() {
+                break;
             }
         }
         *inner.closed.lock() = true;
@@ -943,21 +1125,18 @@ fn build_avail_stream(
     replay: Vec<AvailabilityDelta>,
 ) -> AvailabilityStream {
     let mut pending: VecDeque<AvailabilityDelta> = VecDeque::new();
-    let mut coalesced: Vec<CommittedBlock> = Vec::new();
-    let mut saw_drained = false;
     for d in replay {
         match d {
-            AvailabilityDelta::Available(bs) => coalesced.extend(bs),
-            AvailabilityDelta::Drained => {
-                saw_drained = true;
-            }
+            AvailabilityDelta::Available(blocks) => match pending.back_mut() {
+                Some(AvailabilityDelta::Available(previous)) => previous.extend(blocks),
+                _ => pending.push_back(AvailabilityDelta::Available(blocks)),
+            },
+            AvailabilityDelta::Verified(blocks) => match pending.back_mut() {
+                Some(AvailabilityDelta::Verified(previous)) => previous.extend(blocks),
+                _ => pending.push_back(AvailabilityDelta::Verified(blocks)),
+            },
+            AvailabilityDelta::Drained => pending.push_back(AvailabilityDelta::Drained),
         }
-    }
-    if !coalesced.is_empty() {
-        pending.push_back(AvailabilityDelta::Available(coalesced));
-    }
-    if saw_drained {
-        pending.push_back(AvailabilityDelta::Drained);
     }
     Box::pin(CombiningStream { pending, rx })
 }
@@ -982,6 +1161,10 @@ impl Session for VeloSession {
 
     fn endpoint(&self) -> Option<SessionEndpoint> {
         self.inner.local_endpoint.lock().clone()
+    }
+
+    fn has_inflight_pulls(&self) -> bool {
+        !self.inner.inbound_pulls.is_empty()
     }
 
     fn commit(&self, hashes: Vec<SequenceHash>) -> Result<()> {
@@ -1039,53 +1222,15 @@ impl Session for VeloSession {
     }
 
     fn make_available(&self, blocks: Vec<ImmutableBlock<G2>>) -> Result<()> {
-        // Hold `avail_drained` from check through enqueue — see
-        // `commit` for the rationale. Serialises with
-        // `finish_availability`.
-        let drained_guard = self.inner.avail_drained.lock();
-        if *drained_guard {
-            anyhow::bail!("make_available: cannot make_available after finish_availability");
-        }
-        crate::engine_audit!(
-            "session_make_available",
-            session_id = %self.inner.session_id,
-            num_blocks = blocks.len()
-        );
-        if blocks.is_empty() {
-            return Ok(());
-        }
-        // Validate every block.hash ∈ committed.
-        {
-            let committed = self.inner.committed.lock();
-            for b in &blocks {
-                let h = b.sequence_hash();
-                if !committed.contains(&h) {
-                    anyhow::bail!("make_available: block hash {:?} is not in committed set", h);
-                }
-            }
-        }
+        self.publish_available(blocks, None)
+    }
 
-        // Pin the blocks and build the wire payload.
-        let payload: Vec<CommittedBlock> = blocks
-            .iter()
-            .map(|b| CommittedBlock {
-                hash: b.sequence_hash(),
-                peer_block_id: b.block_id(),
-            })
-            .collect();
-        {
-            let mut pins = self.inner.available_pins.lock();
-            for b in blocks {
-                let h = b.sequence_hash();
-                pins.insert(h, b);
-            }
-        }
-
-        if let Err(err) = self.enqueue_frame(Frame::Available { blocks: payload }) {
-            tracing::error!(error = %err, "enqueue Available failed");
-        }
-        drop(drained_guard);
-        Ok(())
+    fn make_available_verified(
+        &self,
+        blocks: Vec<ImmutableBlock<G2>>,
+        payloads: Vec<VerifiedPayload>,
+    ) -> Result<()> {
+        self.publish_available(blocks, Some(payloads))
     }
 
     fn finish_availability(&self) -> Result<()> {
@@ -1134,8 +1279,8 @@ impl Session for VeloSession {
             .peer_available
             .lock()
             .iter()
-            .map(|(h, id)| CommittedBlock {
-                hash: *h,
+            .map(|(hash, id)| CommittedBlock {
+                hash: *hash,
                 peer_block_id: *id,
             })
             .collect();
@@ -1151,10 +1296,20 @@ impl Session for VeloSession {
         hashes: Vec<SequenceHash>,
         dst: Vec<MutableBlock<G2>>,
     ) -> BoxFuture<'static, Result<Vec<MutableBlock<G2>>>> {
+        self.pull_resource(self.inner.leader.primary_g2_resource(), hashes, dst)
+    }
+
+    fn pull_resource(
+        &self,
+        resource: kvbm_common::LogicalResourceId,
+        hashes: Vec<SequenceHash>,
+        dst: Vec<MutableBlock<G2>>,
+    ) -> BoxFuture<'static, Result<Vec<MutableBlock<G2>>>> {
         let session = self.clone();
         crate::engine_audit!(
             "session_pull_request",
             session_id = %self.inner.session_id,
+            resource = ?resource,
             num_hashes = hashes.len(),
             num_dst = dst.len()
         );
@@ -1234,10 +1389,13 @@ impl Session for VeloSession {
                 num_hashes = hashes.len(),
                 peer_instance_id = %peer_instance_id
             );
-            session.enqueue_frame(Frame::Pull {
+            if let Err(error) = session.enqueue_frame(Frame::Pull {
                 pull_id,
                 hashes: hashes.clone(),
-            })?;
+            }) {
+                session.inner.pending_pulls.remove(&pull_id);
+                return Err(error).context("enqueue Pull");
+            }
             match rx.await {
                 Ok(Ok(())) => {}
                 // Abort path resolved the pull (`close()` / monitor terminal).
@@ -1283,32 +1441,44 @@ impl Session for VeloSession {
             // (event, role, request_id) signature is unchanged, so the disagg
             // audit-equiv diff (bin/audit_diff.rs) is unaffected.
             let rdma_t0 = std::time::Instant::now();
-            session
+            let rdma_result = session
                 .inner
                 .leader
-                .rdma_pull_with_opts(peer_instance_id, refs, WirePullOptions::default())
+                .rdma_pull_resource_with_opts(
+                    resource,
+                    peer_instance_id,
+                    refs,
+                    WirePullOptions::default(),
+                )
                 .await
-                .context("rdma_pull_with_opts")?;
+                .context("rdma_pull_with_opts");
             let rdma_elapsed_us = rdma_t0.elapsed().as_micros() as u64;
-            crate::engine_audit!(
-                "session_pull_rdma_done",
-                session_id = %session.inner.session_id,
-                pull_id,
-                num_blocks = dst_block_ids.len(),
-                elapsed_us = rdma_elapsed_us
-            );
+            if rdma_result.is_ok() {
+                crate::engine_audit!(
+                    "session_pull_rdma_done",
+                    session_id = %session.inner.session_id,
+                    pull_id,
+                    num_blocks = dst_block_ids.len(),
+                    elapsed_us = rdma_elapsed_us
+                );
+            }
 
-            // Enqueue PullAck — sender task forwards in order
-            // after any earlier outbound frames.
-            session
+            // PullAck means the physical read is terminal, not necessarily
+            // successful. Always enqueue it after the RDMA future settles so
+            // the holder can safely release source pins on either outcome.
+            let ack_result = session
                 .enqueue_frame(Frame::PullAck { pull_id })
-                .context("enqueue PullAck")?;
-            crate::engine_audit!(
-                "session_pull_ack_sent",
-                session_id = %session.inner.session_id,
-                pull_id
-            );
+                .context("enqueue PullAck");
+            if ack_result.is_ok() {
+                crate::engine_audit!(
+                    "session_pull_ack_sent",
+                    session_id = %session.inner.session_id,
+                    pull_id
+                );
+            }
 
+            rdma_result?;
+            ack_result?;
             Ok(dst)
         })
     }
@@ -1390,18 +1560,36 @@ impl Session for VeloSession {
             session_id = %self.inner.session_id,
             reason = ?reason
         );
+        // Admission barrier shared with `Frame::Pull`: publish closed before
+        // any teardown so no authorization can race behind the in-flight
+        // decision below.
+        let first_close = {
+            let mut closed = self.inner.closed.lock();
+            let first = !*closed;
+            *closed = true;
+            first
+        };
+        if first_close {
+            let attach_failure = reason
+                .as_deref()
+                .map_or_else(|| "session closed".to_owned(), |reason| reason.to_owned());
+            self.inner
+                .attach_state
+                .send_replace(AttachState::Failed(attach_failure));
+            self.inner.close_token.cancel();
+            // A never-attached holder's sender is waiting on this oneshot and
+            // cannot observe the queued Finalize command. Dropping the install
+            // half wakes it; Frame::Attach takes the same mutex, so either
+            // attach wins fully or close prevents installation.
+            drop(self.inner.outbound_install_tx.lock().take());
+        }
         // Captured before `reason` is consumed by the lifecycle push below; used
         // to fail any parked pulls at the end of the abort.
         let reason_for_drain = reason.clone();
-        // Abort path: emit terminators (if not already), then
-        // enqueue the wire-level Finalize unconditionally. The
-        // sender task drains the queue and calls velo's
-        // `StreamSender::finalize`, which sends the `Finalized`
-        // sentinel; the peer's monitor surfaces
-        // `LifecycleEvent::Detached`. No protocol-level Detach
-        // frame — velo's wire-level finalize is the teardown
-        // signal. No Frame::Finished either — close() bypasses
-        // the cooperative rendezvous.
+        // Abort path: emit terminators, but defer wire finalization while an
+        // authorized pull is unacked. That keeps the channel available for
+        // PullAck and, more importantly, retains source pins until physical
+        // terminal. No Frame::Finished is sent on this path.
         let need_commits_closed = {
             let mut flag = self.inner.commits_closed.lock();
             let was_open = !*flag;
@@ -1420,49 +1608,25 @@ impl Session for VeloSession {
         if need_drained {
             let _ = self.enqueue_frame(Frame::Drained);
         }
-        if let Some(reason) = reason {
+        if first_close && let Some(reason) = reason {
             self.inner.lifecycle_stream.push(LifecycleEvent::Detached {
                 reason: Some(reason),
             });
         }
-        // Force the wire finalize even if rendezvous hasn't
-        // completed. Idempotent against the cooperative path.
-        let already_enqueued = {
-            let mut enqueued = self.inner.finalize_enqueued.lock();
-            let was = *enqueued;
-            *enqueued = true;
-            was
-        };
-        if !already_enqueued {
-            let _ = self.enqueue_finalize();
+        // With no authorized DMA, pins are safe to release immediately. If a
+        // pull is present, keep every holder pin quarantined; the PullAck arm
+        // releases per-hash pins and completes deferred finalization after the
+        // last authorization drains.
+        if self.inner.inbound_pulls.is_empty() {
+            self.inner.available_pins.lock().clear();
+            self.enqueue_finalize_once();
+        } else {
+            tracing::warn!(
+                session_id = %self.inner.session_id,
+                inflight_pulls = self.inner.inbound_pulls.len(),
+                "session close deferred source-pin release until PullAck"
+            );
         }
-        *self.inner.closed.lock() = true;
-        // Drain holder-side pins.  In the cooperative path
-        // (`finalize()`), pins are held until the peer's `PullAck`
-        // arrives — finalize() never reaches here.  `close()` is the
-        // abort path: the wire is being torn down, no further
-        // `PullAck` can ever arrive (peer's monitor surfaces
-        // `Detached` once the `Finalized` sentinel lands), and the
-        // session's per-request scheduling has already concluded
-        // before this point — so any in-flight peer pull has either
-        // settled (and PullAck'd, draining naturally) or has already
-        // errored out with the session's failure reason.
-        //
-        // Dropping the maps here releases the strong refs on the
-        // pinned `ImmutableBlock<G2>`s that `make_available`
-        // installed but never saw a `PullAck` for; without this
-        // they leak past `session_inner_dropped` only because
-        // long-lived sender/monitor task refs keep the inner alive,
-        // which in turn keeps the pin maps populated and the
-        // underlying G2 blocks active — surfacing as
-        // `BlockPoolError::ResetError` ("total blocks: N, available
-        // blocks: N - leaked") on test teardown.
-        //
-        // `inbound_pulls` matches the same shape (peer-authorized
-        // pull frames awaiting a `PullAck` that will never arrive),
-        // so drain it alongside.
-        self.inner.available_pins.lock().clear();
-        self.inner.inbound_pulls.clear();
         // Fail any puller pull still parked on its `PullComplete` oneshot: the
         // wire is being torn down (CD evict/decline on the holder, or our own
         // abort), so no `PullComplete` can ever arrive. Resolving each parked
@@ -1884,6 +2048,19 @@ mod tests {
                 Some(LifecycleEvent::Detached { .. })
             ));
         });
+    }
+
+    #[test]
+    fn sender_drop_maps_to_detached_lifecycle() {
+        let event = lifecycle_event_for_stream_error(&velo::StreamError::SenderDropped);
+        assert!(matches!(event, LifecycleEvent::Detached { .. }));
+    }
+
+    #[test]
+    fn other_stream_errors_map_to_failed_lifecycle() {
+        let error = velo::StreamError::TransportError("test transport error".to_string());
+        let event = lifecycle_event_for_stream_error(&error);
+        assert!(matches!(event, LifecycleEvent::Failed { .. }));
     }
 
     // Targeted unit test of the pull-drain helper used by `close()` and the

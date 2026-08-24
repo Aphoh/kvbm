@@ -29,7 +29,7 @@ use futures::StreamExt;
 use kvbm_engine::G2;
 use kvbm_engine::leader::InstanceLeader;
 use kvbm_engine::p2p::session::{
-    AvailabilityDelta, CommitDelta, Frame, LifecycleEvent, Session, SessionFactory,
+    AvailabilityDelta, CommitDelta, Frame, LifecycleEvent, Session, SessionFactory, SessionManager,
     VeloSessionFactory,
 };
 use kvbm_engine::testing::managers::{TestManagerBuilder, TestRegistryBuilder};
@@ -430,11 +430,19 @@ async fn pull_ack_drops_holder_pins() -> Result<()> {
         pull_id,
         hashes: hashes.clone(),
     });
+    assert!(
+        h_session.has_inflight_pulls(),
+        "watchdog predicate must cover the authorized pull before PullAck"
+    );
 
     // Forge inbound Frame::PullAck — this is what plan §5
     // promises drops the pins. Assert the pin-release
     // invariant directly.
     h_session.test_inject_inbound_frame(Frame::PullAck { pull_id });
+    assert!(
+        !h_session.has_inflight_pulls(),
+        "PullAck must clear the watchdog retention predicate"
+    );
 
     assert_eq!(
         h_session.test_available_pin_count(),
@@ -442,6 +450,87 @@ async fn pull_ack_drops_holder_pins() -> Result<()> {
         "PullAck must drop holder pins for the acked pull_id"
     );
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn overlapping_pull_ids_hold_a_shared_hash_until_the_last_ack() -> Result<()> {
+    let h = build_side().await;
+    let h_session = h.factory.open_concrete(uuid::Uuid::new_v4())?;
+    let blocks = make_blocks(&h.g2_manager, 1, 250);
+    let hash = blocks[0].sequence_hash();
+    h_session.commit(vec![hash])?;
+    h_session.make_available(blocks)?;
+
+    h_session.test_inject_inbound_frame(Frame::Pull {
+        pull_id: 1,
+        hashes: vec![hash],
+    });
+    h_session.test_inject_inbound_frame(Frame::Pull {
+        pull_id: 2,
+        hashes: vec![hash],
+    });
+    h_session.test_inject_inbound_frame(Frame::PullAck { pull_id: 1 });
+    assert_eq!(h_session.test_inbound_pulls_count(), 1);
+    assert_eq!(
+        h_session.test_available_pin_count(),
+        1,
+        "first Ack must not recycle a source still read by another pull_id"
+    );
+
+    h_session.test_inject_inbound_frame(Frame::PullAck { pull_id: 2 });
+    assert_eq!(h_session.test_inbound_pulls_count(), 0);
+    assert_eq!(h_session.test_available_pin_count(), 0);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_rdma_terminal_still_acks_and_releases_holder_pin() -> Result<()> {
+    let (h, p) = paired_sides().await;
+    let session_id = uuid::Uuid::new_v4();
+    let h_session = h.factory.open_concrete(session_id)?;
+    let h_endpoint = h_session.endpoint().expect("holder endpoint");
+    let p_session = p
+        .factory
+        .attach(session_id, h.velo.instance_id(), h_endpoint)
+        .await?;
+
+    let blocks = make_blocks(&h.g2_manager, 1, 275);
+    let hash = blocks[0].sequence_hash();
+    h_session.commit(vec![hash])?;
+    h_session.make_available(blocks)?;
+    h_session.finish_commits()?;
+    h_session.finish_availability()?;
+    let mut availability = p_session.availability();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !p_session
+            .peer_available()
+            .as_slice()
+            .iter()
+            .any(|block| block.hash == hash)
+        {
+            let _ = availability.next().await;
+        }
+    })
+    .await?;
+
+    let destination = p.g2_manager.allocate_blocks(1).expect("destination");
+    p_session
+        .pull(vec![hash], destination)
+        .await
+        .expect_err("worker-less pull must fail at the RDMA dispatch boundary");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while h_session.test_inbound_pulls_count() != 0 || h_session.test_available_pin_count() != 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    assert_eq!(
+        h_session.test_available_pin_count(),
+        0,
+        "physical failure is terminal and must release the source pin via PullAck"
+    );
     Ok(())
 }
 
@@ -627,28 +716,39 @@ async fn sync_methods_callable_from_non_tokio_thread() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn watchdog_reclaims_a_never_attached_concrete_session() -> Result<()> {
+    let side = build_side().await;
+    let manager = SessionManager::new(tokio::runtime::Handle::current(), Duration::from_millis(20));
+    let session = side.factory.open(uuid::Uuid::new_v4())?;
+    assert_eq!(side.factory.active_session_count(), 1);
+    manager.register(session);
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !manager.is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while side.factory.active_session_count() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    Ok(())
+}
+
 // ============================================================================
-// Case: close() drains holder pins that never received PullAck
+// Case: close() quarantines holder pins until PullAck
 // ============================================================================
 //
-// Regression for the prefill-side `Reset pool count mismatch: expected N,
-// got N-3` observed in the disagg two-request smoke (R1 cold,
-// `kv_load_failure_policy=recompute`).  When a peer pull errors before
-// emitting `Frame::PullAck`, holder pins inserted by `make_available`
-// stay live in `available_pins` indefinitely — the pin map is only
-// drained on `PullAck`.  The pinned `ImmutableBlock<G2>` strong refs
-// keep the underlying G2 blocks active, so `ManagedBlockPool::reset()`
-// fails with `total blocks: N, available blocks: N - leaked`.
-//
-// Fix: `close()` is the abort path and runs only after per-request
-// scheduling has concluded, so any in-flight peer pull has already
-// settled.  Drain `available_pins` (and the parallel `inbound_pulls`
-// authorize-but-no-PullAck map) so the strong refs drop synchronously
-// with `close()`.  `finalize()` is unchanged — the cooperative path
-// must hold pins until the peer's `PullAck` lands.
+// Logical close is not transport cancellation. Once PullComplete authorizes
+// an RDMA read, source pins remain quarantined until PullAck. Close atomically
+// rejects later Pull frames and defers finalization until that drain.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn close_drains_unacked_holder_pins() -> Result<()> {
+async fn close_quarantines_unacked_holder_pins_and_rejects_new_pulls() -> Result<()> {
     let h = build_side().await;
     let session_id = uuid::Uuid::new_v4();
     let h_session = h.factory.open_concrete(session_id)?;
@@ -680,64 +780,98 @@ async fn close_drains_unacked_holder_pins() -> Result<()> {
         "Frame::Pull alone must not drop pins"
     );
 
-    // Abort path.  After close() the wire is being torn down, no
-    // PullAck can ever arrive — pins are dead weight, must be
-    // released so the underlying G2 blocks can be reset.
+    // Close rejects new authorizations but cannot release source pins while
+    // the already-authorized DMA may still read them.
     h_session.close(Some("simulated peer abort".to_string()));
     assert_eq!(
         h_session.test_available_pin_count(),
+        3,
+        "close must quarantine source pins until physical terminal"
+    );
+    assert_eq!(h_session.test_inbound_pulls_count(), 1);
+
+    h_session.test_inject_inbound_frame(Frame::Pull {
+        pull_id: pull_id + 1,
+        hashes: vec![hashes[1]],
+    });
+    assert_eq!(
+        h_session.test_inbound_pulls_count(),
+        1,
+        "a pull racing behind close must not receive authorization"
+    );
+
+    h_session.test_inject_inbound_frame(Frame::PullAck { pull_id });
+    assert_eq!(h_session.test_inbound_pulls_count(), 0);
+    assert_eq!(
+        h_session.test_available_pin_count(),
         0,
-        "close() must drain `available_pins`; otherwise the strong \
-         refs keep the underlying G2 blocks active and \
-         ManagedBlockPool::reset() returns ResetError"
+        "the last PullAck releases the close quarantine"
     );
 
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn close_racing_pull_admission_never_releases_an_authorized_source_pin() -> Result<()> {
+    let h = build_side().await;
+    for iteration in 0..32_u64 {
+        let h_session = h.factory.open_concrete(uuid::Uuid::new_v4())?;
+        let blocks = make_blocks(&h.g2_manager, 1, 2_000 + iteration as u32);
+        let hash = blocks[0].sequence_hash();
+        h_session.commit(vec![hash])?;
+        h_session.make_available(blocks)?;
+
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let close_session = Arc::clone(&h_session);
+        let close_start = Arc::clone(&start);
+        let close = tokio::task::spawn_blocking(move || {
+            close_start.wait();
+            close_session.close(Some("racing close".to_owned()));
+        });
+        let pull_session = Arc::clone(&h_session);
+        let pull_start = Arc::clone(&start);
+        let pull_id = iteration + 1;
+        let pull = tokio::task::spawn_blocking(move || {
+            pull_start.wait();
+            pull_session.test_inject_inbound_frame(Frame::Pull {
+                pull_id,
+                hashes: vec![hash],
+            });
+        });
+        close.await?;
+        pull.await?;
+
+        match h_session.test_inbound_pulls_count() {
+            0 => assert_eq!(
+                h_session.test_available_pin_count(),
+                0,
+                "close won admission and may release the un-authorized pin"
+            ),
+            1 => {
+                assert_eq!(
+                    h_session.test_available_pin_count(),
+                    1,
+                    "an authorized pull must keep its source pin quarantined"
+                );
+                h_session.test_inject_inbound_frame(Frame::PullAck { pull_id });
+                assert_eq!(h_session.test_available_pin_count(), 0);
+            }
+            count => panic!("one racing Pull created {count} authorizations"),
+        }
+    }
+    Ok(())
+}
+
 // ============================================================================
-// Case: close() drains BOTH available_pins AND inbound_pulls, releasing the
-//       underlying G2 blocks so the prefill pool reset succeeds
+// Case: close() releases its quarantine only after every PullAck
 // ============================================================================
 //
-// Targeted regression for the `VeloSession::close()` drain fix
-// (3a7b775fa4) — distinct from `close_drains_unacked_holder_pins`,
-// which only asserts `test_available_pin_count() == 0` after
-// `close()`.  This test pins the invariant on three independent
-// observable axes so a future refactor that deletes either drain
-// line is caught:
-//
-//   1. `available_pins` is empty after `close()`.  This is the map
-//      that holds `ImmutableBlock<G2>` strong refs; deleting
-//      `available_pins.lock().clear();` re-introduces the original
-//      "Reset pool count mismatch" failure.
-//
-//   2. `inbound_pulls` is empty after `close()`.  This map holds
-//      `Vec<SequenceHash>` (just `u128` hash values — not strong
-//      refs), so deleting `inbound_pulls.clear();` does NOT directly
-//      leak G2 blocks.  But the `Frame::Pull`/`Frame::PullAck`
-//      protocol contract requires the two maps to drain in lockstep
-//      (PullAck removes the inbound_pulls entry AND the matched
-//      available_pins entries — see `dispatch_frame` Frame::PullAck
-//      arm).  An asymmetric drain at `close()` leaves the session
-//      with stale authorize-but-unacked tracking that any future
-//      change to add a strong-ref-bearing field to `inbound_pulls`
-//      (e.g. for backpressure) would silently leak.  The new
-//      `test_inbound_pulls_count` accessor mirrors
-//      `test_available_pin_count` so this axis is checkable today.
-//
-//   3. The G2 `BlockManager`'s `available_blocks()` returns to
-//      `total_blocks()` after `close()` and the locally-held
-//      `ImmutableBlock` handles drop, and `reset_inactive_pool()`
-//      succeeds.  This is the production-side end-state — same
-//      shape as `ManagedBlockPool::reset`'s `ResetError("total
-//      blocks: N, available blocks: N - leaked")`.  This is the
-//      assertion that would have caught the original bug at
-//      integration scope.  It fires when `available_pins.clear()`
-//      is missing (the strong-ref-bearing drain).
+// Two independent authorizations keep all three source blocks unavailable
+// after close. Each Ack releases its own hashes; only the final Ack completes
+// deferred teardown and restores the pool to its resettable state.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn close_drains_inbound_pulls_and_releases_pool_blocks() -> Result<()> {
+async fn close_drains_inbound_pulls_only_after_terminal_acks() -> Result<()> {
     let h = build_side().await;
     let session_id = uuid::Uuid::new_v4();
     let h_session = h.factory.open_concrete(session_id)?;
@@ -795,25 +929,26 @@ async fn close_drains_inbound_pulls_and_releases_pool_blocks() -> Result<()> {
         "Frame::Pull alone must not drop available_pins"
     );
 
-    // Abort path.  After close():
-    //   - the wire is being torn down (close enqueues Finalize)
-    //   - no PullAck can ever arrive on either pull_id
-    //   - both maps are dead weight — must be drained so the strong
-    //     refs they hold release back to the pool.
+    // Close is a logical terminal, not proof that physical DMA stopped.
     h_session.close(Some("simulated peer abort".to_string()));
 
     assert_eq!(
         h_session.test_available_pin_count(),
-        0,
-        "close() must drain `available_pins`"
+        3,
+        "close must retain all source pins while pulls are unacked"
     );
     assert_eq!(
         h_session.test_inbound_pulls_count(),
-        0,
-        "close() must drain `inbound_pulls`; otherwise authorized- \
-         but-unacked pull entries keep `Vec<SequenceHash>` mirrors \
-         alive and the corresponding G2 blocks leak past pool reset"
+        2,
+        "close must retain both authorized pulls"
     );
+
+    h_session.test_inject_inbound_frame(Frame::PullAck { pull_id: 11 });
+    assert_eq!(h_session.test_inbound_pulls_count(), 1);
+    assert_eq!(h_session.test_available_pin_count(), 2);
+    h_session.test_inject_inbound_frame(Frame::PullAck { pull_id: 12 });
+    assert_eq!(h_session.test_inbound_pulls_count(), 0);
+    assert_eq!(h_session.test_available_pin_count(), 0);
 
     // Drop the local `hashes` vec — the only remaining strong refs
     // should now be inside the (just-drained) session inner, which

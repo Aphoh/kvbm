@@ -214,6 +214,7 @@ mod tests {
             num_provided_tokens: 0,
             request: KvHashingRequestEnvelope::default(),
             expected_hash_digest: None,
+            bundle: None,
         };
         let req = PrefillDispatchRequest {
             request_id: "r1".to_string(),

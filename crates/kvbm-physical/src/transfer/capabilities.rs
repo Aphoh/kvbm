@@ -21,7 +21,7 @@ use crate::{
         executor::{TransferOptionsInternal, execute_transfer},
     },
 };
-use dynamo_memory::nixl::NixlAgent;
+use kvbm_memory::nixl::NixlAgent;
 
 /// Transfer capability flags controlling which direct paths are enabled.
 ///

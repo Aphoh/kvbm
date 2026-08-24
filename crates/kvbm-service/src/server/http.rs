@@ -17,7 +17,7 @@ use axum::{
     response::{IntoResponse, Json, Response},
     routing::get,
 };
-use dynamo_memory::resources::Resources;
+use kvbm_memory::resources::Resources;
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 

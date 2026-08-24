@@ -100,7 +100,7 @@ ungraceful-detach contract.
 
 Delivered:
 
-- **Topology discovery (`dynamo-memory`)**
+- **Topology discovery (`kvbm-memory`)**
   - `NumaNodeRole` ∈ {`HostCpu`, `GpuMemory`, `Reserved`} on every
     `NumaNodeView`; `Resources::host_memory_nodes()` returns only
     `HostCpu` — the pool's allocation targets.
@@ -115,13 +115,13 @@ Delivered:
     pool view` summary and a collapsed `CPU-less nodes [N-M]` line for
     Grace/GB200's long-tail MIG slots.
 
-- **Hugepage discovery (`dynamo-memory::hugepage`)**
+- **Hugepage discovery (`kvbm-memory::hugepage`)**
   - System-wide and per-node pool stats from
     `/proc/meminfo`, `/sys/kernel/mm/hugepages/`, and per-node sysfs.
   - THP mode from `/sys/kernel/mm/transparent_hugepage/enabled`.
   - Folded into `Resources::Display`.
 
-- **Allocator (`dynamo-memory::mmap_pinned`)**
+- **Allocator (`kvbm-memory::mmap_pinned`)**
   - `MmappedPinnedStorage`: `mmap(MAP_PRIVATE|MAP_ANON [|MAP_HUGETLB
     |MAP_HUGE_<size>])` → `mbind(MPOL_BIND, MPOL_MF_STRICT)` →
     parallel first-touch → `cuMemHostRegister(DEVICEMAP)`.
@@ -188,7 +188,7 @@ Delivered:
   observability cheatsheet, troubleshooting.
 
 **Test coverage**
-- 179 `dynamo-memory` lib tests (hugepage parsing, role
+- 179 `kvbm-memory` lib tests (hugepage parsing, role
   classification, cgroup reader, `mmap_pinned` tier decisions, etc.).
 - 86 `kvbm-service` lib tests (29 pool-specific: sizing, cgroup
   filtering/capping, backend resolution policy, lease semantics,
@@ -236,7 +236,7 @@ Sketch of what M2 brings (subject to revision when planning starts):
 
 ## Module map
 
-**Modified in `dynamo-memory` (`lib/memory/`):**
+**Modified in `kvbm-memory` (`lib/memory/`):**
 - `src/lib.rs` — register new modules, export new types
 - `src/resources/mod.rs` — `NumaNodeRole`, `total_bytes`,
   `host_memory_nodes`, `total_host_memory_bytes`,
@@ -245,7 +245,7 @@ Sketch of what M2 brings (subject to revision when planning starts):
 - `src/numa/worker_pool.rs` — `allocate_mmap_pinned_on_node`
 - `bin/inspect_resources.rs` — surfaces all of the above
 
-**New in `dynamo-memory`:**
+**New in `kvbm-memory`:**
 - `src/hugepage.rs` — read-only sysfs discovery
 - `src/mmap_pinned.rs` — `MmappedPinnedStorage`, `HugepageMode`,
   `HugepageTier`, `MmappedPinnedOptions`

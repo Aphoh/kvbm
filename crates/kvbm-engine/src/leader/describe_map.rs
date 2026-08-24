@@ -13,9 +13,9 @@
 //! Skipped Tier 3 follow-ups (see plan): `engine` tag, `build` info,
 //! `endpoints`, NIXL/GPU UUID summary.
 
-use dynamo_memory::StorageKind;
 use kvbm_common::{KvDim, LogicalLayoutHandle};
 use kvbm_config::DisaggregationRole;
+use kvbm_memory::StorageKind;
 use kvbm_physical::layout::LayoutConfig;
 use kvbm_physical::manager::ParallelismDescriptor;
 use kvbm_protocols::control::{

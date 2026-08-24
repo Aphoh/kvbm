@@ -74,7 +74,7 @@ for n in /sys/devices/system/node/node*/hugepages/hugepages-2048kB/nr_hugepages;
 done
 ```
 
-The same data flows into `inspect_resources` (`cargo run -p dynamo-memory
+The same data flows into `inspect_resources` (`cargo run -p kvbm-memory
 --bin inspect_resources`) and into the service's `/v1/pool` snapshot at
 runtime.
 

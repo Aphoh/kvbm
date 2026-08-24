@@ -7,5 +7,8 @@
 #[doc = include_str!("../../docs/offload.md")]
 pub mod offload;
 
+/// Resource-class policy and bundle-dependency invalidation.
+pub mod policy;
+
 /// Engine-side support for the KVBM connector (search reconcile core).
 pub(crate) mod engine;

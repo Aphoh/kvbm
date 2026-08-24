@@ -63,7 +63,7 @@ mod tests {
 
     fn make_serialized_layout() -> LayoutDescriptor {
         use crate::layout::{BlockFormat, FullyContiguousDetails, LayoutTypeDetails};
-        use dynamo_memory::{MemoryRegion, StorageKind, nixl};
+        use kvbm_memory::{MemoryRegion, StorageKind, nixl};
 
         let config = LayoutConfig::builder()
             .num_blocks(2)

@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Optional
 import kvbm
 import torch
 from kvbm.vllm import KvbmVllmConfig
+from kvbm.vllm.manifest import CacheManifest, build_resource_tensor_plans
 from kvbm.vllm.dim_probe import (
     KvBlockLayout,
     KvDim,
@@ -105,6 +106,10 @@ class KvbmConnectorWorker:
         self.kvbm_config = kvbm_config
         self.vllm_kv_cache_config = kv_cache_config
         self.kvbm_override_config = kwargs.get("kvbm_override_config", None)
+        manifest_json = kwargs.get("cache_manifest_json")
+        self.cache_manifest: CacheManifest | None = (
+            CacheManifest.from_json(manifest_json) if manifest_json else None
+        )
         self.device_id = None
 
         # Events
@@ -118,6 +123,8 @@ class KvbmConnectorWorker:
 
         # Create the Rust ConnectorWorker that handles NIXL registration
         self.worker = ConnectorWorker(self.runtime)
+        if self.cache_manifest is not None:
+            self.worker.register_manifest(self.cache_manifest.to_json())
 
         # Store peer info for handshake
         instance_id, worker_addr = self.runtime.peer_info()
@@ -183,12 +190,16 @@ class KvbmConnectorWorker:
             print("Warning: register_kv_caches called with empty kv_caches")
             return
 
+        if self.cache_manifest is not None:
+            self._register_manifest_resources(kv_caches)
+            return
+
         kct_list = self.vllm_kv_cache_config.kv_cache_tensors
         groups = self.vllm_kv_cache_config.kv_cache_groups
         if len(groups) != 1:
             raise NotImplementedError(
-                f"hybrid kv_cache_groups not supported (found {len(groups)} "
-                f"groups); KVBM currently assumes a single uniform group"
+                f"hybrid kv_cache_groups require cache_manifest configuration "
+                f"(found {len(groups)} groups)"
             )
         if len(self._attn_backends) != 1:
             raise NotImplementedError(
@@ -297,6 +308,71 @@ class KvbmConnectorWorker:
         )
         print("[KVBM] Waiting for leader to trigger initialization...")
 
+    def _register_manifest_resources(
+        self, kv_caches: dict[str, torch.Tensor]
+    ) -> None:
+        """Register each heterogeneous vLLM group under its manifest resource."""
+
+        def resolve_backend(layer_names: list[str]) -> type:
+            backends = get_current_attn_backends(self.vllm_config, layer_names)
+            if len(backends) != 1:
+                raise ValueError(
+                    f"vLLM cache group {layer_names} resolves to "
+                    f"{len(backends)} attention backends; expected exactly one"
+                )
+            return backends[0]
+
+        assert self.cache_manifest is not None
+        plans = build_resource_tensor_plans(
+            self.cache_manifest,
+            self.vllm_kv_cache_config,
+            kv_caches,
+            resolve_backend,
+        )
+        cache_dtype_str = self.vllm_config.cache_config.cache_dtype
+        dtype_width_bytes = self.kvbm_config.cache_dtype_bytes()
+        total_tensors = 0
+
+        for plan in plans:
+            tensors = list(plan.tensors)
+            first_shape = tuple(tensors[0].shape)
+            if any(tuple(tensor.shape) != first_shape for tensor in tensors[1:]):
+                raise ValueError(
+                    f"manifest resource {plan.resource} contains divergent tensor shapes"
+                )
+            dims, sizes = build_dim_layout_from_tensor(
+                plan.backend,
+                tensor_shape=first_shape,
+                cache_dtype_str=cache_dtype_str,
+                use_mla=plan.use_mla,
+            )
+            expected_numel = math.prod(sizes)
+            if any(tensor.numel() != expected_numel for tensor in tensors):
+                raise ValueError(
+                    f"manifest resource {plan.resource} tensor size disagrees with its layout"
+                )
+            block_layout = derive_block_layout(plan.backend, dims)
+            block_index = dims.index(KvDim.Block)
+            self.worker.register_resource_tensors(
+                plan.resource,
+                plan.primary,
+                tensors,
+                sizes[block_index],
+                dtype_width_bytes,
+                [dim.value for dim in dims],
+                list(sizes),
+                block_layout.value,
+            )
+            total_tensors += len(tensors)
+
+        self._num_layers = total_tensors
+        self._num_device_blocks = self.vllm_kv_cache_config.num_blocks
+        self._last_layer_name = (
+            self.vllm_kv_cache_config.kv_cache_tensors[-1].shared_by[0]
+            if self.vllm_kv_cache_config.kv_cache_tensors
+            else None
+        )
+
     def register_cross_layers_kv_cache(
         self,
         kv_cache: torch.Tensor,
@@ -336,9 +412,8 @@ class KvbmConnectorWorker:
         groups = self.vllm_kv_cache_config.kv_cache_groups
         if len(groups) != 1:
             raise NotImplementedError(
-                f"hybrid kv_cache_groups not supported in cross-layer "
-                f"registration (found {len(groups)} groups); KVBM "
-                f"currently assumes a single uniform group"
+                f"hybrid kv_cache_groups require manifest-aware per-layer "
+                f"registration (found {len(groups)} groups)"
             )
         if len(self._attn_backends) != 1:
             raise NotImplementedError(

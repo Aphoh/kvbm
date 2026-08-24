@@ -48,6 +48,7 @@ pub use service::{VeloWorkerService, VeloWorkerServiceBuilder};
 /// `service.rs`, and use the const at the call site in `client.rs`.
 pub(crate) mod handler_names {
     pub const LOCAL_TRANSFER: &str = "kvbm.worker.local_transfer";
+    pub const ABORT_LOCAL_COLLECTIVES: &str = "kvbm.worker.abort_local_collectives";
     pub const REMOTE_ONBOARD: &str = "kvbm.worker.remote_onboard";
     pub const REMOTE_OFFLOAD: &str = "kvbm.worker.remote_offload";
     pub const IMPORT_METADATA: &str = "kvbm.worker.import_metadata";
@@ -60,6 +61,7 @@ pub(crate) mod handler_names {
     /// `crate::leader::dispatch::WorkerPullPlan` whose `shards` list
     /// drives one or more sliced reads from rank-aware remote handles.
     pub const REMOTE_PULL_PLAN: &str = "kvbm.worker.remote_pull_plan";
+    pub const HOST_PAYLOAD_DIGESTS: &str = "kvbm.worker.host_payload_digests";
     pub const OBJECT_HAS_BLOCKS: &str = "kvbm.worker.object_has_blocks";
     pub const OBJECT_PUT_BLOCKS: &str = "kvbm.worker.object_put_blocks";
     pub const OBJECT_GET_BLOCKS: &str = "kvbm.worker.object_get_blocks";
@@ -144,11 +146,62 @@ impl From<TransferOptions> for SerializableTransferOptions {
 // Message types for remote worker operations
 #[derive(Serialize, Deserialize)]
 struct LocalTransferMessage {
+    #[serde(default)]
+    resource: Option<kvbm_common::LogicalResourceId>,
     src: LogicalLayoutHandle,
     dst: LogicalLayoutHandle,
     src_block_ids: Vec<BlockId>,
     dst_block_ids: Vec<BlockId>,
     options: SerializableTransferOptions,
+}
+
+#[derive(Serialize, Deserialize)]
+struct AbortLocalCollectivesMessage {
+    reason: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct HostPayloadDigestsMessage {
+    resource: LogicalResourceId,
+    block_ids: Vec<BlockId>,
+}
+
+#[cfg(test)]
+mod local_transfer_message_tests {
+    use super::*;
+    use kvbm_common::LogicalResourceId;
+
+    fn message(resource: LogicalResourceId) -> LocalTransferMessage {
+        LocalTransferMessage {
+            resource: Some(resource),
+            src: LogicalLayoutHandle::G1,
+            dst: LogicalLayoutHandle::G2,
+            src_block_ids: vec![1],
+            dst_block_ids: vec![2],
+            options: SerializableTransferOptions {
+                layer_range: None,
+                nixl_write_notification: None,
+                bounce_buffer_handle: None,
+                bounce_buffer_block_ids: None,
+                metric_route: None,
+            },
+        }
+    }
+
+    #[test]
+    fn local_transfer_message_round_trips_resource() {
+        let encoded = serde_json::to_vec(&message(LogicalResourceId(7))).unwrap();
+        let decoded: LocalTransferMessage = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.resource, Some(LogicalResourceId(7)));
+    }
+
+    #[test]
+    fn legacy_local_transfer_message_omits_resource_routing() {
+        let mut encoded = serde_json::to_value(message(LogicalResourceId(7))).unwrap();
+        encoded.as_object_mut().unwrap().remove("resource");
+        let decoded: LocalTransferMessage = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.resource, None);
+    }
 }
 
 #[derive(Serialize, Deserialize)]

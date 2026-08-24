@@ -56,10 +56,10 @@ pub fn seed_leader_builder_with_hub_discovery(
 }
 
 // Re-exports for bindings — memory/tensor types (already in public API via ConnectorWorkerInterface)
-pub use dynamo_memory::{MemoryDescriptor, StorageKind, TensorDescriptor};
+pub use kvbm_memory::{MemoryDescriptor, StorageKind, TensorDescriptor};
 pub mod memory {
-    //! Re-exports from `dynamo-memory` for bindings convenience.
-    pub use dynamo_memory::nixl;
+    //! Re-exports from `kvbm-memory` for bindings convenience.
+    pub use kvbm_memory::nixl;
 }
 
 #[cfg(feature = "testing")]

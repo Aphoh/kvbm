@@ -18,6 +18,7 @@ KvbmSchedulerOutput: TypeAlias = SchedulerOutput
 def process_scheduler_output(
     iteration: int,
     scheduler_output: "VllmSchedulerOutput",
+    group_resources: tuple[int, ...] | None = None,
 ) -> KvbmSchedulerOutput:
     """
     Convert vLLM's SchedulerOutput to KVBM's SchedulerOutput format.
@@ -33,18 +34,14 @@ def process_scheduler_output(
         KVBM SchedulerOutput object ready for connector metadata building
     """
     output = KvbmSchedulerOutput(iteration)
+    if group_resources is not None:
+        output.set_group_resources(list(group_resources))
 
     # Process new requests
     for req in scheduler_output.scheduled_new_reqs:
         prompt_ids = [int(token) for token in req.prompt_token_ids]
-        # Extract block IDs from the first (and typically only) sequence
-        # - todo: add support for hybrid kv caching which will have an outer tuple > 1
-        block_ids = (
-            [int(block_id) for block_id in req.block_ids[0]]
-            if req.block_ids and len(req.block_ids) > 0
-            else []
-        )
-        output.add_new_request(
+        block_ids = [[int(block_id) for block_id in group] for group in req.block_ids]
+        output.add_new_request_all_groups(
             req.req_id,
             prompt_token_ids=prompt_ids,
             block_ids=block_ids,
@@ -86,14 +83,13 @@ def process_scheduler_output(
                 if all_token_ids is not None:
                     all_token_ids = [int(token) for token in all_token_ids]
 
-            # Extract block IDs from the first sequence
             block_ids = (
-                [int(block_id) for block_id in new_block_ids[0]]
-                if new_block_ids is not None and len(new_block_ids) > 0
+                [[int(block_id) for block_id in group] for group in new_block_ids]
+                if new_block_ids is not None
                 else []
             )
 
-            output.add_cached_request(
+            output.add_cached_request_all_groups(
                 req_id,
                 resumed,
                 [],  # new_token_ids always empty - tokens handled by update_slot()

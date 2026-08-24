@@ -81,6 +81,7 @@ reqwest = { workspace = true }
 # either way.
 default = ["kvbmctl"]
 kvbmctl = []
+test-support = []
 
 # The `kvbm_hub` server binary is auto-discovered and needs no features.
 # `kvbmctl` is gated so a default build never pulls `kvbm-config`/CUDA; build it
@@ -97,4 +98,7 @@ velo-transports    = { version = "0.1.0" }
 # Used by the indexer find_blocks integration test to build real PLHs and seed
 # the index, the same way the in-crate index unit tests do.
 kvbm-logical       = { workspace = true }
+# `ServiceExt::oneshot`, so the control/public router split can be asserted by
+# routing a request rather than by reading the code.
+tower              = { workspace = true }
 dynamo-tokens      = { workspace = true }

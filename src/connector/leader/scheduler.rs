@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use kvbm_common::LogicalResourceId;
 use kvbm_connector::BlockId;
 use kvbm_connector::common::SchedulerOutput as RustSchedulerOutput;
 
@@ -49,6 +50,23 @@ impl PySchedulerOutput {
             .add_new_request(req_id, prompt_token_ids, block_ids, num_computed_tokens);
     }
 
+    /// Add a new request while preserving the outer KV-cache group tuple.
+    #[pyo3(signature = (req_id, *, prompt_token_ids, block_ids, num_computed_tokens))]
+    pub fn add_new_request_all_groups(
+        &mut self,
+        req_id: String,
+        prompt_token_ids: Vec<u32>,
+        block_ids: Vec<Vec<BlockId>>,
+        num_computed_tokens: usize,
+    ) {
+        self.inner.add_new_request_all_groups(
+            req_id,
+            prompt_token_ids,
+            block_ids,
+            num_computed_tokens,
+        );
+    }
+
     /// Add a cached request to the scheduler output.
     ///
     /// Args:
@@ -82,6 +100,30 @@ impl PySchedulerOutput {
         );
     }
 
+    /// Add a cached request while preserving the outer KV-cache group tuple.
+    #[pyo3(signature = (req_id, resumed, new_token_ids, *, all_token_ids = None, new_block_ids, num_computed_tokens, num_output_tokens))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_cached_request_all_groups(
+        &mut self,
+        req_id: String,
+        resumed: bool,
+        new_token_ids: Vec<u32>,
+        all_token_ids: Option<Vec<u32>>,
+        new_block_ids: Vec<Vec<BlockId>>,
+        num_computed_tokens: usize,
+        num_output_tokens: usize,
+    ) {
+        self.inner.add_cached_request_all_groups(
+            req_id,
+            resumed,
+            new_token_ids,
+            all_token_ids,
+            new_block_ids,
+            num_computed_tokens,
+            num_output_tokens,
+        );
+    }
+
     /// Set the number of scheduled tokens for each request.
     ///
     /// Args:
@@ -102,6 +144,12 @@ impl PySchedulerOutput {
         self.inner.preempted_req_ids = preempted_req_ids;
     }
 
+    /// Bind each outer vLLM group position to its manifest resource ID.
+    pub fn set_group_resources(&mut self, resources: Vec<u16>) {
+        self.inner
+            .set_group_resources(resources.into_iter().map(LogicalResourceId).collect());
+    }
+
     /// Get the total number of scheduled tokens.
     pub fn get_total_num_scheduled_tokens(&self) -> usize {
         self.inner.total_num_scheduled_tokens()
@@ -118,5 +166,40 @@ impl PySchedulerOutput {
     /// Get a reference to the inner Rust SchedulerOutput.
     pub fn inner(&self) -> RustSchedulerOutput {
         self.inner.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nested_block_id_groups_cross_the_python_wrapper_without_flattening() {
+        let mut output = PySchedulerOutput::new(3);
+        output.add_new_request_all_groups(
+            "new".to_owned(),
+            vec![1, 2],
+            vec![vec![10, 11], vec![20], vec![30, 31]],
+            0,
+        );
+        output.add_cached_request_all_groups(
+            "cached".to_owned(),
+            false,
+            Vec::new(),
+            None,
+            vec![vec![40], vec![50, 51]],
+            2,
+            1,
+        );
+
+        let inner = output.inner();
+        assert_eq!(
+            inner.scheduled_new_reqs[0].block_ids_by_group,
+            vec![vec![10, 11], vec![20], vec![30, 31]]
+        );
+        assert_eq!(
+            inner.scheduled_cached_reqs[0].new_block_ids_by_group,
+            vec![vec![40], vec![50, 51]]
+        );
     }
 }

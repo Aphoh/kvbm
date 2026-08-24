@@ -11,6 +11,7 @@
 
 use futures::future::BoxFuture;
 
+use kvbm_protocols::disagg::BundlePrefillContext;
 use kvbm_protocols::disagg::{SessionEndpoint, SessionId};
 
 /// Engine-side half of a `kvbm_protocols::disagg::RemotePrefillRequest`.
@@ -45,6 +46,9 @@ pub struct PrefillDispatch {
     /// stays on decode, and the prefill side never computes or offloads blocks
     /// beyond the window decode's pull plan covers.
     pub num_window_tokens: usize,
+    /// Manifest-scoped cold-prefill context, absent for the legacy unitary
+    /// session pipeline.
+    pub bundle: Option<BundlePrefillContext>,
 }
 
 /// Decode-side direction of the hub coupling: enqueue a completed remote-prefill
@@ -96,6 +100,7 @@ mod tests {
                 decode_endpoint: None,
                 num_provided_tokens: 3 * 16,
                 num_window_tokens: 5 * 16,
+                bundle: None,
             })
             .await
             .expect("dispatch ok");

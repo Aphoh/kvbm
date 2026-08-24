@@ -157,6 +157,7 @@ impl PrefillPlane for SlotPrefillPlane {
             decode_endpoint,
             num_provided_tokens,
             num_window_tokens,
+            bundle,
         } = req;
 
         let snapshot = self.snapshot_slot(&request_id, num_window_tokens);
@@ -193,6 +194,7 @@ impl PrefillPlane for SlotPrefillPlane {
                 // crosses the CD wire yet.
                 request: KvHashingRequestEnvelope::default(),
                 expected_hash_digest,
+                bundle,
             };
             enqueue.push(request).await
         }
@@ -256,6 +258,7 @@ mod tests {
             }),
             num_provided_tokens,
             num_window_tokens,
+            bundle: None,
         }
     }
 

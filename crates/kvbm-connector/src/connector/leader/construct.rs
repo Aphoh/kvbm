@@ -25,10 +25,14 @@
 //! conditional-disagg transports themselves live in `super::cd`, consumed by
 //! `Leader::initialize_async`.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 
+use kvbm_common::LogicalResourceId;
+use kvbm_config::ParallelismMode;
+use kvbm_engine::leader::parallelism::worker_data_placement;
 use kvbm_engine::leader::{ConsolidatorParams, InstanceLeader};
 use kvbm_engine::object::{ObjectLockManager, create_lock_manager, create_object_client};
 use kvbm_engine::offload::{
@@ -37,10 +41,12 @@ use kvbm_engine::offload::{
 };
 use kvbm_engine::worker::{LeaderLayoutConfig, Worker};
 use kvbm_hub::HubClient;
+use kvbm_logical::BlockManagerSet;
 use kvbm_logical::blocks::{BlockDuplicationPolicy, BlockRegistry};
 use kvbm_logical::events::{EventsManager, KvbmCacheEventsPublisher};
 use kvbm_logical::manager::{BlockManager, FrequencyTrackingCapacity};
 use kvbm_physical::layout::LayoutConfig;
+use kvbm_physical::manager::WorkerDataPlacement;
 
 use crate::connector::leader::hub_handshake::{self, HubHandshake};
 use crate::connector::leader::hub_indexer;
@@ -48,12 +54,29 @@ use crate::{G1, G2, G3, KvbmRuntime};
 
 use super::Construction;
 
+mod resources;
+
+use resources::{
+    ResourcePlan, build_collective_bootstrap, logical_tier_block_count, resolve_parallelism,
+};
+
+fn local_transfer_placements(
+    resource_parallelism: &BTreeMap<LogicalResourceId, ParallelismMode>,
+) -> Vec<(LogicalResourceId, WorkerDataPlacement)> {
+    resource_parallelism
+        .iter()
+        .map(|(&resource, &mode)| (resource, worker_data_placement(mode)))
+        .collect()
+}
+
 /// The leader-side engine stack produced by [`build_engine_stack`]. The caller
 /// (`Leader::initialize`) clones `instance_leader` for the CD wiring before
 /// moving it into the `LeaderEngine` via `build_local_connector_engine`.
 pub(super) struct EngineStack {
     pub(super) instance_leader: Arc<InstanceLeader>,
-    pub(super) offload: Option<Arc<OffloadEngine>>,
+    pub(super) offloads: Vec<(kvbm_common::LogicalResourceId, Arc<OffloadEngine>)>,
+    pub(super) primary_resource: kvbm_common::LogicalResourceId,
+    pub(super) admission: resources::ResourceAdmissionPlan,
     /// Rank-0 reference layout (all workers validated equal); the CD wiring
     /// reuses it for the hub `layout_compat` payload and the parallelism
     /// template.
@@ -170,63 +193,32 @@ pub(super) async fn build_engine_stack(c: &Construction) -> Result<EngineStack> 
         layout_configs.push(config);
     }
 
-    // Step 2: validate all worker configs match the rank-0 reference.
-    let reference_config = layout_configs[0].clone();
-    for (i, config) in layout_configs.iter().enumerate().skip(1) {
-        if config.num_layers != reference_config.num_layers {
-            bail!(
-                "Layout config mismatch: worker {i} has {} layers, worker 0 has {}",
-                config.num_layers,
-                reference_config.num_layers
-            );
-        }
-        if config.outer_dim != reference_config.outer_dim {
-            bail!(
-                "Layout config mismatch: worker {i} has outer_dim {}, worker 0 has {}",
-                config.outer_dim,
-                reference_config.outer_dim
-            );
-        }
-        if config.page_size != reference_config.page_size {
-            bail!(
-                "Layout config mismatch: worker {i} has page_size {}, worker 0 has {}",
-                config.page_size,
-                reference_config.page_size
-            );
-        }
-        if config.inner_dim != reference_config.inner_dim {
-            bail!(
-                "Layout config mismatch: worker {i} has inner_dim {}, worker 0 has {}",
-                config.inner_dim,
-                reference_config.inner_dim
-            );
-        }
-        if config.dtype_width_bytes != reference_config.dtype_width_bytes {
-            bail!(
-                "Layout config mismatch: worker {i} has dtype_width_bytes {}, worker 0 has {}",
-                config.dtype_width_bytes,
-                reference_config.dtype_width_bytes
-            );
-        }
-    }
+    // Step 2: validate worker ABI identity and plan every logical resource.
+    let cache_identity = c.cache_identity.lock().clone();
+    let ResourcePlan {
+        config: reference_resources,
+        primary: primary_resource,
+        primary_layout: reference_config,
+        tiers: resource_tiers,
+        parallelism: resource_parallelism,
+        admission,
+    } = ResourcePlan::build(
+        runtime,
+        &layout_configs,
+        *c.manifest.lock(),
+        cache_identity.as_ref(),
+    )?;
 
     // Step 3: compute G2/G3 block counts + host-bypass sentinel.
-    let bytes_per_block = reference_config.required_bytes() / reference_config.num_blocks;
-    let host_block_count = runtime
-        .config()
-        .cache
-        .host
-        .compute_num_blocks(bytes_per_block);
-    let disk_block_count = runtime
-        .config()
-        .cache
-        .disk
-        .as_ref()
-        .and_then(|dc| dc.compute_num_blocks(bytes_per_block));
+    let primary_tier = resource_tiers
+        .get(&primary_resource)
+        .expect("primary tier capacity");
+    let host_block_count = primary_tier.host_block_count;
+    let disk_block_count = primary_tier.disk_block_count;
 
     // At least one cache tier must produce a non-zero block count, else the
     // leader has nothing to offload to. Fail loudly (mirrors legacy sanity check).
-    let host_ok = host_block_count.is_some_and(|n| n > 0);
+    let host_ok = host_block_count > 0;
     let disk_ok = disk_block_count.is_some_and(|n| n > 0);
     if !host_ok && !disk_ok {
         bail!(
@@ -234,18 +226,34 @@ pub(super) async fn build_engine_stack(c: &Construction) -> Result<EngineStack> 
              (DYN_KVBM_CPU_CACHE_GB for G2, or DYN_KVBM_DISK_CACHE_GB for G3)."
         );
     }
-    let host_block_count = host_block_count.unwrap_or(0);
+    let worker_count = c.workers.lock().connector_clients.len();
+    let parallelism = resolve_parallelism(runtime.config().cache.parallelism, &reference_config);
+    if parallelism != runtime.config().cache.parallelism {
+        tracing::info!(
+            configured = ?runtime.config().cache.parallelism,
+            resolved = ?parallelism,
+            "Registered cache has no HeadCount axis; selecting replicated-data placement"
+        );
+    }
+    let logical_disk_block_count = disk_block_count
+        .map(|count| logical_tier_block_count(count, parallelism, worker_count))
+        .transpose()?;
+    let collective = build_collective_bootstrap(
+        if resource_parallelism
+            .values()
+            .any(|mode| *mode == kvbm_config::ParallelismMode::ReplicatedData)
+        {
+            kvbm_config::ParallelismMode::ReplicatedData
+        } else {
+            parallelism
+        },
+        worker_count,
+    )?;
 
     // Host-bypass: disk configured, host not — serve disk hits to GPU directly,
     // no G2 staging. InstanceLeader still requires a G2 manager, so build it with
     // a sentinel block_count of 1 (BlockManager rejects 0; it allocates nothing).
     let bypass_host = runtime.config().cache.bypass_host_cache();
-    let g2_manager_block_count = if bypass_host {
-        host_block_count.max(1)
-    } else {
-        host_block_count
-    };
-
     // Step 4: initialize all workers in parallel, collect their metadata, and
     // configure each transfer client's layout handles.
     let initialize_futures = {
@@ -255,10 +263,14 @@ pub(super) async fn build_engine_stack(c: &Construction) -> Result<EngineStack> 
         for (idx, worker) in workers.connector_clients.iter().enumerate() {
             let leader_config = LeaderLayoutConfig {
                 rank: idx,
+                worker_count,
                 host_block_count,
                 disk_block_count,
+                resource_tiers: resource_tiers.clone(),
+                resource_parallelism: resource_parallelism.clone(),
                 object: object_config.clone(),
-                parallelism: runtime.config().cache.parallelism,
+                parallelism,
+                collective: collective.clone(),
             };
             futures.push(worker.initialize(leader_config)?);
         }
@@ -272,7 +284,10 @@ pub(super) async fn build_engine_stack(c: &Construction) -> Result<EngineStack> 
         collected_metadata.push(worker_layout.metadata.clone());
     }
 
-    // Store metadata + configure transfer-client layout handles.
+    // Store metadata + configure transfer-client routing and layout handles.
+    // `resource_parallelism` is the same authoritative plan sent to workers
+    // above, so the leader's SPMD layer cannot drift from worker-side routing.
+    let local_transfer_placements = local_transfer_placements(&resource_parallelism);
     {
         let mut workers = c.workers.lock();
         workers.metadata = collected_metadata.clone();
@@ -282,6 +297,14 @@ pub(super) async fn build_engine_stack(c: &Construction) -> Result<EngineStack> 
             .zip(collected_metadata.iter())
             .enumerate()
         {
+            client
+                .configure_local_transfer_placements(
+                    primary_resource,
+                    local_transfer_placements.clone(),
+                )
+                .with_context(|| {
+                    format!("Failed to configure transfer placements for worker {i}")
+                })?;
             client
                 .configure_layout_handles(metadata)
                 .with_context(|| format!("Failed to configure handles for worker {i}"))?;
@@ -354,31 +377,52 @@ pub(super) async fn build_engine_stack(c: &Construction) -> Result<EngineStack> 
         }
     }
 
-    // Step 5: block registry (wired to the EventsManager when present) + G2/G3.
-    let mut registry_builder = BlockRegistry::builder()
-        .frequency_tracker(FrequencyTrackingCapacity::Medium.create_tracker());
-    if let Some(em) = events_manager.clone() {
-        registry_builder = registry_builder.event_manager(em);
-    }
-    let registry = registry_builder.build();
+    // Step 5: one independent block namespace and G2 manager per resource.
     let logical_metrics = runtime.observability().logical_aggregator();
-    let g2_manager = Arc::new(
-        BlockManager::<G2>::builder()
-            .block_count(g2_manager_block_count)
-            .block_size(reference_config.page_size)
-            .registry(registry.clone())
-            .with_lineage_backend()
-            .aggregator(logical_metrics.clone())
-            .duplication_policy(BlockDuplicationPolicy::Reject)
-            .build()
-            .expect("Should build G2 manager"),
-    );
-    let g3_manager: Option<Arc<BlockManager<G3>>> = disk_block_count.map(|count| {
+    let mut registries = BTreeMap::new();
+    let mut g2_manager_set = BlockManagerSet::new();
+    for (&resource, layout) in &reference_resources.resources {
+        let mut registry_builder = BlockRegistry::builder()
+            .frequency_tracker(FrequencyTrackingCapacity::Medium.create_tracker());
+        if let Some(em) = events_manager.clone() {
+            registry_builder = registry_builder.event_manager(em);
+        }
+        let registry = registry_builder.build();
+        let tier = resource_tiers
+            .get(&resource)
+            .expect("tier capacity for every resource");
+        let resource_parallelism = resolve_parallelism(runtime.config().cache.parallelism, layout);
+        let logical_blocks =
+            logical_tier_block_count(tier.host_block_count, resource_parallelism, worker_count)?;
+        let manager_blocks = if bypass_host {
+            logical_blocks.max(1)
+        } else {
+            logical_blocks
+        };
+        let manager = Arc::new(
+            BlockManager::<G2>::builder()
+                .block_count(manager_blocks)
+                .block_size(layout.page_size)
+                .registry(registry.clone())
+                .with_lineage_backend()
+                .aggregator(logical_metrics.clone())
+                .duplication_policy(BlockDuplicationPolicy::Reject)
+                .build()?,
+        );
+        g2_manager_set.insert(resource, manager)?;
+        registries.insert(resource, registry);
+    }
+    let g2_manager_set = Arc::new(g2_manager_set);
+    let primary_registry = registries
+        .get(&primary_resource)
+        .expect("primary registry")
+        .clone();
+    let g3_manager: Option<Arc<BlockManager<G3>>> = logical_disk_block_count.map(|count| {
         Arc::new(
             BlockManager::<G3>::builder()
                 .block_count(count)
                 .block_size(reference_config.page_size)
-                .registry(registry.clone())
+                .registry(primary_registry.clone())
                 .with_lineage_backend()
                 .aggregator(logical_metrics.clone())
                 .duplication_policy(BlockDuplicationPolicy::Reject)
@@ -388,8 +432,12 @@ pub(super) async fn build_engine_stack(c: &Construction) -> Result<EngineStack> 
     });
 
     // Clone registry + managers for the OffloadEngine (shared state via Arcs).
-    let registry_for_offload = Arc::new(registry.clone());
-    let g2_manager_for_offload = g2_manager.clone();
+    let registry_for_offload = Arc::new(
+        registries
+            .get(&primary_resource)
+            .expect("primary registry")
+            .clone(),
+    );
     let g3_manager_for_offload = g3_manager.clone();
 
     // Snapshot the InstanceLeader workers (transfer clients) + metadata.
@@ -408,8 +456,8 @@ pub(super) async fn build_engine_stack(c: &Construction) -> Result<EngineStack> 
     }
     leader_builder = leader_builder
         .block_layout_mode(runtime.config().block_layout)
-        .registry(registry)
-        .g2_manager(g2_manager)
+        .registry(primary_registry)
+        .g2_manager_set(Arc::clone(&g2_manager_set), primary_resource)
         .bypass_host(bypass_host)
         .workers(
             worker_clients
@@ -421,14 +469,24 @@ pub(super) async fn build_engine_stack(c: &Construction) -> Result<EngineStack> 
     if let Some(disagg_cfg) = runtime.config().disagg.as_ref() {
         leader_builder = leader_builder.role(disagg_cfg.role);
     }
-    if reference_config.num_heads.is_some() {
-        let template = kvbm_engine::leader::parallelism::ParallelismTemplate::from_layout_config(
-            &reference_config,
-            runtime.config().cache.parallelism,
-            num_workers,
-        )?;
-        leader_builder = leader_builder.parallelism_template(template);
-    }
+    let templates = reference_resources
+        .resources
+        .iter()
+        .map(|(&resource, layout)| {
+            let mode = resolve_parallelism(runtime.config().cache.parallelism, layout);
+            Ok((
+                resource,
+                kvbm_engine::leader::parallelism::ParallelismTemplate::from_layout_config(
+                    layout,
+                    mode,
+                    num_workers,
+                )?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    leader_builder = leader_builder.parallelism_template_set(
+        kvbm_engine::leader::parallelism::ParallelismTemplateSet::new(primary_resource, templates)?,
+    );
     if let Some(g3_mgr) = g3_manager {
         leader_builder = leader_builder.g3_manager(g3_mgr);
     }
@@ -508,10 +566,7 @@ pub(super) async fn build_engine_stack(c: &Construction) -> Result<EngineStack> 
 
     // Step 7: OffloadEngine (core pipelines).
     let offload_config = &runtime.config().offload;
-    let mut engine_builder = OffloadEngine::builder(leader.clone())
-        .with_registry(registry_for_offload.clone())
-        .with_g2_manager(g2_manager_for_offload)
-        .with_runtime(runtime.tokio());
+    let mut engine_builder = OffloadEngine::builder(leader.clone()).with_runtime(runtime.tokio());
 
     if bypass_host {
         let g1_to_g3_config = if offload_config.g1_to_g3.policies.is_empty() {
@@ -627,13 +682,53 @@ pub(super) async fn build_engine_stack(c: &Construction) -> Result<EngineStack> 
         }
     }
 
-    let offload = match engine_builder.build() {
+    let primary_offload = match engine_builder.build() {
         Ok(offload_engine) => Some(Arc::new(offload_engine)),
         Err(e) => {
             tracing::warn!("Failed to build OffloadEngine: {e}. Continuing without offload.");
             None
         }
     };
+    let mut offloads = primary_offload
+        .map(|engine| vec![(primary_resource, engine)])
+        .unwrap_or_default();
+    if !bypass_host {
+        for (&resource, registry) in &registries {
+            if resource == primary_resource {
+                continue;
+            }
+            let configured = &runtime.config().offload.g1_to_g2;
+            let fallback;
+            let offload_config = if configured.policies.is_empty() {
+                fallback = kvbm_config::TierOffloadConfig {
+                    policies: vec![kvbm_config::PolicyType::Presence],
+                    ..Default::default()
+                };
+                &fallback
+            } else {
+                configured
+            };
+            let pending = Arc::new(PendingTracker::new());
+            let policy = create_policy_from_config::<G1, G2>(
+                offload_config,
+                Arc::new(registry.clone()),
+                Some(Arc::clone(&pending)),
+            );
+            let pipeline = PipelineBuilder::<G1, G2>::new()
+                .resource(resource)
+                .policy(policy)
+                .pending_tracker(pending)
+                .build();
+            let capacity = leader.g2_capacity_for(resource).with_context(|| {
+                format!("G2 capacity for secondary resource {resource:?} is missing")
+            })?;
+            let builder = OffloadEngine::builder(leader.clone())
+                .with_g2_capacity(capacity)
+                .with_runtime(runtime.tokio())
+                .with_g1_to_g2_pipeline(pipeline);
+            offloads.push((resource, Arc::new(builder.build()?)));
+        }
+    }
 
     // Step 8: refresh worker handler lists (workers registered new handlers
     // during init, invalidating the handshake-time cache).
@@ -651,11 +746,48 @@ pub(super) async fn build_engine_stack(c: &Construction) -> Result<EngineStack> 
 
     Ok(EngineStack {
         instance_leader: leader,
-        offload,
+        offloads,
+        primary_resource,
+        admission,
         reference_config,
         handshake,
         events_manager,
         indexer_publisher,
         indexer_hub_client,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tensor_parallel_resources_configure_independent_local_transfers() {
+        let resource = LogicalResourceId(3);
+        let placements = local_transfer_placements(&BTreeMap::from([(
+            resource,
+            ParallelismMode::TensorParallel,
+        )]));
+        assert_eq!(
+            placements,
+            vec![(resource, WorkerDataPlacement::TensorSharded)]
+        );
+    }
+
+    #[test]
+    fn mixed_resources_preserve_each_worker_transfer_route() {
+        let attention = LogicalResourceId(2);
+        let latent = LogicalResourceId(7);
+        let placements = local_transfer_placements(&BTreeMap::from([
+            (attention, ParallelismMode::TensorParallel),
+            (latent, ParallelismMode::ReplicatedData),
+        ]));
+        assert_eq!(
+            placements,
+            vec![
+                (attention, WorkerDataPlacement::TensorSharded),
+                (latent, WorkerDataPlacement::ReplicatedG1StripedLower),
+            ]
+        );
+    }
 }

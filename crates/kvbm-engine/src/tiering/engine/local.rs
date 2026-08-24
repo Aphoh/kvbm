@@ -45,25 +45,35 @@
 // consumers; one module-level allow covers that gap.
 #![allow(dead_code)]
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use anyhow::Result;
 use dashmap::DashMap;
+use kvbm_common::LogicalResourceId;
 
+use kvbm_protocols::cache_manifest::{BundleKey, CacheIdentity};
 use kvbm_protocols::connector::{
-    AcceptId, ActionFailure, ActionId, ActionStatus, EngineWorkerSink, EvictionFence,
-    EvictionOutcome, FenceToken, FindBlocksHandle, FindBlocksOutcome, FindBlocksRequest,
-    LeaderEngine, LeaderEngineError, OffloadHandle, OnboardHandle, RequestOffloadDrain, SearchId,
-    WorkerEngineDriver,
+    AcceptId, ActionFailure, ActionId, ActionStatus, BundleOffloadPlan, BundleOnboardPlan,
+    EngineWorkerSink, EvictionFence, EvictionOutcome, FenceToken, FindBlocksHandle,
+    FindBlocksOutcome, FindBlocksRequest, LeaderEngine, LeaderEngineError, OffloadHandle,
+    OnboardHandle, RequestOffloadDrain, ResourceOnboard, SearchId, WorkerEngineDriver,
 };
 use kvbm_protocols::connector::{BlockId, RequestId, SequenceHash};
 
+use kvbm_logical::BlockEvictionObserver;
 use kvbm_logical::blocks::ImmutableBlock;
 
+use super::bundle::{
+    BundleAdmissionConfig, BundleCatalog, BundleDirectoryOrder, BundleLease,
+    BundlePublicationRuntime,
+};
+use super::config::PulledBundleReadyObserver;
 use super::driver::{ActionRecord, FenceBarrier};
 use super::inflight::{InflightKey, InflightOnboards};
-use super::offload::{self, BufferedOffload, DisabledOffloadSubmit, OffloadSubmit};
+use super::offload::{
+    self, BufferedOffload, BufferedOffloadCompletion, DisabledOffloadSubmit, OffloadSubmit,
+};
 use super::onboard;
 use super::reconcile::{
     MatchCheckOutcome, OnboardingState, compute_outcome, issue_shard, reconcile_state,
@@ -94,16 +104,105 @@ pub(super) struct SearchState {
     pub(super) buffer: Vec<SequenceHash>,
 }
 
+/// Manifest-scoped pinned match retained by the existing opaque search handle.
+pub(super) struct BundleSearchState {
+    pub(super) request_id: RequestId,
+    pub(super) identity: CacheIdentity,
+    pub(super) source: BundleSearchSource,
+    pub(super) computed_tokens: usize,
+    pub(super) matched_tokens: usize,
+}
+
+/// Exactly one source owns a live bundle search: a local lease or a pending
+/// remote lookup. Making the state exclusive prevents invalid `None`/`None`
+/// and `Some`/`Some` combinations.
+pub(super) enum BundleSearchSource {
+    Local(BundleLease<Vec<ImmutableBlock<G2>>>),
+    Remote(RemoteBundleSearch),
+}
+
+/// Terminal ownership returned by a remote search task. A selected lease is
+/// moved through the channel so no eviction gap exists between pull/dispatch
+/// completion and the connector's next poll.
+pub(super) enum RemoteBundleResolution {
+    Selected(BundleLease<Vec<ImmutableBlock<G2>>>),
+    Fallback,
+    Miss,
+}
+
+/// Pending remote lookup ownership. Dropping the opaque connector search
+/// handle removes this state, which cancels discovery/pull before it can
+/// publish a late result.
+pub(super) struct RemoteBundleSearch {
+    result: tokio::sync::oneshot::Receiver<Result<RemoteBundleResolution, String>>,
+    cancel: tokio_util::sync::CancellationToken,
+    fallback: Option<BundleLease<Vec<ImmutableBlock<G2>>>>,
+}
+
+impl RemoteBundleSearch {
+    pub(super) fn new(
+        result: tokio::sync::oneshot::Receiver<Result<RemoteBundleResolution, String>>,
+        cancel: tokio_util::sync::CancellationToken,
+        fallback: Option<BundleLease<Vec<ImmutableBlock<G2>>>>,
+    ) -> Self {
+        Self {
+            result,
+            cancel,
+            fallback,
+        }
+    }
+
+    pub(super) fn try_recv(
+        &mut self,
+    ) -> Result<Result<RemoteBundleResolution, String>, tokio::sync::oneshot::error::TryRecvError>
+    {
+        self.result.try_recv()
+    }
+
+    pub(super) fn fallback(&self) -> Option<&BundleLease<Vec<ImmutableBlock<G2>>>> {
+        self.fallback.as_ref()
+    }
+
+    pub(super) fn take_fallback(&mut self) -> Option<BundleLease<Vec<ImmutableBlock<G2>>>> {
+        self.fallback.take()
+    }
+}
+
+impl Drop for RemoteBundleSearch {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+impl BundleSearchState {
+    pub(super) fn lease(&self) -> Option<&BundleLease<Vec<ImmutableBlock<G2>>>> {
+        match &self.source {
+            BundleSearchSource::Local(lease) => Some(lease),
+            BundleSearchSource::Remote(remote) => remote.fallback(),
+        }
+    }
+}
+
 /// The local, in-process [`LeaderEngine`].
 pub(crate) struct LocalConnectorEngine {
     pub(super) leader: Arc<InstanceLeader>,
     pub(super) sink: Arc<dyn EngineWorkerSink>,
     pub(super) block_size: usize,
+    /// Internal fail-safe for exact bundle G2-to-G1 onboards. This bounds the
+    /// logical action only; launched transfer work remains quarantined behind
+    /// its physical-drain fence until every completion notification settles.
+    pub(super) bundle_onboard_watchdog_ms: AtomicU64,
+    /// Serializes collective-bearing G2-to-G1 resource onboards across every
+    /// request sharing the leader's rank-local collective communicator.
+    pub(super) resource_onboard_admission: tokio::sync::Mutex<()>,
+    /// Immutable whole-bundle admission policy and physical byte geometry.
+    pub(super) bundle_admission: BundleAdmissionConfig,
     /// Whether shard finds request the leader's remote-search path. Set from
     /// the [`RemoteOps`](super::RemoteOps) selection at construction; threaded
     /// into every `FindMatchesOptions` the engine issues.
     pub(super) search_remote: bool,
     pub(super) searches: DashMap<SearchId, SearchState>,
+    pub(super) bundle_searches: DashMap<SearchId, BundleSearchState>,
     pub(super) actions: DashMap<ActionId, ActionRecord>,
     /// `request_id → in-flight onboard/offload action ids` (read by `evict`).
     pub(super) by_request: DashMap<RequestId, Vec<ActionId>>,
@@ -114,6 +213,16 @@ pub(crate) struct LocalConnectorEngine {
     /// Pairs buffered by `offload`, flushed by `finish_forward_pass` (Decision A:
     /// never enqueue a G1 read mid-forward-pass).
     pub(super) offload_buffer: Mutex<Vec<BufferedOffload>>,
+    /// Complete bundle visibility, reverse lineage, and retired generations.
+    /// One mutex makes publication and eviction callbacks atomic.
+    pub(super) bundle_catalog: Mutex<BundleCatalog<Vec<ImmutableBlock<G2>>>>,
+    /// Orders same-key remote directory updates across async
+    /// advertise/invalidate calls without serializing independent bundles.
+    pub(super) bundle_directory_order: BundleDirectoryOrder,
+    /// Owner-local timing and lifecycle for remote bundle publications.
+    pub(super) bundle_publications: BundlePublicationRuntime,
+    /// Keeps manager-installed weak eviction callbacks live with this engine.
+    bundle_eviction_observers: Vec<Arc<dyn BlockEvictionObserver>>,
     /// Requests with at least one offload — the once-only source for
     /// `take_offload_drain` (removal *is* the consume-once guard).
     pub(super) offload_drains: DashMap<RequestId, ()>,
@@ -122,11 +231,17 @@ pub(crate) struct LocalConnectorEngine {
     /// Self-`Weak` so `finish_forward_pass(&self)` can mint an `Arc<Self>` to
     /// move into the per-offload completion driver (the `WorkerEngineDriver`
     /// receiver is `&self`, unlike onboard's `self: Arc<Self>`).
-    weak_self: Weak<LocalConnectorEngine>,
+    pub(super) weak_self: Weak<LocalConnectorEngine>,
     /// Conditional-disaggregation runtime, present iff CD is configured (built
     /// from [`super::DisaggOps`] at construction). The search path interposes
     /// CD when this is `Some`; `None` is a plain local-tiering engine.
     pub(super) cd: Option<CdRuntime>,
+    /// Advisory hook fired after a remotely-pulled bundle commits into G2 (see
+    /// [`PulledBundleReadyObserver`]). A `OnceLock` set by
+    /// [`build_local_connector_engine`](super::build_local_connector_engine)
+    /// rather than a constructor parameter: the construction seam is already at
+    /// clippy's argument ceiling, and this is an observer, not engine state.
+    pub(super) pulled_bundle_ready: OnceLock<PulledBundleReadyObserver>,
     /// In-flight onboard hash guard (see [`super::inflight`]). Recorded ONCE
     /// per lifecycle at the three onboard mint sites (keyed by the lifecycle
     /// generation), cleared at the lifecycle release funnels
@@ -160,13 +275,13 @@ pub(crate) struct LocalConnectorEngine {
 /// passes an empty `pending_hashes`, and the load terminal always observes a
 /// drained ledger.
 pub(super) struct CdRuntime {
-    cfg: DisaggConfig,
-    tier: Arc<TierCell>,
+    pub(in crate::tiering::engine) cfg: DisaggConfig,
+    pub(in crate::tiering::engine) tier: Arc<TierCell>,
     /// The inflight remote-prefill token budget — the waiting consumer of
     /// `cfg.max_inflight_remote_prefill_tokens`, built once at construction.
-    budget: InflightBudget,
+    pub(in crate::tiering::engine) budget: Arc<InflightBudget>,
     pub(super) sessions: Arc<dyn SessionFactory>,
-    plane: Arc<dyn PrefillPlane>,
+    pub(in crate::tiering::engine) plane: Arc<dyn PrefillPlane>,
     requests: CdRequests,
     /// Resolves + registers the decode peer before the prefill pipeline
     /// attaches (velo's streaming-transport registry is lazily populated).
@@ -193,7 +308,7 @@ impl CdRuntime {
         peer_resolver: Option<Arc<dyn PeerResolver>>,
     ) -> Self {
         Self {
-            budget: InflightBudget::new(cfg.max_inflight_remote_prefill_tokens),
+            budget: Arc::new(InflightBudget::new(cfg.max_inflight_remote_prefill_tokens)),
             cfg,
             tier,
             sessions,
@@ -318,6 +433,15 @@ impl CdRuntime {
 }
 
 impl LocalConnectorEngine {
+    #[cfg(feature = "testing")]
+    pub(crate) fn testing_bundle_visible(&self, identity: &CacheIdentity, key: &BundleKey) -> bool {
+        self.bundle_catalog
+            .lock()
+            .expect("bundle-catalog mutex poisoned")
+            .lease_exact(identity, key)
+            .is_some()
+    }
+
     /// Build the engine over a concrete leader, a worker sink, and the layout
     /// block size (carried here because `InstanceLeader` exposes no block-size
     /// accessor). Returns `Arc<Self>` — callers coerce to `Arc<dyn LeaderEngine>`.
@@ -355,28 +479,123 @@ impl LocalConnectorEngine {
         offload_submit: Arc<dyn OffloadSubmit>,
         cd: Option<CdRuntime>,
     ) -> Arc<Self> {
+        Self::with_offload_submit_and_admission(
+            leader,
+            sink,
+            block_size,
+            search_remote,
+            offload_submit,
+            cd,
+            BundleAdmissionConfig::default(),
+        )
+    }
+
+    pub(super) fn with_offload_submit_and_admission(
+        leader: Arc<InstanceLeader>,
+        sink: Arc<dyn EngineWorkerSink>,
+        block_size: usize,
+        search_remote: bool,
+        offload_submit: Arc<dyn OffloadSubmit>,
+        cd: Option<CdRuntime>,
+        bundle_admission: BundleAdmissionConfig,
+    ) -> Arc<Self> {
         // Source the in-flight-onboard gauge from the leader's observability
         // BEFORE `leader` moves into the cyclic closure. Bare test leaders have
         // no observability → `None` → an inert guard.
         let inflight_gauge = leader
             .observability()
             .map(|o| o.compat_metrics().inflight_onboard_hashes.clone());
-        Arc::new_cyclic(|weak| Self {
-            leader,
-            sink,
-            block_size,
-            search_remote,
-            searches: DashMap::new(),
-            actions: DashMap::new(),
-            by_request: DashMap::new(),
-            offload_submit,
-            offload_buffer: Mutex::new(Vec::new()),
-            offload_drains: DashMap::new(),
-            current_iteration: AtomicUsize::new(0),
-            weak_self: weak.clone(),
-            cd,
-            inflight: Mutex::new(InflightOnboards::with_gauge(inflight_gauge)),
+        Arc::new_cyclic(|weak| {
+            let bundle_eviction_observers = leader
+                .g2_managers()
+                .iter()
+                .map(|(resource, manager)| {
+                    let observer: Arc<dyn BlockEvictionObserver> =
+                        Arc::new(BundleEvictionObserver {
+                            engine: weak.clone(),
+                            resource,
+                        });
+                    manager.observe_evictions(&observer);
+                    observer
+                })
+                .collect();
+            Self {
+                leader,
+                sink,
+                block_size,
+                bundle_onboard_watchdog_ms: AtomicU64::new(30_000),
+                resource_onboard_admission: tokio::sync::Mutex::new(()),
+                bundle_admission,
+                search_remote,
+                searches: DashMap::new(),
+                bundle_searches: DashMap::new(),
+                actions: DashMap::new(),
+                by_request: DashMap::new(),
+                offload_submit,
+                offload_buffer: Mutex::new(Vec::new()),
+                bundle_catalog: Mutex::new(BundleCatalog::new()),
+                bundle_directory_order: BundleDirectoryOrder::new(),
+                bundle_publications: BundlePublicationRuntime::new(),
+                bundle_eviction_observers,
+                offload_drains: DashMap::new(),
+                current_iteration: AtomicUsize::new(0),
+                weak_self: weak.clone(),
+                pulled_bundle_ready: OnceLock::new(),
+                cd,
+                inflight: Mutex::new(InflightOnboards::with_gauge(inflight_gauge)),
+            }
         })
+    }
+
+    /// Install the remote-pull residency observer. First write wins; a second
+    /// install is a wiring bug and is ignored rather than allowed to silently
+    /// replace the first (two observers would each see only some of the pulls).
+    pub(in crate::tiering::engine) fn set_pulled_bundle_ready_observer(
+        &self,
+        observer: PulledBundleReadyObserver,
+    ) {
+        if self.pulled_bundle_ready.set(observer).is_err() {
+            tracing::warn!(
+                "a pulled-bundle residency observer is already installed on this engine; \
+                 keeping the first"
+            );
+        }
+    }
+
+    pub(super) fn bundle_onboard_watchdog(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.bundle_onboard_watchdog_ms.load(Ordering::Relaxed))
+    }
+
+    #[cfg(test)]
+    pub(in crate::tiering::engine) fn set_bundle_onboard_watchdog_for_test(
+        &self,
+        watchdog: std::time::Duration,
+    ) {
+        self.bundle_onboard_watchdog_ms.store(
+            u64::try_from(watchdog.as_millis()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    #[cfg(test)]
+    pub(in crate::tiering::engine) fn set_bundle_publication_clock_for_test(
+        &self,
+        clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+    ) {
+        self.bundle_publications.set_clock(clock);
+    }
+}
+
+struct BundleEvictionObserver {
+    engine: Weak<LocalConnectorEngine>,
+    resource: LogicalResourceId,
+}
+
+impl BlockEvictionObserver for BundleEvictionObserver {
+    fn on_blocks_evicted(&self, hashes: &[SequenceHash]) {
+        if let Some(engine) = self.engine.upgrade() {
+            engine.invalidate_resource_blocks(self.resource, hashes);
+        }
     }
 }
 
@@ -629,55 +848,76 @@ pub(super) fn perform_refresh(
 // LeaderEngine impl
 // ============================================================================
 
-impl LeaderEngine for LocalConnectorEngine {
-    fn offload(
+impl LocalConnectorEngine {
+    fn buffer_offload(
         self: Arc<Self>,
+        resource: Option<kvbm_common::LogicalResourceId>,
         req: &RequestId,
         pairs: Vec<(SequenceHash, BlockId)>,
     ) -> Result<OffloadHandle, LeaderEngineError> {
+        if let Some(resource) = resource
+            && !self.offload_submit.supports_resource(resource)
+        {
+            return Err(LeaderEngineError::ResourceOffloadNotConfigured { resource });
+        }
         let action_id = ActionId::new();
-        // Completion cell: the engine keeps a `Weak` in `actions` (the by-id
-        // `poll_action` path + `evict`'s pending check); the handle owns the
-        // strong, so the cell frees by RAII on handle drop. Mirrors onboard —
-        // insert the in-flight record BEFORE returning the handle so `evict` and
-        // the by-id path observe a live `Pending` action.
         let cell = Arc::new(Mutex::new(ActionStatus::Pending));
         self.actions.insert(
             action_id,
-            ActionRecord::new(req.clone(), Arc::downgrade(&cell)),
+            ActionRecord::new_save(req.clone(), Arc::downgrade(&cell)),
         );
         self.by_request
             .entry(req.clone())
             .or_default()
             .push(action_id);
-        // Register the request for its once-only `finished_sending` drain.
         self.offload_drains.insert(req.clone(), ());
 
-        // DECISION A: buffer the pairs; the `enqueue_g1_to_g2_with_precondition`
-        // flush happens in `finish_forward_pass` (eager enqueue would read G1
-        // mid-GPU-write → corruption). Entries are stamped with the current
-        // iteration so a late pass-`n` flush cannot submit pass-`n+1`'s
-        // mid-pass buffer. The `ExternalBlock` arg-order reversal happens at
-        // flush time (see `offload::build_external_blocks`).
         self.offload_buffer
             .lock()
             .expect("offload-buffer mutex poisoned")
             .push(BufferedOffload {
                 action_id,
                 request_id: req.clone(),
+                resource,
                 pairs,
+                planned_bytes: None,
                 iteration: self.current_iteration.load(Ordering::Relaxed),
+                completion: BufferedOffloadCompletion::Single,
             });
 
-        // The handle owns the strong cell and a `Weak` back-ref; its RAII drop
-        // fires `release_action` to prune both `actions` and `by_request` for
-        // this action (the action analogue of search-handle drop).
         let me: Arc<dyn LeaderEngine> = self;
         Ok(OffloadHandle::new(action_id, Arc::downgrade(&me), cell))
     }
+}
+
+impl LeaderEngine for LocalConnectorEngine {
+    fn offload(
+        self: Arc<Self>,
+        req: &RequestId,
+        pairs: Vec<(SequenceHash, BlockId)>,
+    ) -> Result<OffloadHandle, LeaderEngineError> {
+        self.buffer_offload(None, req, pairs)
+    }
+
+    fn offload_for_resource(
+        self: Arc<Self>,
+        resource: kvbm_common::LogicalResourceId,
+        req: &RequestId,
+        pairs: Vec<(SequenceHash, BlockId)>,
+    ) -> Result<OffloadHandle, LeaderEngineError> {
+        self.buffer_offload(Some(resource), req, pairs)
+    }
+
+    fn offload_bundle(
+        self: Arc<Self>,
+        req: &RequestId,
+        plan: BundleOffloadPlan,
+    ) -> Result<OffloadHandle, LeaderEngineError> {
+        self.start_bundle_offload(req, plan)
+    }
 
     fn evict(&self, req: &RequestId) -> EvictionOutcome {
-        // Find in-flight onboard actions for this request and, if any, flag them
+        // Find in-flight actions for this request and, if any, flag them
         // cancelled-for-emission: their terminal fires `mark_fence_complete`
         // (not `mark_load_finished`) and mints one barrier token per worker.
         let action_ids: Vec<ActionId> = self
@@ -697,20 +937,15 @@ impl LeaderEngine for LocalConnectorEngine {
         // worker reuses G1 blocks only after every in-flight-at-eviction action has
         // drained — never on the first.
         let mut barrier: Option<Arc<FenceBarrier>> = None;
+        let mut cancellations = Vec::new();
         for id in &action_ids {
             if let Some(mut record) = self.actions.get_mut(id) {
-                let still_pending = record.cell.upgrade().is_some_and(|cell| {
-                    matches!(
-                        *cell.lock().expect("action-status mutex poisoned"),
-                        ActionStatus::Pending
-                    )
-                });
                 // Arm only an unfenced action. The drain-holder/fresh-GNMT design
                 // precludes re-evicting the same in-flight action, but guarding
                 // `fence.is_none()` is a cheap strict improvement: it stops a second
                 // evict from reassigning a live barrier (which would drop the prior
                 // clone and complete that fence one drain early).
-                if still_pending && record.fence.is_none() {
+                if record.has_pending_work() && record.fence.is_none() {
                     let shared = barrier.get_or_insert_with(|| {
                         let worker_count = self.leader.worker_count().max(1);
                         let tokens = (0..worker_count as u32).map(FenceToken::new).collect();
@@ -718,7 +953,13 @@ impl LeaderEngine for LocalConnectorEngine {
                     });
                     record.fence = Some(Arc::clone(shared));
                 }
+                if let Some(cancel) = record.physical_load_cancel() {
+                    cancellations.push(cancel);
+                }
             }
+        }
+        for cancel in cancellations {
+            cancel.cancel();
         }
 
         // Tokens (and the leader's observational handle) are returned IFF at least
@@ -791,12 +1032,9 @@ impl LeaderEngine for LocalConnectorEngine {
         if let Some(cell) = live {
             return cell.lock().expect("action-status mutex poisoned").clone();
         }
-        // No entry, or the handle dropped (dead `Weak`). Self-clean any dead entry
-        // on access so the map cannot grow without bound, then report the
-        // stateless default: a vanished action has no observer to mislead, and a
-        // never-minted id has nothing in flight — matching the noop answer.
-        self.actions
-            .remove_if(id, |_, r| r.cell.strong_count() == 0);
+        // A missing entry and a dropped handle both use the stateless default.
+        // Record removal belongs to handle release or the physical terminal.
+        // Polling cannot prove that a dead cell has no physical work.
         ActionStatus::Complete
     }
 
@@ -828,6 +1066,8 @@ impl LeaderEngine for LocalConnectorEngine {
             if let Some(cd) = &self.cd {
                 cd.cleanup_guarded(&search_state.request_id, "declined", Some(*id));
             }
+        } else {
+            self.bundle_searches.remove(id);
         }
     }
 
@@ -837,24 +1077,26 @@ impl LeaderEngine for LocalConnectorEngine {
         // an unknown or already-released id finds no entry and does nothing (the noop
         // offload path and a second drop are both no-ops).
         //
-        // DEFER if a fence is armed: the action was evicted and its driver has not
-        // reached terminal (`finish_*_action` takes the fence). Removing the record
-        // now would drop the live fence clone and could complete the eviction fence
-        // BEFORE the transfer drains — freeing G1 blocks mid-transfer. Instead flag
-        // `dropped_by_handle` under the per-action guard (serialized against
-        // `finish_*_action`); the driver's terminal then removes the record. Takes
-        // only DashMap guards — lock order dashmap→cell is preserved.
-        let defer = {
+        // DEFER if a fence/drain is armed or physical work is still pending.
+        // Early removal can complete a fence, fire a drain, or clear the
+        // bundle overlap guard before the transfer drains. Instead flag
+        // `dropped_by_handle` under the per-action guard; the driver's terminal
+        // then removes the record. Legacy actions with no in-flight key retain
+        // the original lock-free status path.
+        let (defer, cancel) = {
             if let Some(mut record) = self.actions.get_mut(id) {
-                let armed = record.fence.is_some() || record.drain.is_some();
-                if armed {
+                let retain = record.must_retain_after_handle_drop();
+                if retain {
                     record.dropped_by_handle = true;
                 }
-                armed
+                (retain, record.physical_load_cancel())
             } else {
-                false
+                (false, None)
             }
         };
+        if let Some(cancel) = cancel {
+            cancel.cancel();
+        }
         if !defer {
             self.remove_action_record(id);
         }
@@ -876,6 +1118,31 @@ impl LeaderEngine for LocalConnectorEngine {
         num_external_tokens: usize,
     ) -> Result<OnboardHandle, LeaderEngineError> {
         self.route_onboard_blocks(handle, dest, num_external_tokens)
+    }
+
+    fn onboard_resources(
+        self: Arc<Self>,
+        req: &RequestId,
+        plan: BundleOnboardPlan,
+    ) -> Result<OnboardHandle, LeaderEngineError> {
+        self.start_bundle_onboard(req, plan)
+    }
+
+    fn onboard_resource_blocks(
+        self: Arc<Self>,
+        req: &RequestId,
+        resources: Vec<ResourceOnboard>,
+    ) -> Result<OnboardHandle, LeaderEngineError> {
+        self.start_resource_onboard(req, resources)
+    }
+
+    fn onboard_bundle(
+        self: Arc<Self>,
+        handle: &FindBlocksHandle,
+        destinations: Vec<kvbm_protocols::connector::ResourceDestination>,
+        num_external_tokens: usize,
+    ) -> Result<OnboardHandle, LeaderEngineError> {
+        self.start_searched_bundle_onboard(handle, destinations, num_external_tokens)
     }
 
     fn release_prefill_session(&self, request_id: &RequestId, accept_id: AcceptId) {
@@ -1331,6 +1598,7 @@ impl LocalConnectorEngine {
             num_computed_tokens: num_computed,
             matched_tokens: local_hit * bs,
             block_size: bs,
+            bundle_bytes: 0,
         };
 
         match decode::plan(&cd.cfg, &cd.tier, &cd.budget, &inputs) {
@@ -1478,6 +1746,7 @@ impl LocalConnectorEngine {
             decode_endpoint: session.endpoint(),
             num_provided_tokens: num_computed + local_hit * bs,
             num_window_tokens: num_computed + fbet,
+            bundle: None,
         };
         let plane = cd.plane.clone();
         let dispatch_state = Arc::clone(&state);
@@ -1740,6 +2009,7 @@ fn local_reason_label(reason: LocalReason) -> &'static str {
         LocalReason::BreakerHot => "remote_downgraded_breaker_hot",
         LocalReason::ZeroBlock => "remote_downgraded_zero_block",
         LocalReason::OverloadFallback => "remote_downgraded_overload",
+        LocalReason::CostGuard => "remote_downgraded_cost_guard",
     }
 }
 
@@ -1803,10 +2073,26 @@ impl LocalConnectorEngine {
         let precondition = event.as_ref().map(|ev| ev.handle());
 
         for b in buffered {
-            let blocks = offload::build_external_blocks(&b.pairs);
-            let action_id = b.action_id;
-            let request_id = b.request_id;
-            match self.offload_submit.submit_g1_to_g2(blocks, precondition) {
+            let BufferedOffload {
+                action_id,
+                request_id,
+                resource,
+                pairs,
+                planned_bytes,
+                completion,
+                ..
+            } = b;
+            let observation = resource
+                .zip(planned_bytes)
+                .map(|(resource, planned_bytes)| {
+                    offload::BundleTransferObservation::start(resource, planned_bytes)
+                });
+            self.record_bundle_transfer_start(observation);
+            let blocks = offload::build_external_blocks(&pairs);
+            match self
+                .offload_submit
+                .submit_g1_to_g2(resource, blocks, precondition)
+            {
                 Ok(transfer) => {
                     let driver = this.clone();
                     self.leader.runtime().spawn(async move {
@@ -1814,7 +2100,15 @@ impl LocalConnectorEngine {
                         // Write terminal into the cell + notify with no engine
                         // lock held (per-action terminal flips the cell only —
                         // `mark_save_finished` is drain-driven).
-                        driver.finish_save_action(action_id, &request_id, outcome);
+                        driver.finish_offload_child(
+                            action_id,
+                            &request_id,
+                            resource,
+                            pairs,
+                            observation,
+                            completion,
+                            outcome,
+                        );
                     });
                 }
                 Err(e) => {
@@ -1823,9 +2117,13 @@ impl LocalConnectorEngine {
                         %request_id,
                         "offload submit failed; marking action Failed(AllBlocks)"
                     );
-                    this.finish_save_action(
+                    this.finish_offload_child(
                         action_id,
                         &request_id,
+                        resource,
+                        pairs,
+                        observation,
+                        completion,
                         ActionStatus::Failed(ActionFailure::AllBlocks),
                     );
                 }
@@ -1866,12 +2164,34 @@ impl WorkerEngineDriver for LocalConnectorEngine {
     }
 
     fn shutdown(&self) {
-        // Drop buffered-but-unflushed offloads; their handles' cells stay
-        // `Pending` and free by RAII on drop. Orderly teardown sequencing is P-D.
-        self.offload_buffer
-            .lock()
-            .expect("offload-buffer mutex poisoned")
-            .clear();
+        // Settle buffered offloads after the buffer lock releases. A dropped
+        // handle must not leave its physical-save record pending forever.
+        let buffered = {
+            let mut buffer = self
+                .offload_buffer
+                .lock()
+                .expect("offload-buffer mutex poisoned");
+            std::mem::take(&mut *buffer)
+        };
+        for BufferedOffload {
+            action_id,
+            request_id,
+            resource,
+            pairs,
+            completion,
+            ..
+        } in buffered
+        {
+            self.finish_offload_child(
+                action_id,
+                &request_id,
+                resource,
+                pairs,
+                None,
+                completion,
+                ActionStatus::Failed(ActionFailure::AllBlocks),
+            );
+        }
     }
 }
 
@@ -1886,11 +2206,24 @@ mod tests {
         OnboardingStatus, ReadyResult, SessionId,
     };
     use crate::offload::{ExternalBlock, TransferStatus};
+    use crate::{ConnectorEngineConfig, RemoteOps};
     use kvbm_protocols::connector::NoopWorkerSink;
     use kvbm_protocols::connector::{LoadOutcome, SaveOutcome};
     use std::sync::Mutex as StdMutex;
     use tokio::sync::{Mutex as TokioMutex, watch};
     use uuid::Uuid;
+
+    #[path = "offload_action_retention.rs"]
+    mod offload_action_retention;
+
+    fn connector_config(block_size: usize, remote: RemoteOps) -> ConnectorEngineConfig {
+        ConnectorEngineConfig {
+            block_size,
+            remote,
+            resource_policies: Default::default(),
+            resource_component_bytes: Default::default(),
+        }
+    }
 
     // ----- offload-submission double (OffloadEngine needs GPU/velo) -----
 
@@ -1899,6 +2232,7 @@ mod tests {
     /// was provided, then hands back a transfer pre-set to a configured terminal.
     struct MockOffloadSubmit {
         submits: StdMutex<Vec<Vec<(BlockId, SequenceHash)>>>,
+        resources: StdMutex<Vec<Option<kvbm_common::LogicalResourceId>>>,
         preconditions: StdMutex<Vec<bool>>,
         terminal: TransferStatus,
         failed: Vec<BlockId>,
@@ -1907,6 +2241,7 @@ mod tests {
         fn new(terminal: TransferStatus, failed: Vec<BlockId>) -> Arc<Self> {
             Arc::new(Self {
                 submits: StdMutex::new(Vec::new()),
+                resources: StdMutex::new(Vec::new()),
                 preconditions: StdMutex::new(Vec::new()),
                 terminal,
                 failed,
@@ -1923,6 +2258,9 @@ mod tests {
                 .cloned()
                 .unwrap_or_default()
         }
+        fn last_resource(&self) -> Option<kvbm_common::LogicalResourceId> {
+            self.resources.lock().unwrap().last().copied().flatten()
+        }
         fn last_precondition_present(&self) -> bool {
             self.preconditions
                 .lock()
@@ -1933,11 +2271,17 @@ mod tests {
         }
     }
     impl OffloadSubmit for MockOffloadSubmit {
+        fn supports_resource(&self, _resource: kvbm_common::LogicalResourceId) -> bool {
+            true
+        }
+
         fn submit_g1_to_g2(
             &self,
+            resource: Option<kvbm_common::LogicalResourceId>,
             blocks: Vec<ExternalBlock<crate::G1>>,
             precondition: Option<velo::EventHandle>,
         ) -> Result<Box<dyn OffloadTransfer>> {
+            self.resources.lock().unwrap().push(resource);
             self.submits.lock().unwrap().push(
                 blocks
                     .iter()
@@ -2455,18 +2799,8 @@ mod tests {
         Ok(())
     }
 
-    /// Production-path boundedness for terminal onboards. Pre-fix, a terminal
-    /// onboard left a strong `ActionRecord` in `actions` forever on the in-process
-    /// path: the connector reads `handle.outcome()` (a local cell read) and never
-    /// calls `poll_action` (the only pruner then), so the by-id key — and its
-    /// `by_request` link — leaked once a real caller was wired. With RAII
-    /// `OnboardHandle::drop -> release_action` (the action analogue of
-    /// `release_search`), dropping each terminal handle prunes BOTH maps.
-    ///
-    /// This proves the fix **without calling `poll_action`**: `finish_load_action`
-    /// never removes from `actions`, so `actions.len() == 0` can only be reached by
-    /// the handle Drop -> `release_action` path. If these assertions held only
-    /// after a `poll_action` self-prune, the RAII fix would be wrong.
+    /// Each terminal onboard stays indexed while its handle is live.
+    /// Handle drop calls `release_action`, which clears both indexes.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn failed_then_dropped_onboards_retain_no_strong_cell() -> Result<()> {
         let leader = Arc::new(build_test_leader().await?);
@@ -2504,14 +2838,11 @@ mod tests {
                 })
             );
 
-            // Drop the terminal handle. Its RAII `Drop -> release_action` is the
-            // ONLY pruner exercised here — no `poll_action` call anywhere.
+            // Drop the terminal handle. This test does not call `poll_action`.
             drop(onboard);
         }
 
-        // Teeth (no `poll_action` involved): handle Drop alone kept both maps
-        // bounded. `actions` can only reach 0 via `release_action`, since
-        // `finish_load_action` never removes from it — so this isolates the RAII fix.
+        // Handle drop alone keeps both maps bounded in this live-handle path.
         assert_eq!(
             engine.actions.len(),
             0,
@@ -2613,9 +2944,10 @@ mod tests {
         let req: RequestId = "rq".into();
         let a1 = ActionId::new();
         let cell = Arc::new(Mutex::new(ActionStatus::Pending));
-        engine
-            .actions
-            .insert(a1, ActionRecord::new(req.clone(), Arc::downgrade(&cell)));
+        engine.actions.insert(
+            a1,
+            ActionRecord::new_save(req.clone(), Arc::downgrade(&cell)),
+        );
         engine.by_request.insert(req.clone(), vec![a1]);
 
         let fence = engine.evict(&req).fence;
@@ -2839,10 +3171,12 @@ mod tests {
     fn fb(request_id: &str, hashes: Vec<SequenceHash>, total_tokens: usize) -> FindBlocksRequest {
         FindBlocksRequest {
             request_id: request_id.to_string(),
+            cache: kvbm_protocols::connector::CacheScope::LegacyPrimary,
             sequence_hashes: Arc::from(hashes),
             num_computed_tokens: 0,
             total_tokens,
             transfer_params: None,
+            local_prefill_estimate: None,
         }
     }
 
@@ -3220,6 +3554,56 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resource_offload_buffers_and_flushes_through_the_connector_engine() -> Result<()> {
+        let leader = Arc::new(build_test_leader().await?);
+        let sink = RecordingSink::new();
+        let submit = MockOffloadSubmit::new(TransferStatus::Complete, vec![]);
+        let engine =
+            LocalConnectorEngine::with_offload_submit(leader, sink, BS, true, submit.clone(), None);
+
+        let handle = engine
+            .clone()
+            .offload_for_resource(
+                kvbm_common::LogicalResourceId(7),
+                &"resource-rq".into(),
+                vec![(h(4), 13usize)],
+            )
+            .unwrap();
+        assert_eq!(submit.submit_count(), 0);
+
+        engine.finish_forward_pass(0);
+
+        assert_eq!(submit.submit_count(), 1);
+        assert_eq!(submit.last_submit(), vec![(13, h(4))]);
+        assert_eq!(
+            submit.last_resource(),
+            Some(kvbm_common::LogicalResourceId(7))
+        );
+        wait_offload_complete(&handle).await;
+        assert_eq!(handle.outcome(), Some(SaveOutcome::Done));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resource_offload_without_a_route_fails_before_buffering() -> Result<()> {
+        let leader = Arc::new(build_test_leader().await?);
+        let engine = LocalConnectorEngine::new(leader, RecordingSink::new(), BS, true);
+        let resource = kvbm_common::LogicalResourceId(9);
+
+        let error = engine
+            .clone()
+            .offload_for_resource(resource, &"missing-route".into(), vec![(h(4), 13usize)])
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            LeaderEngineError::ResourceOffloadNotConfigured { resource }
+        );
+        assert!(engine.offload_buffer.lock().unwrap().is_empty());
+        Ok(())
+    }
+
     /// `finish_forward_pass(n)` submits only offloads buffered under iteration
     /// `<= n`: the leader's merge-await for pass `n` can land after pass
     /// `n+1`'s scheduler walk has buffered new offloads, and those mid-pass G1
@@ -3378,12 +3762,14 @@ mod tests {
         let (a1, a2) = (ActionId::new(), ActionId::new());
         let cell1 = Arc::new(Mutex::new(ActionStatus::Pending));
         let cell2 = Arc::new(Mutex::new(ActionStatus::Pending));
-        engine
-            .actions
-            .insert(a1, ActionRecord::new(req.clone(), Arc::downgrade(&cell1)));
-        engine
-            .actions
-            .insert(a2, ActionRecord::new(req.clone(), Arc::downgrade(&cell2)));
+        engine.actions.insert(
+            a1,
+            ActionRecord::new_save(req.clone(), Arc::downgrade(&cell1)),
+        );
+        engine.actions.insert(
+            a2,
+            ActionRecord::new_save(req.clone(), Arc::downgrade(&cell2)),
+        );
         engine.by_request.insert(req.clone(), vec![a1, a2]);
         engine.offload_drains.insert(req.clone(), ());
 
@@ -3478,9 +3864,10 @@ mod tests {
         let req: RequestId = "rq".into();
         let a1 = ActionId::new();
         let cell1 = Arc::new(Mutex::new(ActionStatus::Pending));
-        engine
-            .actions
-            .insert(a1, ActionRecord::new(req.clone(), Arc::downgrade(&cell1)));
+        engine.actions.insert(
+            a1,
+            ActionRecord::new_save(req.clone(), Arc::downgrade(&cell1)),
+        );
         engine.by_request.insert(req.clone(), vec![a1]);
         engine.offload_drains.insert(req.clone(), ());
 
@@ -3569,10 +3956,8 @@ mod tests {
         Ok(())
     }
 
-    /// RAII: dropping each terminal offload handle prunes BOTH the `actions` map
-    /// and the `by_request` index (the action analogue of the onboard RAII test;
-    /// `finish_save_action` never removes from `actions`, so reaching 0 isolates
-    /// the handle-Drop → `release_action` path).
+    /// Each terminal offload stays indexed while its handle is live.
+    /// Handle drop calls `release_action`, which clears both indexes.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn offload_handle_drop_prunes_actions_and_by_request() -> Result<()> {
         let leader = Arc::new(build_test_leader().await?);
@@ -3597,7 +3982,7 @@ mod tests {
             engine.finish_forward_pass(i);
             wait_offload_complete(&handle).await;
             assert_eq!(handle.outcome(), Some(SaveOutcome::Done));
-            // RAII Drop -> release_action is the ONLY pruner exercised here.
+            // This live-handle path releases through `release_action`.
             drop(handle);
         }
 
@@ -3620,7 +4005,7 @@ mod tests {
     /// nothing, so a subsequent `set_remote_discovery` succeeds (`true`).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn search_remoteops_installs_discovery_disabled_does_not() -> Result<()> {
-        use super::super::{ConnectorEngineConfig, RemoteOps, build_local_connector_engine};
+        use super::super::{RemoteOps, build_local_connector_engine};
         use crate::remote::search::discovery::{
             RemoteBlockDiscovery, RemoteCandidates, RemoteDiscoveryHandle,
         };
@@ -3644,10 +4029,7 @@ mod tests {
         let _engine = build_local_connector_engine(
             search_leader.clone(),
             NoopWorkerSink::new(),
-            ConnectorEngineConfig {
-                block_size: BS,
-                remote: RemoteOps::with_search(stub()),
-            },
+            connector_config(BS, RemoteOps::with_search(stub())),
             None,
         );
         assert!(
@@ -3660,10 +4042,7 @@ mod tests {
         let _engine = build_local_connector_engine(
             disabled_leader.clone(),
             NoopWorkerSink::new(),
-            ConnectorEngineConfig {
-                block_size: BS,
-                remote: RemoteOps::default(),
-            },
+            connector_config(BS, RemoteOps::default()),
             None,
         );
         assert!(
@@ -3709,7 +4088,7 @@ mod tests {
         use crate::remote::cd::policy::SelectionPolicy;
         use crate::testing::managers::{TestManagerBuilder, TestRegistryBuilder};
         use crate::testing::token_blocks::create_token_sequence;
-        use crate::{ConnectorEngineConfig, RemoteOps, build_local_connector_engine};
+        use crate::{RemoteOps, build_local_connector_engine};
 
         // ----- fixtures: real G2 immutable blocks + recording prefill plane -----
 
@@ -3952,9 +4331,9 @@ mod tests {
             let plane = RecordingPrefillPlane::ok();
 
             // Factory path: exercises with_disagg + mod.rs CdRuntime construction.
-            let config = ConnectorEngineConfig {
-                block_size: BS,
-                remote: RemoteOps::default().with_disagg(
+            let config = connector_config(
+                BS,
+                RemoteOps::default().with_disagg(
                     factory.clone(),
                     plane.clone(),
                     Arc::new(TierCell::default()),
@@ -3965,7 +4344,7 @@ mod tests {
                         ..DisaggConfig::default()
                     },
                 ),
-            };
+            );
             let (engine, _driver) =
                 build_local_connector_engine(Arc::new(leader), NoopWorkerSink::new(), config, None);
 
@@ -5104,15 +5483,15 @@ mod tests {
             let leader = Arc::new(build_test_leader().await?);
             let factory = MockSessionFactory::new();
             let plane = RecordingPrefillPlane::ok();
-            let config = ConnectorEngineConfig {
-                block_size: BS,
-                remote: RemoteOps::default().with_disagg(
+            let config = connector_config(
+                BS,
+                RemoteOps::default().with_disagg(
                     factory,
                     plane,
                     Arc::new(TierCell::default()),
                     DisaggConfig::default(),
                 ),
-            };
+            );
             let (_engine, _driver) =
                 build_local_connector_engine(leader, NoopWorkerSink::new(), config, None);
             Ok(())
@@ -8865,10 +9244,12 @@ mod tests {
         ) -> FindBlocksRequest {
             FindBlocksRequest {
                 request_id: request_id.to_string(),
+                cache: kvbm_protocols::connector::CacheScope::LegacyPrimary,
                 sequence_hashes: Arc::from(sequence_hashes),
                 num_computed_tokens,
                 total_tokens,
                 transfer_params: None,
+                local_prefill_estimate: None,
             }
         }
 
@@ -8886,12 +9267,14 @@ mod tests {
             params.num_provided_tokens = provided_tokens;
             FindBlocksRequest {
                 request_id: "rq".to_string(),
+                cache: kvbm_protocols::connector::CacheScope::LegacyPrimary,
                 sequence_hashes: Arc::from(plhs.to_vec()),
                 num_computed_tokens: computed_tokens,
                 total_tokens,
                 transfer_params: Some(kvbm_protocols::disagg::TransferParams::remote_prefill(
                     params,
                 )),
+                local_prefill_estimate: None,
             }
         }
 
@@ -9015,6 +9398,7 @@ mod tests {
         /// manager, invisible to its leader). Recording workers capture the
         /// delegation onboard's G2→G1 transfers.
         struct FallthroughRig {
+            holder_f: Arc<MockSessionFactory>,
             workers: Arc<RecordingWorkers>,
             engine: Arc<LocalConnectorEngine>,
             plhs: Vec<SequenceHash>,
@@ -9025,7 +9409,7 @@ mod tests {
             use crate::testing::messenger::create_messenger_tcp;
             use kvbm_logical::blocks::BlockRegistry;
 
-            let (_holder_f, puller_f) = MockSessionFactory::make_paired();
+            let (holder_f, puller_f) = MockSessionFactory::make_paired();
             let resolver = RecordingResolver::new();
             let workers = RecordingWorkers::new();
             let messenger = create_messenger_tcp().await?;
@@ -9061,11 +9445,17 @@ mod tests {
                 Some(cd),
             );
             Ok(FallthroughRig {
+                holder_f,
                 workers,
                 engine,
                 plhs,
                 _held: held,
             })
+        }
+
+        fn open_fallthrough_holder(rig: &FallthroughRig, session_id: Uuid) -> Arc<MockSession> {
+            rig.holder_f.open(session_id).expect("holder open");
+            rig.holder_f.last_opened().expect("holder recorded")
         }
 
         /// Fresh local hit: token-granular `hit_blocks × block_size`, a minted
@@ -9746,11 +10136,13 @@ mod tests {
                 SearchId::new(),
                 Arc::downgrade(&dyn_engine),
             );
+            let session_id = Uuid::new_v4();
+            let holder = open_fallthrough_holder(&rig, session_id);
             let req = fb_prefill_req(
                 &rig.plhs,
-                Uuid::new_v4(),
+                session_id,
                 Uuid::new_v4().into(),
-                None,
+                holder.endpoint(),
                 BS,
                 0,
                 3 * BS + 1,
@@ -10098,13 +10490,15 @@ mod tests {
         async fn find_blocks_prefill_fallthrough_local_hit_binds_internal_search() -> Result<()> {
             let rig = fallthrough_rig(4).await?;
             let cdr = rig.engine.cd.as_ref().unwrap();
+            let session_id = Uuid::new_v4();
+            let holder = open_fallthrough_holder(&rig, session_id);
 
             // provided == computed → zero external; chain[1..4] resident.
             let req = fb_prefill_req(
                 &rig.plhs,
-                Uuid::new_v4(),
+                session_id,
                 Uuid::new_v4().into(),
-                None,
+                holder.endpoint(),
                 BS,
                 BS,
                 4 * BS + 1,
@@ -10138,6 +10532,8 @@ mod tests {
         async fn find_blocks_prefill_fallthrough_internal_mint_exempt_from_deferral() -> Result<()>
         {
             let rig = fallthrough_rig(4).await?;
+            let session_id = Uuid::new_v4();
+            let holder = open_fallthrough_holder(&rig, session_id);
 
             // An in-flight onboard covers part of the eligible window.
             rig.engine
@@ -10156,9 +10552,9 @@ mod tests {
             // The dispatched prefill's fall-through mint proceeds.
             let req = fb_prefill_req(
                 &rig.plhs,
-                Uuid::new_v4(),
+                session_id,
                 Uuid::new_v4().into(),
-                None,
+                holder.endpoint(),
                 BS,
                 BS,
                 4 * BS + 1,
@@ -10175,12 +10571,14 @@ mod tests {
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn onboard_blocks_zero_stored_delegates_to_bound_search() -> Result<()> {
             let rig = fallthrough_rig(4).await?;
+            let session_id = Uuid::new_v4();
+            let holder = open_fallthrough_holder(&rig, session_id);
 
             let req = fb_prefill_req(
                 &rig.plhs,
-                Uuid::new_v4(),
+                session_id,
                 Uuid::new_v4().into(),
-                None,
+                holder.endpoint(),
                 BS,
                 BS,
                 4 * BS + 1,
@@ -10233,12 +10631,14 @@ mod tests {
         async fn find_blocks_handle_drop_releases_prefill_and_bound_search() -> Result<()> {
             let rig = fallthrough_rig(4).await?;
             let cdr = rig.engine.cd.as_ref().unwrap();
+            let session_id = Uuid::new_v4();
+            let holder = open_fallthrough_holder(&rig, session_id);
 
             let req = fb_prefill_req(
                 &rig.plhs,
-                Uuid::new_v4(),
+                session_id,
                 Uuid::new_v4().into(),
-                None,
+                holder.endpoint(),
                 BS,
                 BS,
                 4 * BS + 1,

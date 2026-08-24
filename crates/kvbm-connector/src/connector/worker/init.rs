@@ -35,7 +35,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use derive_builder::Builder;
-use dynamo_memory::TensorDescriptor;
+use kvbm_memory::TensorDescriptor;
 
 use kvbm_physical::transfer::context::TokioRuntime;
 
@@ -61,6 +61,10 @@ use kvbm_common::{BlockLayoutMode, KvBlockLayout, LogicalLayoutHandle};
 use kvbm_physical::TransferManager;
 use kvbm_physical::layout::{BlockDimension, LayoutConfig, PhysicalLayoutBuilder};
 use kvbm_physical::transfer::TransferCapabilities;
+
+mod resources;
+
+pub(super) use resources::PendingWorkerResources;
 
 /// Whether the registered tensors describe a per-layer set of allocations
 /// (vLLM's default `register_kv_caches` path) or a single cross-layer
@@ -148,7 +152,7 @@ impl PendingWorkerStateBuilder {
     /// - If first tensor is not on a CUDA device
     pub fn build(mut self) -> Result<PendingWorkerState> {
         use anyhow::{bail, ensure};
-        use dynamo_memory::TensorDescriptorExt;
+        use kvbm_memory::TensorDescriptorExt;
 
         // Validate tensors first (before build_internal which requires cuda_device_id)
         let tensors = self
@@ -317,13 +321,12 @@ impl PendingWorkerState {
 
         // 6. Create G2/G3 layouts based on leader config and parallelism mode
         //
-        // For ReplicatedData mode: only rank 0 gets G2/G3 layouts
-        // For TensorParallel mode: all workers get G2/G3 layouts
+        // Every worker receives G2/G3 physical capacity. Tensor-parallel
+        // workers store one shard of every logical block; replicated-data
+        // workers contribute disjoint canonical block stripes.
         // For host-bypass mode (DYN_KVBM_DISK_CACHE_GB set, DYN_KVBM_CPU_CACHE_GB
         // unset): G2 is skipped on every rank — transfers go G1↔G3 directly via
         // GDS. G3 still gets allocated normally.
-        let skip_g2_g3 =
-            config.parallelism == kvbm_config::ParallelismMode::ReplicatedData && config.rank > 0;
         let bypass_host = runtime.config().cache.bypass_host_cache();
 
         // c3: G2 (and G3) layout selection. Operational mode keeps the
@@ -343,14 +346,7 @@ impl PendingWorkerState {
             "Selected G1/G2 block layouts"
         );
 
-        let (g2_handle, g3_handle) = if skip_g2_g3 {
-            tracing::info!(
-                rank = config.rank,
-                parallelism = ?config.parallelism,
-                "Skipping G2/G3 layout creation (ReplicatedData mode, rank > 0)"
-            );
-            (None, None)
-        } else {
+        let (g2_handle, g3_handle) = {
             tracing::info!(
                 host_block_count = config.host_block_count,
                 disk_block_count = ?config.disk_block_count,
@@ -478,7 +474,7 @@ impl PendingWorkerState {
             .g1_handle(g1_handle)
             .rank(config.rank);
 
-        // Optional G2 handle (not present for ReplicatedData rank > 0)
+        // Optional G2 handle (absent only in host-bypass mode).
         if let Some(g2) = g2_handle {
             builder = builder.g2_handle(g2);
         }

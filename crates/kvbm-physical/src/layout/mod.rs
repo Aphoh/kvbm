@@ -54,8 +54,8 @@ use std::any::Any;
 
 use anyhow::{Result, bail};
 
-pub(crate) use dynamo_memory::MemoryDescriptor;
-pub use dynamo_memory::{Buffer, MemoryRegion};
+pub(crate) use kvbm_memory::MemoryDescriptor;
+pub use kvbm_memory::{Buffer, MemoryRegion};
 
 /// Resolve `(num_heads, head_dim)` from a config, requiring `num_heads`
 /// to be set when the projection has been asked to honour a known

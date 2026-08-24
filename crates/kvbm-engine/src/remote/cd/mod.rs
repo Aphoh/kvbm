@@ -13,6 +13,7 @@
 
 pub(crate) mod budget;
 pub(crate) mod commit;
+pub(crate) mod cost;
 pub(crate) mod decode;
 pub(crate) mod output;
 pub(crate) mod policy;
@@ -50,6 +51,17 @@ pub struct DisaggConfig {
     /// On inflight-budget exhaustion: `true` downgrades the Remote decision to a
     /// local prefill; `false` rejects it (no external match onboarded).
     pub(crate) local_fallback_on_overload: bool,
+    /// Static transfer/compute cost guard. A missing maximum keeps the guard
+    /// inert for backward compatibility.
+    pub(crate) cost: cost::CostModel,
+    /// Strict placement headroom: remote plus this margin must beat local.
+    pub(crate) decision_margin: Duration,
+    /// Estimated bytes occupied by all logical resources for one token.
+    pub(crate) bundle_bytes_per_token: u64,
+    /// Bound for queue acceptance plus target-bundle publication.
+    pub(crate) bundle_prefill_timeout: Duration,
+    /// Directory poll interval while awaiting the target bundle.
+    pub(crate) bundle_prefill_poll: Duration,
     /// Poll interval of the prefill release's deferred-finalize drain — how
     /// often the drain task re-checks the output observer's `has_pending`.
     pub(crate) output_drain_poll: Duration,
@@ -65,6 +77,11 @@ impl Default for DisaggConfig {
             selection: SelectionPolicy::Never,
             max_inflight_remote_prefill_tokens: usize::MAX,
             local_fallback_on_overload: true,
+            cost: cost::CostModel::default(),
+            decision_margin: Duration::ZERO,
+            bundle_bytes_per_token: 0,
+            bundle_prefill_timeout: Duration::from_secs(10),
+            bundle_prefill_poll: Duration::from_millis(10),
             output_drain_poll: Duration::from_millis(2),
             output_drain_watchdog: Duration::from_secs(10),
         }
@@ -102,6 +119,15 @@ impl DisaggConfig {
             selection,
             max_inflight_remote_prefill_tokens: cfg.max_inflight_remote_prefill_tokens,
             local_fallback_on_overload: cfg.cd_local_fallback_on_overload,
+            cost: cost::CostModel::new(
+                Duration::from_millis(cfg.remote_prefill_fixed_cost_ms),
+                cfg.remote_prefill_bytes_per_second,
+                cfg.remote_prefill_tokens_per_second,
+                cfg.max_remote_prefill_cost_ms.map(Duration::from_millis),
+            ),
+            decision_margin: Duration::from_millis(cfg.remote_prefill_decision_margin_ms),
+            bundle_bytes_per_token: cfg.bundle_bytes_per_token,
+            bundle_prefill_timeout: Duration::from_millis(cfg.bundle_prefill_timeout_ms),
             ..Self::default()
         }
     }
@@ -159,11 +185,13 @@ mod tests {
         let cfg = kvbm_config::DisaggConfig {
             max_inflight_remote_prefill_tokens: 4096,
             cd_local_fallback_on_overload: false,
+            remote_prefill_decision_margin_ms: 17,
             ..connector_cfg(DisaggregationRole::Decode)
         };
         let translated = DisaggConfig::from_connector_config(&cfg);
         assert_eq!(translated.max_inflight_remote_prefill_tokens, 4096);
         assert!(!translated.local_fallback_on_overload);
+        assert_eq!(translated.decision_margin, Duration::from_millis(17));
     }
 
     #[test]

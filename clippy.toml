@@ -1,0 +1,7 @@
+# Isolates the kvbm workspace from any ambient parent clippy.toml (clippy's config
+# lookup walks the filesystem upward, unbounded by workspace/git boundaries — when
+# kvbm is vendored as a submodule under the rhino checkout it would otherwise inherit
+# rhino's disallowed-macros rule and fail on the fork's plain assert! test code).
+# Standalone this file is a near-no-op over clippy defaults; the threshold below suits
+# this kernel-heavy codebase and matches the rhino parent's convention.
+too-many-arguments-threshold = 12

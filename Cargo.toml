@@ -30,7 +30,6 @@ kernels = ["dep:kvbm-kernels", "dep:cudarc", "dep:once_cell"]
 # kvbm-hub + velo.
 hub = [
     "dep:kvbm-hub",
-    "dep:kvbm-protocols",
     "dep:velo",
     "dep:velo-ext",
     "dep:tokio",
@@ -41,14 +40,14 @@ hub = [
 [dependencies]
 # Connector deps — path deps into the crates/ workspace
 kvbm-common = { path = "crates/kvbm-common" }
-kvbm-connector = { path = "crates/kvbm-connector", features = ["static-kernels"] }
+kvbm-connector = { path = "crates/kvbm-connector", features = ["static-kernels", "nccl"] }
 
 # kernels deps (optional)
 kvbm-kernels = { path = "crates/kvbm-kernels", optional = true }
 
 # hub deps (optional)
 kvbm-hub = { path = "crates/kvbm-hub", optional = true }
-kvbm-protocols = { path = "crates/kvbm-protocols", optional = true }
+kvbm-protocols = { path = "crates/kvbm-protocols" }
 velo = { version = "0.4.1", optional = true }
 velo-ext = { version = "0.2.0", optional = true }
 tokio = { version = "1.46", features = ["rt-multi-thread", "sync", "macros", "time"], optional = true }

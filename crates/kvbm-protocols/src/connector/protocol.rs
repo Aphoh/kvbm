@@ -10,10 +10,13 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub use crate::cache_manifest::CacheScope;
+use crate::cache_manifest::{BundleKey, CacheIdentity};
 use crate::disagg::TransferParams;
 
 use super::handles::FindBlocksHandle;
@@ -116,11 +119,61 @@ impl FenceToken {
 // Unified find / onboard seam
 // ---------------------------------------------------------------------------
 
+/// Scheduler-owned local-prefill cost assumptions for one placement decision.
+///
+/// The engine applies the rate to the suffix that remains after the greatest
+/// complete bundle seed, so the scheduler does not need to predict which cache
+/// boundary will win. A zero rate omits compute time while retaining the queue
+/// estimate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalPrefillEstimate {
+    queue: Duration,
+    tokens_per_second: u64,
+}
+
+impl LocalPrefillEstimate {
+    /// Construct an estimate from current queue/load delay and effective local
+    /// prefill throughput.
+    pub const fn from_rate(queue: Duration, tokens_per_second: u64) -> Self {
+        Self {
+            queue,
+            tokens_per_second,
+        }
+    }
+
+    /// Estimate queue plus compute time for `tokens` remaining local tokens.
+    pub fn estimate(self, tokens: usize) -> Duration {
+        let tokens = u64::try_from(tokens).unwrap_or(u64::MAX);
+        self.queue
+            .saturating_add(Duration::from_nanos(estimate_nanos(
+                tokens,
+                self.tokens_per_second,
+            )))
+    }
+
+    /// Current scheduler queue/load delay.
+    pub const fn queue(self) -> Duration {
+        self.queue
+    }
+}
+
+fn estimate_nanos(tokens: u64, tokens_per_second: u64) -> u64 {
+    if tokens == 0 || tokens_per_second == 0 {
+        return 0;
+    }
+    let nanos = u128::from(tokens)
+        .saturating_mul(1_000_000_000)
+        .div_ceil(u128::from(tokens_per_second));
+    u64::try_from(nanos).unwrap_or(u64::MAX)
+}
+
 /// Input to [`super::engine::LeaderEngine::find_blocks`]. Hashes and counts
 /// only — token ids never cross the seam.
 #[derive(Debug, Clone)]
 pub struct FindBlocksRequest {
     pub request_id: RequestId,
+    /// Explicit legacy-primary or manifest-scoped cache contract.
+    pub cache: CacheScope,
     /// Full per-block hash chain in absolute-position order.
     pub sequence_hashes: Arc<[SequenceHash]>,
     /// vLLM's `num_computed_tokens` at this poll.
@@ -129,6 +182,66 @@ pub struct FindBlocksRequest {
     pub total_tokens: usize,
     /// The slot's parsed `kv_transfer_params`, passed through whole.
     pub transfer_params: Option<TransferParams>,
+    /// Optional scheduler-owned queue/load estimate used by complete-bundle
+    /// conditional-prefill placement. Absence fails closed to local execution.
+    pub local_prefill_estimate: Option<LocalPrefillEstimate>,
+}
+
+/// One exact G2-to-G1 restore within a logical model resource.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceOnboard {
+    pub resource: kvbm_common::LogicalResourceId,
+    pub source_block_ids: Vec<BlockId>,
+    pub destination_block_ids: Vec<BlockId>,
+}
+
+/// One vLLM G1 destination allocation for a manifest logical resource.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceDestination {
+    pub resource: kvbm_common::LogicalResourceId,
+    pub block_ids: Vec<BlockId>,
+}
+
+/// One exact G1-to-G2 save within a logical model resource.
+///
+/// Within a [`BundleOffloadPlan`], prefix-history resources carry the complete
+/// native-block chain through the bundle boundary. A boundary capsule carries
+/// one logical object even when that object spans several physical pools.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceOffload {
+    pub resource: kvbm_common::LogicalResourceId,
+    pub blocks: Vec<(SequenceHash, BlockId)>,
+}
+
+/// Source-tier retention after an atomic bundle offload commits.
+///
+/// The source owner must keep external G1 ownership live until the parent
+/// offload handle reaches terminal. It then applies this disposition: retain
+/// the allocation for `Mirror`, release it for `Move`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OffloadMode {
+    /// Publish the G2 bundle while retaining the G1 source allocation.
+    Mirror,
+    /// Release the G1 source allocation only after the G2 bundle commits.
+    Move,
+}
+
+/// Atomic multi-resource G1-to-G2 save contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BundleOffloadPlan {
+    pub identity: CacheIdentity,
+    pub key: BundleKey,
+    pub mode: OffloadMode,
+    pub resources: Vec<ResourceOffload>,
+}
+
+/// Atomic multi-resource G2-to-G1 restore contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BundleOnboardPlan {
+    pub identity: CacheIdentity,
+    pub key: BundleKey,
+    pub resources: Vec<ResourceOnboard>,
 }
 
 /// Outcome of [`super::engine::LeaderEngine::find_blocks`]. Encodes everything
@@ -172,6 +285,12 @@ pub enum ActionFailure {
     AllBlocks,
     /// Named G1 block ids failed.
     Partial { block_ids: Vec<usize> },
+    /// One logical resource failed, optionally with concrete G1 source block
+    /// ids for offload or G1 destination block ids for onboard.
+    Resource {
+        resource: kvbm_common::LogicalResourceId,
+        block_ids: Option<Vec<usize>>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -203,6 +322,22 @@ pub struct EvictionOutcome {
 /// Synchronous error from the leader seam.
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum LeaderEngineError {
+    /// An explicit model resource has no G1-to-G2 execution route.
+    #[error("G1-to-G2 offload is not configured for logical resource {resource:?}")]
+    ResourceOffloadNotConfigured {
+        resource: kvbm_common::LogicalResourceId,
+    },
+    /// An explicit resource has no G2-to-G1 execution route.
+    #[error("G2-to-G1 onboard is not configured for logical resource {resource:?}")]
+    ResourceOnboardNotConfigured {
+        resource: kvbm_common::LogicalResourceId,
+    },
+    /// A resource-batched restore request is structurally invalid.
+    #[error("invalid resource onboard: {reason}")]
+    InvalidResourceOnboard { reason: String },
+    /// A bundle plan is structurally inconsistent with its manifest identity.
+    #[error("invalid bundle transfer: {reason}")]
+    InvalidBundleTransfer { reason: String },
     /// `onboard_blocks` routed to a local search whose pin is no longer live.
     #[error("search not matched (pin lost or still pending)")]
     SearchNotMatched,

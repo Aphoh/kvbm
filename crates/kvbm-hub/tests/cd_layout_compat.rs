@@ -22,7 +22,7 @@ use kvbm_common::shape::CanonicalBlockShape;
 use kvbm_common::{BlockLayoutMode, KvBlockLayout};
 use kvbm_hub::protocol::{
     ConditionalDisaggConfig, ConditionalDisaggRole, ErrorBody, Feature, P2pConfig, RegisterRequest,
-    instance_by_id, instance_describe, paths, peers_by_instance,
+    RegisterResponse, instance_by_id, instance_describe, paths, peers_by_instance,
 };
 use kvbm_hub::{
     ConditionalDisaggManager, ControlPlaneManager, FeatureManager, HubServer, P2pManager,
@@ -1068,9 +1068,14 @@ async fn describe_push_after_p2p_unregister_not_found() {
 
     let resp = post_p2p_register(&server, &peer, baseline.clone()).await;
     assert_eq!(resp.status(), 200);
+    let registration: RegisterResponse = resp.json().await.unwrap();
 
     let resp = http()
         .delete(control_url(&server, &instance_by_id(peer.instance_id())))
+        .header(
+            kvbm_hub::protocol::MUTATION_CREDENTIAL_HEADER,
+            registration.mutation_credential.unwrap().to_header_value(),
+        )
         .send()
         .await
         .expect("DELETE /v1/instances/{id}");

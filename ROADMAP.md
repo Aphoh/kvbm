@@ -52,9 +52,11 @@ day-to-day development; they are the forward work.
   `ai-dynamo/dynamo` branch the deps point at is private.
 
 ### Pin the dynamo git-deps to an immutable rev
-- `crates/Cargo.toml` git-deps `dynamo-tokens` / `dynamo-memory` / `dynamo-kv-router` /
+- `crates/Cargo.toml` git-deps `dynamo-tokens` / `dynamo-kv-router` /
   `dynamo-kv-hashing` on the floating branch `ryan/kvbm-engine-service`. Pin to an immutable
   rev (or tag) for reproducible builds, and keep that branch alive until then.
+  (`dynamo-memory` was replaced by the locally-owned `kvbm-memory` crate — no
+  longer a git dep.)
 
 ### Durable vllm wheel for the dev/CI venv
 - The GB10 venv needs `vllm 0.19.1rc1.dev232+cu130`, which has been GC'd from the nightly

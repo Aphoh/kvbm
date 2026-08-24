@@ -38,6 +38,9 @@ pub(crate) struct PlanInputs {
     pub(crate) matched_tokens: usize,
     /// Block granularity used to floor the external prefill window.
     pub(crate) block_size: usize,
+    /// Estimated bytes in the complete target bundle. Zero disables the byte
+    /// component while preserving token-only legacy decisions.
+    pub(crate) bundle_bytes: u64,
 }
 
 /// Final placement decision for one decode GNMT call.
@@ -93,6 +96,8 @@ pub(crate) enum LocalReason {
     /// The inflight budget is exhausted and `local_fallback_on_overload` downgraded
     /// the request rather than rejecting it.
     OverloadFallback,
+    /// The static transfer/compute estimate exceeds the configured TTFT guard.
+    CostGuard,
 }
 
 /// Derive the decode placement decision for one GNMT call.
@@ -152,6 +157,15 @@ pub(crate) fn plan(
             if full_block_external_tokens == 0 {
                 return PlanOutcome::Local {
                     reason: LocalReason::ZeroBlock,
+                };
+            }
+
+            if !cfg
+                .cost
+                .allows(full_block_external_tokens, inputs.bundle_bytes)
+            {
+                return PlanOutcome::Local {
+                    reason: LocalReason::CostGuard,
                 };
             }
 
@@ -227,6 +241,7 @@ mod tests {
             num_computed_tokens: computed,
             matched_tokens: matched,
             block_size: BS,
+            bundle_bytes: 0,
         }
     }
 
@@ -354,6 +369,29 @@ mod tests {
             }
         );
         assert_eq!(budget.available(), 256 - 4 * BS);
+    }
+
+    #[test]
+    fn bundle_cost_guard_rejects_remote_work_above_ttft_limit() {
+        let mut cfg = always(true);
+        cfg.cost = super::super::cost::CostModel::new(
+            std::time::Duration::from_millis(4),
+            1_000_000,
+            10_000,
+            Some(std::time::Duration::from_millis(5)),
+        );
+        let tier = TierCell::default();
+        let budget = InflightBudget::new(256);
+        let mut input = inputs(4 * BS, 0, 0);
+        input.bundle_bytes = 4_000_000;
+
+        assert_eq!(
+            plan(&cfg, &tier, &budget, &input),
+            PlanOutcome::Local {
+                reason: LocalReason::CostGuard
+            }
+        );
+        assert_eq!(budget.available(), 256);
     }
 
     #[test]
