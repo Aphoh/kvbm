@@ -34,7 +34,10 @@
 //! variant is O(1) and allocation-free but appends a re-leafed node at the
 //! tail instead; it is opt-in via `with_lineage_backend_eviction`.
 
+#[cfg(test)]
+mod advice_tests;
 mod eviction;
+mod hold;
 #[cfg(test)]
 mod trace_tests;
 mod valued;
@@ -49,7 +52,8 @@ use dynamo_tokens::PositionalLineageHash;
 
 use crate::BlockId;
 use crate::blocks::SequenceHash;
-use crate::pools::store::InactiveIndex;
+use crate::pools::advice::{InactiveFeatures, evict_rank_for};
+use crate::pools::store::{ExactReclaimPlanError, InactiveIndex};
 
 // ---------------------------------------------------------------------------
 // `(position, fragment)` index hasher
@@ -489,6 +493,32 @@ impl LineageBackend {
         }
     }
 
+    /// `(seq_hash, block_id)` of the `Real` node at `idx`; `None` for a ghost or
+    /// freed slot.
+    fn real_payload(&self, idx: u32) -> Option<(SequenceHash, BlockId)> {
+        match self.slots.get(idx as usize)?.data {
+            SlotData::Real { seq_hash, block_id } => Some((seq_hash, block_id)),
+            _ => None,
+        }
+    }
+
+    /// Read-only feature snapshot for the `Real` node at `idx`: the leaf
+    /// policy's per-node advice plus the graph's own structural `is_leaf`, with
+    /// the caller-supplied peek-relative rank. Mutates nothing.
+    fn features_for(&self, idx: u32, evict_rank: Option<u8>) -> InactiveFeatures {
+        let advice = self.leaves.advice_for(idx);
+        InactiveFeatures {
+            poisoned: advice.poisoned,
+            // Structural truth from the graph, not from policy membership: an
+            // interior node is unevictable no matter what the policy thinks.
+            is_leaf: self.slots[idx as usize].is_leaf(),
+            age_ticks: advice.age_ticks,
+            freq_estimate: advice.freq_estimate,
+            max_fanout: advice.max_fanout,
+            evict_rank,
+        }
+    }
+
     /// A node is a (shared) branch point if it currently has ≥ 2 children, or — for a
     /// `Real` node — its monotone high-water `max_fanout` is ≥ 2 (a re-leafed branch point
     /// that may re-fork). A ghost has no hash, so only its current child count counts.
@@ -576,6 +606,25 @@ impl InactiveIndex for LineageBackend {
         })
     }
 
+    #[cfg(test)]
+    fn contains(&self, seq_hash: SequenceHash, block_id: BlockId) -> bool {
+        let position = seq_hash.position();
+        let fragment = seq_hash.parent_fragment_for_child_position(position + 1);
+        self.index.get(&(position, fragment)).is_some_and(|&idx| {
+            match self.slots[idx as usize].data {
+                SlotData::Real {
+                    seq_hash: stored,
+                    block_id: stored_id,
+                } => {
+                    stored == seq_hash
+                        && stored_id == block_id
+                        && self.slots[idx as usize].is_leaf()
+                }
+                _ => false,
+            }
+        })
+    }
+
     fn take(&mut self, seq_hash: SequenceHash, block_id: BlockId) -> bool {
         // Match on the full `SequenceHash` AND the block id — the
         // `(position, fragment)` key alone can collide across distinct PLHs.
@@ -597,6 +646,46 @@ impl InactiveIndex for LineageBackend {
         }
     }
 
+    fn take_complete_lineage(
+        &mut self,
+        seq_hash: SequenceHash,
+        block_id: BlockId,
+    ) -> Option<Vec<(SequenceHash, BlockId)>> {
+        self.take_exact_complete_lineage(seq_hash, block_id)
+    }
+
+    fn complete_lineage(
+        &self,
+        seq_hash: SequenceHash,
+        block_id: BlockId,
+    ) -> Option<Vec<(SequenceHash, BlockId)>> {
+        self.exact_complete_lineage(seq_hash, block_id)
+    }
+
+    fn supports_exact_reclaim(&self) -> bool {
+        true
+    }
+
+    fn exact_block_id(&self, seq_hash: SequenceHash) -> Option<BlockId> {
+        let position = seq_hash.position();
+        let fragment = seq_hash.parent_fragment_for_child_position(position + 1);
+        let index = *self.index.get(&(position, fragment))?;
+        match self.slots[index as usize].data {
+            SlotData::Real {
+                seq_hash: stored,
+                block_id,
+            } if stored == seq_hash => Some(block_id),
+            _ => None,
+        }
+    }
+
+    fn preflight_exact_reclaim(
+        &self,
+        victims: &[crate::ExactInactiveVictim],
+    ) -> Result<(), ExactReclaimPlanError> {
+        LineageBackend::preflight_exact_reclaim(self, victims)
+    }
+
     fn poison(&mut self, seq_hash: SequenceHash) {
         self.poison_suffix(seq_hash);
     }
@@ -608,6 +697,69 @@ impl InactiveIndex for LineageBackend {
         match self.index.get(&(position, fragment)) {
             Some(&idx) => self.leaves.test_is_poisoned(idx),
             None => false,
+        }
+    }
+
+    /// Up to `max` of the *currently evictable* leaves, worst-first by the
+    /// leaf policy's ranking, with their features. Only leaves are ever
+    /// returned — an interior node is structurally unevictable — so a consumer
+    /// must reach interior nodes through [`Self::advice`] instead.
+    ///
+    /// # Why this is not a drain preview
+    ///
+    /// The ranking covers the leaf set as it stands. Evicting a leaf can
+    /// re-leaf its parent (`on_leaf_added`) — a node this peek could not have
+    /// listed, since it was interior at the time. `Tick`/`Fifo` re-admit it at
+    /// its own older position, ahead of leaves listed behind it; `Valued`
+    /// restamps `last_touch` there, so it re-enters as the *freshest* leaf and
+    /// sinks to the back instead. Either way the drain diverges, so only the
+    /// *head* is comparable to a real [`InactiveIndex::allocate`], and only where the
+    /// policy is exact: `Tick` and `Fifo` always, `Valued` for its poison
+    /// prefix (`Valued`'s unpoisoned pick is sampled, this scan is not). A
+    /// result shorter than `max` means "no more candidates were ranked", never
+    /// "the pool is empty" — `len` counts interior nodes too, and `Valued`
+    /// scores only a bounded window of `leaf_dense` per call.
+    ///
+    /// `evict_rank` is the entry's position *within this returned slice*
+    /// scaled to `[0, 255]`; it says nothing about the rest of the pool.
+    /// Read-only: no clock stamp, no RNG draw, no reordering (R7a §3.4).
+    fn peek_victims(&self, max: usize) -> Vec<(SequenceHash, BlockId, InactiveFeatures)> {
+        let slots = self.leaves.peek_slots(max);
+        let len = slots.len();
+        slots
+            .into_iter()
+            .enumerate()
+            .filter_map(|(rank, idx)| {
+                let Some((seq_hash, block_id)) = self.real_payload(idx) else {
+                    // The policy only ever holds `Real` leaves the backend
+                    // announced; a ghost/free slot here is a bookkeeping bug.
+                    debug_assert!(false, "leaf policy peeked a non-Real slot {idx}");
+                    return None;
+                };
+                let features = self.features_for(idx, evict_rank_for(rank, len));
+                Some((seq_hash, block_id, features))
+            })
+            .collect()
+    }
+
+    /// Point advice for `seq_hash`, O(1) through the `(position, fragment)`
+    /// index. Membership is the same rule `poison_suffix` uses: the node must
+    /// be `Real` *and* its stored full hash must equal `seq_hash` (the index
+    /// key alone can collide across distinct PLHs). A ghost placeholder, a hash
+    /// mismatch, or an absent key all report `None`.
+    ///
+    /// Interior nodes are visible here (with `is_leaf: false`) even though they
+    /// never appear in [`Self::peek_victims`]. `evict_rank` is always `None` —
+    /// rank is only defined within one peek batch.
+    fn advice(&self, seq_hash: SequenceHash) -> Option<InactiveFeatures> {
+        let position = seq_hash.position();
+        let fragment = seq_hash.parent_fragment_for_child_position(position + 1);
+        let &idx = self.index.get(&(position, fragment))?;
+        match self.slots[idx as usize].data {
+            SlotData::Real {
+                seq_hash: stored, ..
+            } if stored == seq_hash => Some(self.features_for(idx, None)),
+            _ => None,
         }
     }
 }
