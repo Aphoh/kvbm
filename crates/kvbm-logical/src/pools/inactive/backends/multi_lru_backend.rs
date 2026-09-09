@@ -9,13 +9,13 @@ use std::sync::Arc;
 
 use lru::LruCache;
 
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 
-use crate::BlockId;
 use crate::blocks::SequenceHash;
-use crate::pools::IdBuildHasher;
 use crate::pools::store::InactiveIndex;
+use crate::pools::IdBuildHasher;
 use crate::tinylfu::FrequencyTracker;
+use crate::BlockId;
 
 pub(crate) struct MultiLruBackend {
     /// Identity-hashed: `SequenceHash` is already a content hash.
@@ -76,6 +76,14 @@ impl MultiLruBackend {
 }
 
 impl InactiveIndex for MultiLruBackend {
+    fn grow_capacity(&mut self, capacity: usize) {
+        if let Some(capacity) = NonZeroUsize::new(capacity) {
+            for pool in &mut self.priority_pools {
+                pool.resize(capacity);
+            }
+        }
+    }
+
     fn find_matches(
         &mut self,
         hashes: &[SequenceHash],

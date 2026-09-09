@@ -7,10 +7,10 @@ use std::num::NonZeroUsize;
 
 use lru::LruCache;
 
-use crate::BlockId;
 use crate::blocks::SequenceHash;
-use crate::pools::IdBuildHasher;
 use crate::pools::store::InactiveIndex;
+use crate::pools::IdBuildHasher;
+use crate::BlockId;
 
 pub(crate) struct LruBackend {
     /// Identity-hashed: `SequenceHash` is already a content hash, so
@@ -27,6 +27,12 @@ impl LruBackend {
 }
 
 impl InactiveIndex for LruBackend {
+    fn grow_capacity(&mut self, capacity: usize) {
+        if let Some(capacity) = NonZeroUsize::new(capacity) {
+            self.cache.resize(capacity);
+        }
+    }
+
     fn find_matches(
         &mut self,
         hashes: &[SequenceHash],
