@@ -9,13 +9,13 @@ use std::sync::Arc;
 
 use lru::LruCache;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
-use crate::blocks::SequenceHash;
-use crate::pools::store::InactiveIndex;
-use crate::pools::IdBuildHasher;
-use crate::tinylfu::FrequencyTracker;
 use crate::BlockId;
+use crate::blocks::SequenceHash;
+use crate::pools::IdBuildHasher;
+use crate::pools::store::InactiveIndex;
+use crate::tinylfu::FrequencyTracker;
 
 pub(crate) struct MultiLruBackend {
     /// Identity-hashed: `SequenceHash` is already a content hash.

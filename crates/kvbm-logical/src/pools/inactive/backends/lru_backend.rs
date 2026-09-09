@@ -7,10 +7,10 @@ use std::num::NonZeroUsize;
 
 use lru::LruCache;
 
-use crate::blocks::SequenceHash;
-use crate::pools::store::InactiveIndex;
-use crate::pools::IdBuildHasher;
 use crate::BlockId;
+use crate::blocks::SequenceHash;
+use crate::pools::IdBuildHasher;
+use crate::pools::store::InactiveIndex;
 
 pub(crate) struct LruBackend {
     /// Identity-hashed: `SequenceHash` is already a content hash, so

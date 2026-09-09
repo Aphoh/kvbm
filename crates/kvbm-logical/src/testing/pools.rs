@@ -10,10 +10,10 @@ use std::sync::Arc;
 use derive_builder::Builder;
 
 use crate::blocks::BlockMetadata;
-use crate::metrics::{short_type_name, BlockPoolMetrics};
+use crate::metrics::{BlockPoolMetrics, short_type_name};
 use crate::pools::{
-    backends::{FifoReusePolicy, HashMapBackend},
     BlockStore,
+    backends::{FifoReusePolicy, HashMapBackend},
 };
 
 /// Configuration for setting up a test [`BlockStore`].
