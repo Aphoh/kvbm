@@ -8,13 +8,14 @@
 //! and a broadcast channel to allow multiple subscribers.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use anyhow::Result;
 use derive_builder::Builder;
 use futures::Stream;
 use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
 use super::policy::EventEmissionPolicy;
 use super::protocol::{EventReleaseHandle, KvCacheEvent};
@@ -69,7 +70,11 @@ impl EventsManagerSettings {
             .unwrap_or_else(|| Arc::new(super::policy::AllEventsPolicy::new()));
         let (event_tx, _) = broadcast::channel(self.channel_capacity);
 
-        EventsManager { policy, event_tx }
+        EventsManager {
+            policy,
+            event_tx,
+            lagged_events: Arc::new(AtomicU64::new(0)),
+        }
     }
 }
 
@@ -78,7 +83,7 @@ impl EventsManagerSettings {
 /// The EventsManager is responsible for:
 /// - Filtering block registrations based on a policy
 /// - Emitting Create events when blocks are registered
-/// - Attaching RAII handles that emit Remove events when blocks are dropped
+/// - Giving each registration the RAII handle that emits its Remove event
 /// - Broadcasting events to multiple subscribers via [`subscribe()`](Self::subscribe)
 ///
 /// Note: Instance context is applied at the publisher level via
@@ -98,6 +103,13 @@ impl EventsManagerSettings {
 pub struct EventsManager {
     policy: Arc<dyn EventEmissionPolicy>,
     event_tx: broadcast::Sender<KvCacheEvent>,
+    /// Count of events a slow subscriber never saw, summed over the
+    /// `Lagged(n)` reports of every subscriber stream. A dropped `Remove`
+    /// is request-visible. `query_holders` returns the deepest hash with a
+    /// holder, so one stale entry hides a live shallower holder until the
+    /// hub reaps the instance. This counter is the signal that loss
+    /// happened. It names no event and repairs nothing on its own.
+    lagged_events: Arc<AtomicU64>,
 }
 
 /// Builder for [`EventsManager`] that wraps [`EventsManagerSettingsBuilder`].
@@ -147,11 +159,28 @@ impl EventsManager {
     /// subscriber receives all events. Late subscribers will miss events that
     /// occurred before subscribing.
     ///
-    /// The stream filters out lagged errors (when events are dropped due to
-    /// slow consumption) and continues delivering subsequent events.
+    /// A slow subscriber makes the broadcast channel report `Lagged(n)` for
+    /// the `n` events it overwrote. The stream adds `n` to
+    /// [`Self::lagged_events`], logs a warning, and continues with the next
+    /// event. A dropped `Remove` hides a live holder from a later query, so
+    /// the stream counts the loss even though it does not repair it.
     pub fn subscribe(&self) -> impl Stream<Item = KvCacheEvent> + Send + 'static {
         let rx = self.event_tx.subscribe();
-        BroadcastStream::new(rx).filter_map(|result| result.ok())
+        let lagged_events = Arc::clone(&self.lagged_events);
+        BroadcastStream::new(rx).filter_map(move |result| match result {
+            Ok(event) => Some(event),
+            Err(BroadcastStreamRecvError::Lagged(n)) => {
+                lagged_events.fetch_add(n, Ordering::Relaxed);
+                tracing::warn!(dropped = n, "events subscriber lagged and lost events");
+                None
+            }
+        })
+    }
+
+    /// Cumulative count of events dropped, summed over the `Lagged(n)`
+    /// reports of every subscriber stream since this manager was built.
+    pub fn lagged_events(&self) -> u64 {
+        self.lagged_events.load(Ordering::Relaxed)
     }
 
     /// Hook called when a block is registered in the BlockRegistry.
@@ -159,19 +188,20 @@ impl EventsManager {
     /// This method:
     /// 1. Checks the policy to determine if an event should be emitted
     /// 2. Broadcasts a Create event if the policy allows
-    /// 3. Attaches an EventReleaseHandle to the registration handle for cleanup
+    /// 3. Gives the registration handle the RAII publisher of its Remove event
+    ///
+    /// `register_sequence_hash` calls this under the entry's position guard, so
+    /// both steps happen inside the critical section that orders this `Create`
+    /// against the `Remove` of the registration it replaces.
     ///
     /// # Arguments
     /// * `handle` - The block registration handle
-    ///
-    /// # Returns
-    /// Ok(()) if successful, or an error if attachment fails
-    pub fn on_block_registered(&self, handle: &BlockRegistrationHandle) -> Result<()> {
+    pub fn on_block_registered(&self, handle: &BlockRegistrationHandle) {
         let seq_hash = handle.seq_hash();
 
         // Check policy - only emit events for filtered blocks
         if !self.policy.should_emit(seq_hash) {
-            return Ok(());
+            return;
         }
 
         // Emit Create event
@@ -180,13 +210,7 @@ impl EventsManager {
         // Broadcast send only fails if there are no receivers, which is fine
         let _ = self.event_tx.send(create_event);
 
-        // Attach RAII handle for Remove event
-        let release_handle = EventReleaseHandle::new(seq_hash, self.event_tx.clone());
-
-        // Attach as Arc<dyn Any> to the registration handle
-        handle.attach_unique(Arc::new(release_handle))?;
-
-        Ok(())
+        handle.attach_event_release(EventReleaseHandle::new(seq_hash, self.event_tx.clone()));
     }
 }
 
@@ -219,7 +243,7 @@ mod tests {
         let handle = registry.register_sequence_hash(seq_hash);
 
         // Register the block
-        manager.on_block_registered(&handle).unwrap();
+        manager.on_block_registered(&handle);
 
         // Should receive Create event
         let event = tokio::time::timeout(std::time::Duration::from_millis(100), stream.next())
@@ -241,7 +265,7 @@ mod tests {
         let handle = registry.register_sequence_hash(seq_hash);
 
         // Register the block
-        manager.on_block_registered(&handle).unwrap();
+        manager.on_block_registered(&handle);
 
         // Should NOT receive any event (will timeout)
         let result =
@@ -264,7 +288,7 @@ mod tests {
 
         {
             let handle = registry.register_sequence_hash(seq_hash);
-            manager.on_block_registered(&handle).unwrap();
+            manager.on_block_registered(&handle);
 
             // Consume Create event
             let event = tokio::time::timeout(std::time::Duration::from_millis(100), stream.next())
@@ -297,7 +321,7 @@ mod tests {
         let seq_hash = create_seq_hash_at_position(64); // Power of 2
         let handle = registry.register_sequence_hash(seq_hash);
 
-        manager.on_block_registered(&handle).unwrap();
+        manager.on_block_registered(&handle);
 
         // Both streams should receive the same event
         let event1 = tokio::time::timeout(std::time::Duration::from_millis(100), stream1.next())
@@ -328,6 +352,44 @@ mod tests {
 
         // With AllEventsPolicy, all blocks should emit events
         // (this would fail with PowerOfTwoPolicy for position 17)
-        manager.on_block_registered(&handle).unwrap();
+        manager.on_block_registered(&handle);
+    }
+
+    #[tokio::test]
+    async fn lagged_events_are_counted() {
+        let manager = Arc::new(EventsManager::builder().channel_capacity(2).build());
+        let mut stream = Box::pin(manager.subscribe());
+
+        let registry = BlockRegistry::builder()
+            .event_manager(Arc::clone(&manager))
+            .build();
+
+        // Five registrations into a two-slot channel, with the stream never
+        // polled in between. The broadcast sender overwrites the three
+        // oldest before any subscriber reads them. Keep every handle alive
+        // so a Remove never competes with the Create events under test.
+        let mut handles = Vec::with_capacity(5);
+        for position in 0..5 {
+            let seq_hash = create_seq_hash_at_position(position);
+            handles.push(registry.register_sequence_hash(seq_hash));
+        }
+
+        let mut received = Vec::new();
+        while let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(100), stream.next()).await
+        {
+            received.push(event);
+        }
+
+        assert_eq!(
+            received.len(),
+            2,
+            "only the two surviving Create events arrive"
+        );
+        assert_eq!(
+            manager.lagged_events(),
+            3,
+            "the three overwritten events must be counted, not silently dropped"
+        );
     }
 }

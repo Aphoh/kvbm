@@ -4,6 +4,7 @@
 //! Exact G1-to-G2 route ownership for policy actions.
 
 mod installation;
+mod session_staging;
 mod source;
 mod state;
 mod transaction;
@@ -15,7 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use anyhow::Result;
-use kvbm_common::{LogicalLayoutHandle, LogicalResourceId};
+use kvbm_common::{LogicalLayoutHandle, LogicalResourceId, SequenceHash};
 use kvbm_logical::{BlockManager, InactiveLineageHold, ManagerId};
 use kvbm_physical::transfer::{TransferDrainOutcome, TransferOptions};
 use kvbm_protocols::connector::OffloadMode;
@@ -29,6 +30,7 @@ use crate::BlockId;
 use crate::leader::InstanceLeader;
 use installation::{ExactG1G2ManagerIdentity, ExactG1G2RouteIdentity, new_identity_pair};
 use source::PolicyG1G2Source;
+use state::PolicyG1G2Destination;
 use transaction::{PolicyG1G2Transaction, PolicyG1G2TransactionOwner, TransactionRoute};
 
 pub use installation::{
@@ -37,8 +39,9 @@ pub use installation::{
 
 pub use state::{
     PolicyCancelDisposition, PolicyG1G2CancelHandle, PolicyG1G2Completion, PolicyG1G2Execution,
-    PolicyG1G2ExecutionError, PolicyG1G2Reservation, PolicyG1G2SourceSettlement,
-    PolicyG1G2SubmitError, PolicyPhysicalCompletion, PolicyPhysicalTerminal,
+    PolicyG1G2ExecutionError, PolicyG1G2Reservation, PolicyG1G2ReserveError,
+    PolicyG1G2SourceSettlement, PolicyG1G2SubmitError, PolicyPhysicalCompletion,
+    PolicyPhysicalTerminal,
 };
 
 type TransferFuture = Pin<Box<dyn Future<Output = TransferDrainOutcome> + Send>>;
@@ -78,6 +81,7 @@ pub struct PolicyG1G2BoundRoute<T: PolicyG1SourceMetadata> {
     core: Arc<PolicyG1G2RouteCore>,
     binding: Arc<RouteBinding>,
     source_manager_id: ManagerId,
+    source_block_size: usize,
     _route_identity: ExactG1G2RouteIdentity,
     _manager_identity: ExactG1G2ManagerIdentity,
     source_type: PhantomData<fn() -> T>,
@@ -275,6 +279,7 @@ impl PolicyG1G2Installation {
         Ok(PolicyG1G2ValidatedInstallation {
             installation: self,
             manager_id: source_manager.id(),
+            block_size: source_manager.block_size(),
             source_type: PhantomData,
         })
     }
@@ -291,6 +296,7 @@ impl<T: PolicyG1SourceMetadata> PolicyG1G2ValidatedInstallation<T> {
             core: route.core,
             binding: Arc::new(RouteBinding),
             source_manager_id: self.manager_id,
+            source_block_size: self.block_size,
             _route_identity: route.identity,
             _manager_identity: manager_identity,
             source_type: PhantomData,
@@ -311,13 +317,36 @@ impl<T: PolicyG1SourceMetadata> PolicyG1G2BoundRoute<T> {
         }
     }
 
-    /// Reserve exact G2 capacity before source mutation.
-    pub fn reserve(&self, count: usize) -> Result<PolicyG1G2Reservation, G2CapacityError> {
+    /// Pin retained G2 data or reserve exact capacity before source mutation.
+    ///
+    /// After a complete-match miss, exact capacity preserves the relief path.
+    /// A registered overlap then declines this attempt and drops the allocation.
+    /// The snapshot does not pin G2. A later attempt checks it again.
+    pub fn reserve(
+        &self,
+        hashes: &[SequenceHash],
+    ) -> Result<PolicyG1G2Reservation, PolicyG1G2ReserveError> {
+        let count = hashes.len();
         if count == 0 {
             return Err(G2CapacityError::Rejected(
                 "an exact G1-to-G2 transfer needs at least one block".to_string(),
+            )
+            .into());
+        }
+        let retained = self.core.capacity.match_inactive_blocks(hashes);
+        if retained.len() == count
+            && retained.iter().zip(hashes).all(|(block, hash)| {
+                block.sequence_hash() == *hash
+                    && block.pin().manager_id() == self.core.capacity.manager_id()
+            })
+        {
+            return Ok(PolicyG1G2Reservation::new(
+                PolicyG1G2Destination::Retained(retained),
+                hashes.to_vec(),
+                Arc::clone(&self.binding),
             ));
         }
+        drop(retained);
         let request = G2CapacityRequest::exact_reclaim(G2AllocationKind::CacheExtension, count);
         let allocation = match self.core.capacity.reserve(request)? {
             G2CapacityDecision::ExactGranted(allocation) => allocation,
@@ -325,21 +354,29 @@ impl<T: PolicyG1SourceMetadata> PolicyG1G2BoundRoute<T> {
                 return Err(G2CapacityError::RequirementMismatch {
                     expected: G2CapacityRequirement::ExactReclaim,
                     actual: G2CapacityRequirement::Compatibility,
-                });
+                }
+                .into());
             }
             G2CapacityDecision::PendingReclaim(pending) => {
                 return Err(G2CapacityError::PendingReclaim {
                     target_count: pending.plan().target_count(),
-                });
+                }
+                .into());
             }
         };
         if allocation.kind() != G2AllocationKind::CacheExtension {
             return Err(G2CapacityError::Rejected(
                 "the exact route received a different allocation kind".to_string(),
-            ));
+            )
+            .into());
+        }
+        // Preserve capacity relief before a snapshot can decline cache retention.
+        if self.core.capacity.has_any_registered_hashes(hashes) {
+            return Err(PolicyG1G2ReserveError::G2Overlap);
         }
         Ok(PolicyG1G2Reservation::new(
-            allocation,
+            PolicyG1G2Destination::Allocated(allocation),
+            hashes.to_vec(),
             Arc::clone(&self.binding),
         ))
     }
@@ -435,8 +472,15 @@ impl PolicyG1G2TransferReceipt {
         Self { completion }
     }
 
+    /// Hand the drain future to a caller that already runs on the runtime.
+    fn into_completion(self) -> TransferFuture {
+        self.completion
+    }
+
+    /// Drain from a blocking thread. The offload supervisor already owns
+    /// one, so it keeps the same completion primitive as the stager.
     fn drain(self) -> TransferDrainOutcome {
-        futures::executor::block_on(self.completion)
+        futures::executor::block_on(self.into_completion())
     }
 }
 

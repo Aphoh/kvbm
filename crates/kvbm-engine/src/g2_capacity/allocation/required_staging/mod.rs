@@ -3,6 +3,7 @@
 
 //! Requirement-neutral ownership for a required G2 staging transaction.
 
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::sync::Arc;
 
@@ -14,7 +15,6 @@ use super::{
     G2Allocation, G2ExactAllocation, G2ExactPublishedRequiredStaging, G2ExactStagedAllocation,
     G2StagedAllocation,
 };
-#[cfg(test)]
 use crate::BlockId;
 use crate::G2;
 use crate::g2_capacity::{
@@ -69,6 +69,13 @@ enum PublishedRequiredStaging {
 
 struct CompatibilityPublishedAllocation {
     blocks: Option<Vec<ImmutableBlock<G2>>>,
+    /// Block identifiers this allocation staged, captured before
+    /// registration. Under `BlockDuplicationPolicy::Reject` a collision
+    /// makes `register_compatibility` hand back the pre-existing retained
+    /// primary in place of the block this allocation staged, so `Drop`
+    /// must flag only the ids in this set — flipping the retained
+    /// primary's shared slot flag would reset it on its own last release.
+    block_ids: BTreeSet<BlockId>,
 }
 
 impl RequiredStagingAllocation {
@@ -145,6 +152,16 @@ impl RequiredStagingAllocation {
 }
 
 impl RequiredStagingStagedAllocation {
+    pub(crate) fn publish_temporary(mut self) -> Result<Vec<ImmutableBlock<G2>>, G2CapacityError> {
+        match &mut self.inner {
+            StagedRequiredStaging::Compatibility { allocation, .. } => {
+                allocation.set_evict_on_reset(true);
+            }
+            StagedRequiredStaging::Exact(allocation) => allocation.set_evict_on_reset(true),
+        }
+        self.publish()
+    }
+
     /// Bind a compatibility allocation to its original registration owner.
     pub(crate) fn from_compatibility(
         allocation: G2StagedAllocation,
@@ -165,7 +182,6 @@ impl RequiredStagingStagedAllocation {
     }
 
     /// Return staged block identifiers without publishing them.
-    #[cfg(test)]
     pub(crate) fn block_ids(&self) -> Vec<BlockId> {
         match &self.inner {
             StagedRequiredStaging::Compatibility { allocation, .. } => allocation.block_ids(),
@@ -187,15 +203,19 @@ impl RequiredStagingStagedAllocation {
             StagedRequiredStaging::Compatibility {
                 allocation,
                 registration_owner,
-            } => registration_owner
-                .register_compatibility(allocation)
-                .map(|blocks| RequiredStagingPublishedAllocation {
-                    inner: Some(PublishedRequiredStaging::Compatibility(
-                        CompatibilityPublishedAllocation {
-                            blocks: Some(blocks),
-                        },
-                    )),
-                }),
+            } => {
+                let block_ids = allocation.block_ids().into_iter().collect();
+                registration_owner
+                    .register_compatibility(allocation)
+                    .map(|blocks| RequiredStagingPublishedAllocation {
+                        inner: Some(PublishedRequiredStaging::Compatibility(
+                            CompatibilityPublishedAllocation {
+                                blocks: Some(blocks),
+                                block_ids,
+                            },
+                        )),
+                    })
+            }
             StagedRequiredStaging::Exact(allocation) => allocation
                 .register_required_staging_reversible()
                 .map(|allocation| RequiredStagingPublishedAllocation {
@@ -233,7 +253,9 @@ impl Drop for CompatibilityPublishedAllocation {
             return;
         };
         for block in &blocks {
-            block.set_evict_on_reset(true);
+            if self.block_ids.contains(&block.block_id()) {
+                block.set_evict_on_reset(true);
+            }
         }
         drop(blocks);
     }

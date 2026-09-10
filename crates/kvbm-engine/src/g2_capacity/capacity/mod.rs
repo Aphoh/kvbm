@@ -42,6 +42,19 @@ pub trait G2Capacity: Send + Sync {
     /// Find matching registered G2 blocks.
     fn match_blocks(&self, hashes: &[SequenceHash]) -> Vec<ImmutableBlock<G2>>;
 
+    /// Pin a complete inactive G2 set without an access-frequency update.
+    ///
+    /// Active and pressure-held primaries prevent the complete match. A miss
+    /// or repeated hash leaves inactive tenure and eviction order intact.
+    /// Returned blocks already survived their last owner's release into cache.
+    fn match_inactive_blocks(&self, hashes: &[SequenceHash]) -> Vec<ImmutableBlock<G2>>;
+
+    /// Return a registration snapshot without owners or access tracking.
+    ///
+    /// Active, inactive, and pressure-held entries all count. A positive
+    /// result permits a skipped action, never a source release.
+    fn has_any_registered_hashes(&self, hashes: &[SequenceHash]) -> bool;
+
     /// Find matching registered G2 blocks with optional access tracking.
     fn scan_matches(
         &self,
@@ -218,6 +231,14 @@ impl G2Capacity for DirectG2Capacity {
 
     fn match_blocks(&self, hashes: &[SequenceHash]) -> Vec<ImmutableBlock<G2>> {
         self.manager.match_blocks(hashes)
+    }
+
+    fn match_inactive_blocks(&self, hashes: &[SequenceHash]) -> Vec<ImmutableBlock<G2>> {
+        self.manager.match_inactive_blocks(hashes)
+    }
+
+    fn has_any_registered_hashes(&self, hashes: &[SequenceHash]) -> bool {
+        self.manager.has_any_registered_hashes(hashes)
     }
 
     fn scan_matches(

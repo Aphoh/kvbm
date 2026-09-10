@@ -6,19 +6,37 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use kvbm_common::SequenceHash;
+use kvbm_logical::ImmutableBlock;
 use parking_lot::Mutex;
 use tokio::sync::oneshot;
 
 use super::RouteBinding;
-use crate::g2_capacity::G2ExactAllocation;
+use crate::G2;
+use crate::g2_capacity::{G2CapacityError, G2ExactAllocation};
+
+/// A reservation rejection before source mutation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PolicyG1G2ReserveError {
+    /// Registered G2 data prevents a complete new copy of this lineage.
+    G2Overlap,
+    /// The destination rejected its capacity request.
+    Capacity(G2CapacityError),
+}
 
 /// One opaque exact reservation from a bound policy route.
 #[must_use = "submit this reservation through its bound route or drop it"]
 pub struct PolicyG1G2Reservation {
-    pub(super) allocation: Option<G2ExactAllocation>,
+    pub(super) destination: Option<PolicyG1G2Destination>,
+    pub(super) source_hashes: Vec<SequenceHash>,
     pub(super) cancellation: PolicyG1G2CancelHandle,
     pub(super) binding: Arc<RouteBinding>,
     mark_terminal_on_drop: bool,
+}
+
+pub(super) enum PolicyG1G2Destination {
+    Allocated(G2ExactAllocation),
+    Retained(Vec<ImmutableBlock<G2>>),
 }
 
 /// Cancellation control for one policy transfer.
@@ -94,9 +112,14 @@ enum CommitState {
 }
 
 impl PolicyG1G2Reservation {
-    pub(super) fn new(allocation: G2ExactAllocation, binding: Arc<RouteBinding>) -> Self {
+    pub(super) fn new(
+        destination: PolicyG1G2Destination,
+        source_hashes: Vec<SequenceHash>,
+        binding: Arc<RouteBinding>,
+    ) -> Self {
         Self {
-            allocation: Some(allocation),
+            destination: Some(destination),
+            source_hashes,
             cancellation: PolicyG1G2CancelHandle {
                 state: Arc::new(Mutex::new(CommitState::Open)),
             },
@@ -110,7 +133,11 @@ impl PolicyG1G2Reservation {
     }
 
     pub fn len(&self) -> usize {
-        self.allocation.as_ref().map_or(0, G2ExactAllocation::len)
+        match self.destination.as_ref() {
+            Some(PolicyG1G2Destination::Allocated(allocation)) => allocation.len(),
+            Some(PolicyG1G2Destination::Retained(blocks)) => blocks.len(),
+            None => 0,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -121,7 +148,6 @@ impl PolicyG1G2Reservation {
         &mut self,
         failure: impl Into<String>,
     ) -> PolicyPhysicalCompletion {
-        drop(self.allocation.take());
         if self.cancellation.settle_uncommitted_failure() {
             PolicyPhysicalCompletion::failed(failure)
         } else {
@@ -145,8 +171,8 @@ impl std::fmt::Debug for PolicyG1G2Reservation {
 
 impl Drop for PolicyG1G2Reservation {
     fn drop(&mut self) {
-        if self.allocation.is_some() {
-            drop(self.allocation.take());
+        if self.destination.is_some() {
+            drop(self.destination.take());
             if self.mark_terminal_on_drop {
                 self.cancellation.mark_terminal();
             }
@@ -278,6 +304,23 @@ impl PolicyPhysicalCompletion {
             terminal: PolicyPhysicalTerminal::Failed,
             failure: Some(failure.into()),
         }
+    }
+}
+
+impl std::fmt::Display for PolicyG1G2ReserveError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::G2Overlap => formatter.write_str("the exact route overlaps registered G2 data"),
+            Self::Capacity(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for PolicyG1G2ReserveError {}
+
+impl From<G2CapacityError> for PolicyG1G2ReserveError {
+    fn from(error: G2CapacityError) -> Self {
+        Self::Capacity(error)
     }
 }
 
