@@ -80,7 +80,7 @@ hyper-util = { version = "=0.1.17" }
 indexmap = { version = "2" }
 libc = { version = "0.2" }
 libloading = "0.8.9"
-nixl-sys = { version = "=1.0.1" } # the single graph-wide NIXL binding pin (kvbm-memory inherits via workspace = true)
+nixl-sys = { version = "=1.4.1", git = "https://github.com/Aphoh/nixl.git", rev = "9e04f3dcb56c84d5b63feb10250e657822168322" }
 oneshot = { version = "0.1.13", features = ["std", "async"] }
 parking_lot = "0.12.5"
 prometheus = { version = "0.14" }
