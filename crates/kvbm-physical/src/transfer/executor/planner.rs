@@ -513,10 +513,9 @@ pub(crate) fn execute_planner_nixl_transfer(
     let xfer_req = nixl_agent.create_xfer_req(xfer_op, &src_dl, &dst_dl, remote_agent, None)?;
     let tel_ctrl_us = t_ctrl0.elapsed().as_micros() as u64;
     let t_post0 = std::time::Instant::now();
-    let still_pending = nixl_agent.post_xfer_req(&xfer_req, None).map_err(|error| {
-        std::mem::forget(std::mem::take(&mut guards));
-        error
-    })?;
+    let still_pending = nixl_agent
+        .post_xfer_req(&xfer_req, None)
+        .inspect_err(|_| std::mem::forget(std::mem::take(&mut guards)))?;
     let tel_post_us = t_post0.elapsed().as_micros() as u64;
     let tel_submitted_at = std::time::Instant::now();
 
@@ -1689,10 +1688,9 @@ impl OwnedStagedContext {
         let still_pending = self
             .nixl_agent
             .post_xfer_req(&xfer_req, None)
-            .map_err(|error| {
+            .inspect_err(|_| {
                 std::mem::forget(std::mem::take(&mut guards));
                 std::mem::forget(self.registrations.clone());
-                error
             })?;
         if !still_pending {
             return Ok(TransferCompleteNotification::completed());

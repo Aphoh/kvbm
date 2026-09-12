@@ -386,10 +386,9 @@ impl<'a> NixlTransferBuilder<'a, Set, Set, Set, Set, Set> {
         // NOTE: this legacy NixlTransferBuilder path is NOT the live remote-search
         // pull route (the connector always uses the planner's direct path via
         // execute_planner_nixl_transfer). Per-worker RDMA telemetry lives there.
-        let still_pending = nixl_agent.post_xfer_req(&xfer_req, None).map_err(|error| {
-            std::mem::forget(std::mem::take(&mut guards));
-            error
-        })?;
+        let still_pending = nixl_agent
+            .post_xfer_req(&xfer_req, None)
+            .inspect_err(|_| std::mem::forget(std::mem::take(&mut guards)))?;
 
         if still_pending {
             // Register for async completion via status polling
