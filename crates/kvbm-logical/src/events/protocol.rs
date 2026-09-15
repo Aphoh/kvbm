@@ -4,13 +4,28 @@
 //! Event types for KV cache coordination across workers.
 //!
 //! This module defines the event protocol used to track block registrations
-//! and removals across distributed workers. Events are emitted when blocks
-//! at power-of-2 positions are registered or released.
+//! and removals across distributed workers. *Which* blocks emit an event is not
+//! fixed here: emission is pluggable through
+//! [`EventEmissionPolicy`](super::policy::EventEmissionPolicy). The default
+//! wired by [`EventsManagerBuilder`](super::manager::EventsManagerBuilder) is
+//! [`AllEventsPolicy`](super::policy::AllEventsPolicy) — every registered block
+//! emits. [`PowerOfTwoPolicy`](super::policy::PowerOfTwoPolicy) is the opt-in
+//! sparse radix sampling (power-of-2 positions in `[2^4, 2^16]`) that lets the
+//! hub narrow a search without tracking every block. Do not assume either when
+//! reasoning about coverage — read the configured policy.
+//!
+//! This is the *legacy* untiered stream. It carries no tier, resource, lane,
+//! generation, sequence number, or recovery, and it stays byte-compatible for
+//! the consolidator and the hub's legacy indexer. The tiered, sequenced,
+//! recoverable stream is a separate wire schema
+//! (`kvbm_protocols::tier_protocol`) on a separate subject.
 //!
 //! The event types are organized in three layers:
 //! - [`KvCacheEvent`]: Individual events for internal streaming
 //! - [`KvCacheEvents`]: Batched events with multiple sequence hashes
 //! - [`KvbmCacheEvents`]: Wire format with instance/cluster context
+
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -62,12 +77,18 @@ pub struct KvbmCacheEvents {
 
 /// RAII handle that triggers a Remove event when dropped.
 ///
-/// This handle is attached to a [`crate::registry::BlockRegistrationHandle`] as an [`std::sync::Arc<dyn std::any::Any>`].
-/// When all references to the block are dropped, this handle's Drop implementation
-/// sends a Remove event to clean up the hub's tracking state.
+/// The handle lives in the registration's attachment store
+/// ([`crate::registry::BlockRegistrationHandle`]). The registry takes it out
+/// under the entry's position guard, so the `Remove` reaches the stream inside
+/// the same critical section that a racing registration takes to publish its
+/// `Create`. Dropping it outside that guard lets the hub apply `Create` then
+/// `Remove` and forget a block the instance still holds.
+#[derive(Debug)]
 pub struct EventReleaseHandle {
     seq_hash: SequenceHash,
     event_tx: broadcast::Sender<KvCacheEvent>,
+    /// Set when a newer registration replaced this one. See [`Self::disarm`].
+    disarmed: AtomicBool,
 }
 
 impl EventReleaseHandle {
@@ -77,12 +98,29 @@ impl EventReleaseHandle {
     /// * `seq_hash` - The positional sequence hash of the block
     /// * `event_tx` - Broadcast channel sender for emitting the Remove event
     pub fn new(seq_hash: SequenceHash, event_tx: broadcast::Sender<KvCacheEvent>) -> Self {
-        Self { seq_hash, event_tx }
+        Self {
+            seq_hash,
+            event_tx,
+            disarmed: AtomicBool::new(false),
+        }
+    }
+
+    /// Suppress this handle's `Remove`.
+    ///
+    /// A registration that a newer one replaced must publish nothing: the newer
+    /// registration published the `Create` that owns the hash, and its own drop
+    /// publishes the matching `Remove`. The handle still drops normally, because
+    /// it holds a broadcast `Sender` that a leak would keep alive.
+    pub fn disarm(&self) {
+        self.disarmed.store(true, Ordering::Release);
     }
 }
 
 impl Drop for EventReleaseHandle {
     fn drop(&mut self) {
+        if self.disarmed.load(Ordering::Acquire) {
+            return;
+        }
         let event = KvCacheEvent::Remove(self.seq_hash);
         // Broadcast send only fails if there are no receivers, which is fine
         let _ = self.event_tx.send(event);

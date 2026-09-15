@@ -7,9 +7,14 @@ use super::attachments::{AttachmentError, AttachmentStore, TypedAttachments};
 use super::{BlockRegistry, PositionalRadixTree};
 
 use crate::blocks::{BlockMetadata, SequenceHash};
+use crate::branch_tracker::BranchOracle;
+use crate::events::protocol::EventReleaseHandle;
+
+use dashmap::DashMap;
 
 use std::any::{Any, TypeId};
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
 // Under `#[cfg(test)]`, swap in `tracing-mutex`'s parking_lot wrapper
@@ -40,6 +45,18 @@ pub(crate) struct BlockRegistrationHandleInner {
     touch_callbacks: Mutex<Vec<TouchCallback>>,
     /// Weak reference to the registry - allows us to remove the block from the registry on drop
     registry: Weak<PositionalRadixTree<Weak<BlockRegistrationHandleInner>>>,
+    /// Branch oracle to notify on removal (mirrors the registry's own field at the time
+    /// this handle was created). `None` when branch tracking isn't attached -- fail-closed.
+    /// A transfer-created inner is deliberately `None` (it never fired
+    /// `on_block_registered`); [`BlockRegistry::remove_batch`](super::BlockRegistry::remove_batch)
+    /// reads this to skip firing an unpaired removal for such handles.
+    pub(super) branch_oracle: Option<Arc<dyn BranchOracle>>,
+    /// Set by [`BlockRegistry::remove_batch`](super::BlockRegistry::remove_batch) once it
+    /// has already deregistered this entry (and fired the oracle) under a single
+    /// per-position lock. `Drop` checks this FIRST and returns before touching the
+    /// registry, so the batched path collapses N per-position locks to P and the oracle
+    /// never double-fires.
+    removed_via_batch: AtomicBool,
 }
 
 impl std::fmt::Debug for BlockRegistrationHandleInner {
@@ -59,48 +76,111 @@ impl BlockRegistrationHandleInner {
     pub(super) fn new(
         seq_hash: SequenceHash,
         registry: Weak<PositionalRadixTree<Weak<BlockRegistrationHandleInner>>>,
+        branch_oracle: Option<Arc<dyn BranchOracle>>,
     ) -> Self {
         Self {
             seq_hash,
             attachments: Mutex::new(AttachmentStore::new()),
             touch_callbacks: Mutex::new(Vec::new()),
             registry,
+            branch_oracle,
+            removed_via_batch: AtomicBool::new(false),
         }
     }
+
+    /// Marks this registration as already removed by the batched path so the subsequent
+    /// [`Drop`] is a no-op. Called under the entry's position guard, immediately before
+    /// [`BlockRegistry::remove_batch`](super::BlockRegistry::remove_batch) releases the
+    /// last strong reference.
+    pub(super) fn mark_removed_via_batch(&self) {
+        self.removed_via_batch.store(true, Ordering::Release);
+    }
+
+    /// Take the publisher of this registration's `Remove` event out of the
+    /// attachment store. Both removal paths call this under the entry's
+    /// position guard: dropping the returned handle there publishes the
+    /// `Remove` inside the critical section, and
+    /// [`EventReleaseHandle::disarm`] there suppresses the `Remove` of a
+    /// registration that a newer one replaced.
+    pub(super) fn take_event_release(&self) -> Option<EventReleaseHandle> {
+        self.attachments.lock().event_release.take()
+    }
+}
+
+/// Identity-checked removal of a single registry entry, performed under an already-held
+/// position guard (`map`). This is the ONE shared *removal decision* for both the singular
+/// [`Drop`] path and [`BlockRegistry::remove_batch`](super::BlockRegistry::remove_batch),
+/// so an entry is deregistered on identical terms either way.
+///
+/// It does **not** fire [`BranchOracle::on_block_removed`] — each caller owns notification,
+/// because they must fire it against *different* oracles and at *different* times:
+/// - `Drop` fires the **handle's own** `branch_oracle` inline (under this guard). A
+///   transfer-created inner carries `branch_oracle: None` (it never fired
+///   `on_block_registered`), so its drop correctly fires nothing — the pairing invariant.
+/// - `remove_batch` collects the removed hashes and fires the oracle **after** releasing
+///   the guard (a public `BranchOracle` impl must not re-enter the registry, but deferring
+///   the call keeps the batch path safe even if one does), skipping transfer-created
+///   handles the same way (see its body).
+///
+/// The stored `Weak` pointer must match `identity`.
+/// A different pointer identifies a replacement registration.
+/// An absent slot means that another path already removed an entry.
+/// Both cases leave the map unchanged.
+pub(super) fn remove_entry_if_identity(
+    map: &DashMap<SequenceHash, Weak<BlockRegistrationHandleInner>>,
+    seq_hash: SequenceHash,
+    identity: *const BlockRegistrationHandleInner,
+) -> bool {
+    let Some(weak_ref) = map.get(&seq_hash) else {
+        return false;
+    };
+    let should_remove = std::ptr::eq(weak_ref.as_ptr(), identity);
+    drop(weak_ref);
+    if should_remove {
+        map.remove(&seq_hash);
+    }
+    should_remove
 }
 
 impl Drop for BlockRegistrationHandleInner {
     #[inline]
     fn drop(&mut self) {
+        // Batched removal already deregistered this entry (and fired the oracle) under one
+        // per-position lock; skip the singular per-position lock entirely. This early
+        // return is what lets `remove_batch` collapse N locks to P, and it keeps
+        // `on_block_removed` firing exactly once per removed hash.
+        if self.removed_via_batch.load(Ordering::Acquire) {
+            // `remove_batch` released this registration's `Remove` under its own
+            // position guard, so nothing is left to publish here.
+            return;
+        }
         let Some(registry) = self.registry.upgrade() else {
             return;
         };
-        // The position-level write lock held by `prefix()` for the lifetime of
-        // `map` serializes us against concurrent `register_sequence_hash` and
-        // `transfer_registration` on this `seq_hash`. Without that lock, a
-        // concurrent registration could replace the entry's `Weak` between our
-        // strong-count-drop and this body running, and an unconditional remove
-        // would silently delete the newer registration's entry.
-        //
-        // Compare the stored `Weak`'s pointer to `self`: `Weak::<T>::as_ptr()`
-        // for sized `T` returns the same pointer as `&T as *const T`, and
-        // during `drop_in_place` the inner allocation is still live (the
-        // implicit weak from the strong refcount is released after `Drop`
-        // returns). Only remove if the entry still points to us.
+        // The position-level write lock held by `prefix()` for the lifetime of `map`
+        // serializes us against concurrent `register_sequence_hash` and
+        // `transfer_registration` on this `seq_hash`, so the stored `Weak` is stable across
+        // the identity check performed by `remove_entry_if_identity`.
         let map = registry.prefix(&self.seq_hash);
-        let should_remove = match map.get(&self.seq_hash) {
-            Some(weak_ref) => std::ptr::eq(weak_ref.as_ptr(), self as *const Self),
-            None => {
-                debug_assert!(
-                    false,
-                    "registry entry vanished while a strong ref was alive: {:?}",
-                    self.seq_hash
-                );
-                false
+        if remove_entry_if_identity(&map, self.seq_hash, self as *const Self) {
+            // Publish the `Remove` while `map` is held. A racing
+            // `register_sequence_hash` publishes its `Create` under this same guard,
+            // and the hub keeps one holder set per hash, so a `Remove` released after
+            // that `Create` deletes a block this instance still holds. The event goes
+            // out before the oracle call, so a panicking oracle cannot push it past
+            // the guard.
+            drop(self.take_event_release());
+            // Fire the *handle's own* oracle (a transfer-created inner has `None` here and
+            // so fires nothing — the pairing invariant). Held under `map`; `BranchOracle`
+            // impls must not re-enter the registry (documented on the trait).
+            if let Some(oracle) = &self.branch_oracle {
+                oracle.on_block_removed(self.seq_hash);
             }
-        };
-        if should_remove {
-            map.remove(&self.seq_hash);
+        } else if let Some(release) = self.take_event_release() {
+            // A newer registration owns this slot, or already removed it. Its `Create`
+            // is the authoritative one and its own drop publishes the `Remove`, so this
+            // registration must publish nothing.
+            release.disarm();
         }
     }
 }
@@ -122,19 +202,29 @@ impl BlockRegistrationHandle {
             .unwrap_or(false)
     }
 
-    /// Increment the refcounted presence marker for tier `T`. Each
-    /// presence-bearing slot transition (`Staged → Primary`,
-    /// `Staged → Duplicate`) calls this exactly once.
+    /// Store the publisher of this registration's `Remove` event.
+    /// [`EventsManager::on_block_registered`](crate::events::EventsManager::on_block_registered)
+    /// calls this right after it publishes the `Create`, under the position
+    /// guard that `register_sequence_hash` holds.
+    pub(crate) fn attach_event_release(&self, release: EventReleaseHandle) {
+        self.inner.attachments.lock().event_release = Some(release);
+    }
+
+    /// Increment the physical-residency marker for tier `T`. Each
+    /// registration transition (`Staged → Primary`, `Staged → Duplicate`)
+    /// calls this exactly once. The marker remains set while a slot is
+    /// `Primary`, `Duplicate`, `Inactive`, or `Held`.
     pub(crate) fn mark_present<T: BlockMetadata>(&self) {
         let type_id = TypeId::of::<T>();
         let mut attachments = self.inner.attachments.lock();
         *attachments.presence_markers.entry(type_id).or_insert(0) += 1;
     }
 
-    /// Decrement the refcounted presence marker for tier `T`. Each
+    /// Decrement the physical-residency marker for tier `T`. Each
     /// presence-removing slot transition (`Inactive → Mutable` via
-    /// eviction, `Duplicate → Reset` via last-duplicate drop) calls this
-    /// exactly once. The entry is removed on reaching zero.
+    /// eviction, `Held → Reset` via pressure commit, or `Duplicate → Reset`
+    /// via last-duplicate drop) calls this exactly once. The entry is removed
+    /// on reaching zero.
     pub(crate) fn mark_absent<T: BlockMetadata>(&self) {
         let type_id = TypeId::of::<T>();
         let mut attachments = self.inner.attachments.lock();
@@ -150,8 +240,9 @@ impl BlockRegistrationHandle {
         }
     }
 
-    /// Returns `true` if at least one `Block<T, Registered>` exists for
-    /// this sequence hash (i.e., the refcount is > 0).
+    /// Returns `true` if a physical registered slot exists for this sequence
+    /// hash and tier `T` (the refcount is greater than zero). This includes a
+    /// `Held` slot and does not prove request availability.
     ///
     /// This is a **refcounted shadow** of authoritative `BlockStore<T>`
     /// state, not a linearizable snapshot. The store is updated under
@@ -159,9 +250,10 @@ impl BlockRegistrationHandle {
     /// separate critical section that runs after the store lock is
     /// released. In steady state the shadow agrees with the store; while
     /// a registration, eviction, or duplicate drop is mid-flight it can
-    /// briefly report the pre-update value. Callers who need the exact
-    /// current state should go through `BlockManager::match_blocks`
-    /// (which consults the store directly).
+    /// briefly report the pre-update value. A held slot remains present, but
+    /// `BlockManager::match_blocks` and `BlockManager::scan_matches` cannot
+    /// return it. Callers who need request availability must use those
+    /// store-backed operations.
     pub fn has_block<T: BlockMetadata>(&self) -> bool {
         let type_id = TypeId::of::<T>();
         let attachments = self.inner.attachments.lock();
@@ -173,8 +265,9 @@ impl BlockRegistrationHandle {
             > 0
     }
 
-    /// Returns `true` if a block exists for at least one of the
-    /// specified metadata-tier `TypeId`s.
+    /// Returns `true` if physical registered residency exists for at least
+    /// one specified metadata-tier `TypeId`. This does not prove request
+    /// availability.
     pub fn has_any_block(&self, type_ids: &[TypeId]) -> bool {
         let attachments = self.inner.attachments.lock();
         type_ids.iter().any(|type_id| {

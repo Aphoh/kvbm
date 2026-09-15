@@ -18,9 +18,9 @@
 //! - [`CLOSE_SESSION_HANDLER`] — dispatched at the *holder*. Idempotent
 //!   teardown of a session by id.
 //!
-//! Two legacy handlers ([`SEARCH_PREFIX_HANDLER`], [`SEARCH_SCATTER_HANDLER`])
-//! are retained as thin shims for back-compat with the hub's existing HTTP
-//! routes; they delegate to `open_session` with `find_mode = Sync` and the
+//! Two handlers ([`SEARCH_PREFIX_HANDLER`], [`SEARCH_SCATTER_HANDLER`])
+//! serve as thin shims for the hub's existing HTTP query routes. They
+//! delegate to `open_session` with `find_mode = Sync` and the
 //! corresponding [`SearchMode`].
 
 use std::time::Duration;
@@ -45,14 +45,14 @@ pub const PULL_FROM_SESSION_HANDLER: &str = "kvbm.leader.control.pull_from_sessi
 /// Velo handler name for explicit session teardown.
 pub const CLOSE_SESSION_HANDLER: &str = "kvbm.leader.control.close_session";
 
-/// Legacy handler: contiguous-prefix G2 search, kept as a shim over
-/// `open_session` with `find_mode = Sync`, `tiers = default`, and
-/// `search_mode = Prefix`.
+/// Handler for a hub HTTP query route: contiguous-prefix G2 search, kept
+/// as a shim over `open_session` with `find_mode = Sync`, `tiers = default`,
+/// and `search_mode = Prefix`.
 pub const SEARCH_PREFIX_HANDLER: &str = "kvbm.leader.control.search_prefix";
 
-/// Legacy handler: scatter (gather-all) G2 search, kept as a shim over
-/// `open_session` with `find_mode = Sync`, `tiers = default`, and
-/// `search_mode = Scatter`.
+/// Handler for a hub HTTP query route: scatter (gather-all) G2 search,
+/// kept as a shim over `open_session` with `find_mode = Sync`,
+/// `tiers = default`, and `search_mode = Scatter`.
 pub const SEARCH_SCATTER_HANDLER: &str = "kvbm.leader.control.search_scatter";
 
 // ---------------------------------------------------------------------------
@@ -63,9 +63,11 @@ pub const SEARCH_SCATTER_HANDLER: &str = "kvbm.leader.control.search_scatter";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchMode {
-    /// Contiguous prefix — stop at the first miss. Maps to
-    /// `BlockManager::match_blocks`. The right choice for LLM
-    /// prompt-prefix KV reuse.
+    /// Contiguous prefix — stop at the first miss. When `tiers.g1` is
+    /// set, the walk continues into G1 from the cursor that G2 reached.
+    /// The G2 leg keeps its LRU touch through `match_blocks`. In G1 the
+    /// walk uses `match_prefix` with `touch = false`. The right choice
+    /// for LLM prompt-prefix KV reuse.
     #[default]
     Prefix,
     /// Gather every hash present, ignoring gaps. Maps to
@@ -95,6 +97,13 @@ pub enum FindMode {
 /// Tiers eligible for matching beyond G2 (G2 is always on).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct TierSelection {
+    /// Match in G1 (device). Staging runs G1→G2 in the background
+    /// before `make_available`. This tier is off by default, like
+    /// every tier beyond G2. A holder that gains a G1 source must not
+    /// copy device blocks for a caller that only queries and never
+    /// pulls.
+    #[serde(default)]
+    pub g1: bool,
     /// Match in G3; staged G3→G2 in the background before
     /// `make_available`. v1 ships this off by default to preserve
     /// existing G2-only behavior — callers opt in.
@@ -110,12 +119,15 @@ pub struct TierSelection {
 // MatchBreakdown — per-tier hit counts (telemetry)
 // ---------------------------------------------------------------------------
 
-/// Per-tier breakdown of where committed hashes were found on the
-/// holder. Field names match the engine's internal
-/// `leader::types::MatchBreakdown` so the engine-side conversion is
-/// trivial.
+/// Per-tier counts of the holder's committed matches.
+/// Device matches need local G1-to-G2 staging before publication.
+/// Host, disk, and object counts name the other source tiers.
+/// Pull-side responses count copied blocks in the host tier.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct MatchBreakdown {
+    /// G1 (device) matches.
+    #[serde(default)]
+    pub device_blocks: usize,
     /// G2 (host) matches.
     #[serde(default)]
     pub host_blocks: usize,
@@ -173,8 +185,8 @@ pub struct OpenTransferSessionRequest {
     pub watchdog_ms: Option<u64>,
 
     /// Registration lifecycle expected of the holder. Complete-bundle pulls
-    /// always set this from their directory hit; ordinary legacy transfer
-    /// callers may omit it.
+    /// always set this from their directory hit. Ordinary transfer
+    /// callers can omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registration_epoch: Option<RegistrationEpoch>,
 
@@ -254,8 +266,8 @@ pub struct PullFromSessionRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selector: Option<Vec<SequenceHash>>,
     /// Logical resource served by the holder and receiving blocks locally.
-    /// Callers should copy this from [`TransferSessionCapability::resource`].
-    /// `None` selects the puller's primary resource for legacy callers.
+    /// Callers copy this value from [`TransferSessionCapability::resource`].
+    /// `None` selects the puller's primary resource.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource: Option<LogicalResourceId>,
 
@@ -301,7 +313,7 @@ pub struct CloseTransferSessionResponse {
 }
 
 // ---------------------------------------------------------------------------
-// Legacy search request/response (kept for hub back-compat)
+// Search request/response for the hub's HTTP query routes
 // ---------------------------------------------------------------------------
 
 /// Request for [`SEARCH_PREFIX_HANDLER`] / [`SEARCH_SCATTER_HANDLER`].
@@ -310,10 +322,10 @@ pub struct SearchRequest {
     pub sequence_hashes: Vec<SequenceHash>,
 }
 
-/// Response for the legacy search handlers. Either no matches (no
-/// session was opened) or the id of a freshly-opened disagg session
-/// pre-populated with the matched G2 blocks. The endpoint is resolved
-/// out-of-band (e.g. via the hub peer registry).
+/// Response for the search handlers of the hub HTTP query routes. Either no
+/// matches (no session was opened) or the id of a freshly-opened disagg
+/// session pre-populated with the matched G2 blocks. The endpoint is
+/// resolved out-of-band, for example through the hub peer registry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum SearchResponse {
@@ -379,7 +391,7 @@ mod client {
             self.chan.call(CLOSE_SESSION_HANDLER, &req).await
         }
 
-        /// Legacy: contiguous-prefix G2 search. Shim over
+        /// Hub HTTP query route: contiguous-prefix G2 search. Shim over
         /// `open_session(find_mode = Sync, search_mode = Prefix)`.
         pub async fn search_prefix(
             &self,
@@ -388,7 +400,7 @@ mod client {
             self.chan.call(SEARCH_PREFIX_HANDLER, &req).await
         }
 
-        /// Legacy: scatter (gather-all) G2 search. Shim over
+        /// Hub HTTP query route: scatter (gather-all) G2 search. Shim over
         /// `open_session(find_mode = Sync, search_mode = Scatter)`.
         pub async fn search_scatter(
             &self,
@@ -418,8 +430,33 @@ mod tests {
     #[test]
     fn tier_selection_defaults_to_g2_only() {
         let t: TierSelection = Default::default();
+        assert!(!t.g1);
         assert!(!t.g3);
         assert!(!t.g4);
+    }
+
+    #[test]
+    fn old_open_request_selects_no_tier_beyond_g2() {
+        let wire = serde_json::json!({
+            "sequence_hashes": [],
+            "tiers": { "g3": true }
+        });
+        let decoded: OpenTransferSessionRequest = serde_json::from_value(wire).unwrap();
+        assert!(!decoded.tiers.g1);
+        assert!(decoded.tiers.g3);
+    }
+
+    #[test]
+    fn tier_selection_ignores_a_tier_key_it_does_not_know() {
+        // `g99` stands for the `g1` key at a holder built before this
+        // field existed. No side of the wire denies unknown fields, so
+        // that holder decodes the request and searches the tiers it does
+        // know instead of failing the open.
+        let wire = serde_json::json!({ "g1": true, "g3": true, "g99": true });
+        let decoded: TierSelection = serde_json::from_value(wire).unwrap();
+        assert!(decoded.g1);
+        assert!(decoded.g3);
+        assert!(!decoded.g4);
     }
 
     #[test]

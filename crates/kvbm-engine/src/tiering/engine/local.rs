@@ -46,7 +46,7 @@
 #![allow(dead_code)]
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use anyhow::Result;
 use dashmap::DashMap;
@@ -68,6 +68,7 @@ use super::bundle::{
     BundleAdmissionConfig, BundleCatalog, BundleDirectoryOrder, BundleLease,
     BundlePublicationRuntime,
 };
+use super::config::PulledBundleReadyObserver;
 use super::driver::{ActionRecord, FenceBarrier};
 use super::inflight::{InflightKey, InflightOnboards};
 use super::offload::{
@@ -235,6 +236,12 @@ pub(crate) struct LocalConnectorEngine {
     /// from [`super::DisaggOps`] at construction). The search path interposes
     /// CD when this is `Some`; `None` is a plain local-tiering engine.
     pub(super) cd: Option<CdRuntime>,
+    /// Advisory hook fired after a remotely-pulled bundle commits into G2 (see
+    /// [`PulledBundleReadyObserver`]). A `OnceLock` set by
+    /// [`build_local_connector_engine`](super::build_local_connector_engine)
+    /// rather than a constructor parameter: the construction seam is already at
+    /// clippy's argument ceiling, and this is an observer, not engine state.
+    pub(super) pulled_bundle_ready: OnceLock<PulledBundleReadyObserver>,
     /// In-flight onboard hash guard (see [`super::inflight`]). Recorded ONCE
     /// per lifecycle at the three onboard mint sites (keyed by the lifecycle
     /// generation), cleared at the lifecycle release funnels
@@ -533,10 +540,26 @@ impl LocalConnectorEngine {
                 offload_drains: DashMap::new(),
                 current_iteration: AtomicUsize::new(0),
                 weak_self: weak.clone(),
+                pulled_bundle_ready: OnceLock::new(),
                 cd,
                 inflight: Mutex::new(InflightOnboards::with_gauge(inflight_gauge)),
             }
         })
+    }
+
+    /// Install the remote-pull residency observer. First write wins; a second
+    /// install is a wiring bug and is ignored rather than allowed to silently
+    /// replace the first (two observers would each see only some of the pulls).
+    pub(in crate::tiering::engine) fn set_pulled_bundle_ready_observer(
+        &self,
+        observer: PulledBundleReadyObserver,
+    ) {
+        if self.pulled_bundle_ready.set(observer).is_err() {
+            tracing::warn!(
+                "a pulled-bundle residency observer is already installed on this engine; \
+                 keeping the first"
+            );
+        }
     }
 
     pub(super) fn bundle_onboard_watchdog(&self) -> std::time::Duration {
@@ -841,7 +864,7 @@ impl LocalConnectorEngine {
         let cell = Arc::new(Mutex::new(ActionStatus::Pending));
         self.actions.insert(
             action_id,
-            ActionRecord::new(req.clone(), Arc::downgrade(&cell)),
+            ActionRecord::new_save(req.clone(), Arc::downgrade(&cell)),
         );
         self.by_request
             .entry(req.clone())
@@ -894,7 +917,7 @@ impl LeaderEngine for LocalConnectorEngine {
     }
 
     fn evict(&self, req: &RequestId) -> EvictionOutcome {
-        // Find in-flight onboard actions for this request and, if any, flag them
+        // Find in-flight actions for this request and, if any, flag them
         // cancelled-for-emission: their terminal fires `mark_fence_complete`
         // (not `mark_load_finished`) and mints one barrier token per worker.
         let action_ids: Vec<ActionId> = self
@@ -917,18 +940,12 @@ impl LeaderEngine for LocalConnectorEngine {
         let mut cancellations = Vec::new();
         for id in &action_ids {
             if let Some(mut record) = self.actions.get_mut(id) {
-                let still_pending = record.cell.upgrade().is_some_and(|cell| {
-                    matches!(
-                        *cell.lock().expect("action-status mutex poisoned"),
-                        ActionStatus::Pending
-                    )
-                });
                 // Arm only an unfenced action. The drain-holder/fresh-GNMT design
                 // precludes re-evicting the same in-flight action, but guarding
                 // `fence.is_none()` is a cheap strict improvement: it stops a second
                 // evict from reassigning a live barrier (which would drop the prior
                 // clone and complete that fence one drain early).
-                if (still_pending || record.physical_pending) && record.fence.is_none() {
+                if record.has_pending_work() && record.fence.is_none() {
                     let shared = barrier.get_or_insert_with(|| {
                         let worker_count = self.leader.worker_count().max(1);
                         let tokens = (0..worker_count as u32).map(FenceToken::new).collect();
@@ -936,10 +953,8 @@ impl LeaderEngine for LocalConnectorEngine {
                     });
                     record.fence = Some(Arc::clone(shared));
                 }
-                if record.physical_pending
-                    && let Some(cancel) = record.cancel.as_ref()
-                {
-                    cancellations.push(cancel.clone());
+                if let Some(cancel) = record.physical_load_cancel() {
+                    cancellations.push(cancel);
                 }
             }
         }
@@ -1017,12 +1032,9 @@ impl LeaderEngine for LocalConnectorEngine {
         if let Some(cell) = live {
             return cell.lock().expect("action-status mutex poisoned").clone();
         }
-        // No entry, or the handle dropped (dead `Weak`). Self-clean any dead entry
-        // on access so the map cannot grow without bound, then report the
-        // stateless default: a vanished action has no observer to mislead, and a
-        // never-minted id has nothing in flight — matching the noop answer.
-        self.actions
-            .remove_if(id, |_, r| r.cell.strong_count() == 0);
+        // A missing entry and a dropped handle both use the stateless default.
+        // Record removal belongs to handle release or the physical terminal.
+        // Polling cannot prove that a dead cell has no physical work.
         ActionStatus::Complete
     }
 
@@ -1065,33 +1077,19 @@ impl LeaderEngine for LocalConnectorEngine {
         // an unknown or already-released id finds no entry and does nothing (the noop
         // offload path and a second drop are both no-ops).
         //
-        // DEFER if a fence/drain is armed or a direct bundle onboard is still
-        // pending. Removing early could complete a fence, fire a drain, or clear
-        // the bundle overlap guard before the transfer drains. Instead flag
+        // DEFER if a fence/drain is armed or physical work is still pending.
+        // Early removal can complete a fence, fire a drain, or clear the
+        // bundle overlap guard before the transfer drains. Instead flag
         // `dropped_by_handle` under the per-action guard; the driver's terminal
         // then removes the record. Legacy actions with no in-flight key retain
         // the original lock-free status path.
         let (defer, cancel) = {
             if let Some(mut record) = self.actions.get_mut(id) {
-                let bundle_pending = record.inflight.is_some()
-                    && record.cell.upgrade().is_some_and(|cell| {
-                        matches!(
-                            *cell.lock().expect("action-status mutex poisoned"),
-                            ActionStatus::Pending
-                        )
-                    });
-                let armed = record.fence.is_some()
-                    || record.drain.is_some()
-                    || bundle_pending
-                    || record.physical_pending;
-                if armed {
+                let retain = record.must_retain_after_handle_drop();
+                if retain {
                     record.dropped_by_handle = true;
                 }
-                let cancel = record
-                    .physical_pending
-                    .then(|| record.cancel.as_ref().cloned())
-                    .flatten();
-                (armed, cancel)
+                (retain, record.physical_load_cancel())
             } else {
                 (false, None)
             }
@@ -1328,16 +1326,35 @@ impl LocalConnectorEngine {
         self: Arc<Self>,
         search_id: SearchId,
         dest: &[BlockId],
+        num_external_tokens: usize,
     ) -> Result<OnboardHandle, LeaderEngineError> {
         // Sufficient precondition: a latch exists and its pin is still live
         // (Matched). The guard drops before the take below.
-        let hit_blocks = {
+        let accepted_blocks = {
             let Some(entry) = self.searches.get(&search_id) else {
                 return Err(LeaderEngineError::SearchNotMatched);
             };
             let status = *entry.status.lock().expect("search-status mutex poisoned");
             match status {
-                MatchStatus::Matched { hit_blocks } => hit_blocks,
+                MatchStatus::Matched { hit_blocks } => {
+                    let promised = hit_blocks as usize * self.block_size;
+                    let disaggregated = self
+                        .cd
+                        .as_ref()
+                        .is_some_and(|cd| cd.requests.get(&entry.request_id).is_some());
+                    // Hybrid state can accept an earlier local frontier.
+                    // A dispatched remote continuation owns its exact span.
+                    if !num_external_tokens.is_multiple_of(self.block_size)
+                        || num_external_tokens > promised
+                        || (disaggregated && num_external_tokens != promised)
+                    {
+                        return Err(LeaderEngineError::ExternalTokensMismatch {
+                            expected: promised,
+                            got: num_external_tokens,
+                        });
+                    }
+                    (num_external_tokens / self.block_size) as u32
+                }
                 MatchStatus::Pending | MatchStatus::Lost => {
                     return Err(LeaderEngineError::SearchNotMatched);
                 }
@@ -1355,14 +1372,13 @@ impl LocalConnectorEngine {
         let request_id = search_state.request_id;
         let mut onboarding = search_state.onboarding;
         // The absolute-indexed hash buffer, snapshotted before the local mint so
-        // the in-flight guard records the matched window even though `onboarding`
+        // the in-flight guard records the accepted window even though `onboarding`
         // moves into the CD fan-out or the driver below. Unused on the CD arm
         // (it records its own unified window).
         let buffer = search_state.buffer;
 
         let block_size = self.block_size;
         let num_computed_tokens = onboarding.num_computed_tokens;
-        let num_external_tokens = hit_blocks as usize * block_size;
         let g1_block_ids = onboard::select_onboard_block_ids(
             dest,
             num_computed_tokens,
@@ -1389,7 +1405,7 @@ impl LocalConnectorEngine {
                 request_id,
                 onboarding,
                 g1_block_ids,
-                hit_blocks,
+                accepted_blocks,
             ));
         }
 
@@ -1415,16 +1431,16 @@ impl LocalConnectorEngine {
             .or_default()
             .push(action_id);
 
-        // Record the in-flight onboard's hit window for the deferral guard,
+        // Record the in-flight onboard's accepted window for the deferral guard,
         // keyed by the lifecycle generation so the clear lands at the
         // connector-visible release (`release_search`). The window is the
-        // matched span `buffer[computed .. computed + hit]` —
+        // accepted span `buffer[computed .. computed + accepted]` —
         // absolute-indexed, copied once per lifecycle (never per poll). `min`
         // is defensive: a well-behaved match never reaches past the buffer.
         let computed_blocks = num_computed_tokens / block_size;
         let avail = buffer.len().saturating_sub(computed_blocks);
-        let hit = (hit_blocks as usize).min(avail);
-        let window = buffer[computed_blocks..computed_blocks + hit].to_vec();
+        let window_blocks = (accepted_blocks as usize).min(avail);
+        let window = buffer[computed_blocks..computed_blocks + window_blocks].to_vec();
         self.inflight
             .lock()
             .expect("inflight-guard mutex poisoned")
@@ -1443,6 +1459,7 @@ impl LocalConnectorEngine {
                 g1_block_ids,
                 staging_futs,
                 block_size,
+                accepted_blocks as usize,
             )
             .await;
             // Release every shard's server-side session (Ready pins are no-ops).
@@ -1883,7 +1900,7 @@ impl LocalConnectorEngine {
             // `local_g1` (zero local match) short-circuits to Complete in
             // run_onboard without awaiting the staging futures.
             let local_status =
-                onboard::run_onboard(&leader, &mut onboarding, local_g1, staging_futs, block_size)
+                onboard::run_onboard(&leader, &mut onboarding, local_g1, staging_futs, block_size, local_hit)
                     .await;
             onboarding.release_all(&leader);
 
@@ -2166,12 +2183,34 @@ impl WorkerEngineDriver for LocalConnectorEngine {
     }
 
     fn shutdown(&self) {
-        // Drop buffered-but-unflushed offloads; their handles' cells stay
-        // `Pending` and free by RAII on drop. Orderly teardown sequencing is P-D.
-        self.offload_buffer
-            .lock()
-            .expect("offload-buffer mutex poisoned")
-            .clear();
+        // Settle buffered offloads after the buffer lock releases. A dropped
+        // handle must not leave its physical-save record pending forever.
+        let buffered = {
+            let mut buffer = self
+                .offload_buffer
+                .lock()
+                .expect("offload-buffer mutex poisoned");
+            std::mem::take(&mut *buffer)
+        };
+        for BufferedOffload {
+            action_id,
+            request_id,
+            resource,
+            pairs,
+            completion,
+            ..
+        } in buffered
+        {
+            self.finish_offload_child(
+                action_id,
+                &request_id,
+                resource,
+                pairs,
+                None,
+                completion,
+                ActionStatus::Failed(ActionFailure::AllBlocks),
+            );
+        }
     }
 }
 
@@ -2192,6 +2231,12 @@ mod tests {
     use std::sync::Mutex as StdMutex;
     use tokio::sync::{Mutex as TokioMutex, watch};
     use uuid::Uuid;
+
+    #[path = "offload_action_retention.rs"]
+    mod offload_action_retention;
+
+    #[path = "accepted_onboard.rs"]
+    mod accepted_onboard;
 
     fn connector_config(block_size: usize, remote: RemoteOps) -> ConnectorEngineConfig {
         ConnectorEngineConfig {
@@ -2716,7 +2761,7 @@ mod tests {
         );
         let onboard = engine
             .clone()
-            .local_onboard(search_id, &[10, 11, 12])
+            .local_onboard(search_id, &[10, 11, 12], 0)
             .unwrap();
         wait_complete(&onboard).await;
 
@@ -2752,7 +2797,7 @@ mod tests {
                 buffer: Vec::new(),
             },
         );
-        let onboard = engine.clone().local_onboard(search_id, &[10]).unwrap();
+        let onboard = engine.clone().local_onboard(search_id, &[10], BS).unwrap();
         wait_complete(&onboard).await;
 
         // A total load failure resolves to the CONCRETE dest ids (the external
@@ -2776,18 +2821,8 @@ mod tests {
         Ok(())
     }
 
-    /// Production-path boundedness for terminal onboards. Pre-fix, a terminal
-    /// onboard left a strong `ActionRecord` in `actions` forever on the in-process
-    /// path: the connector reads `handle.outcome()` (a local cell read) and never
-    /// calls `poll_action` (the only pruner then), so the by-id key — and its
-    /// `by_request` link — leaked once a real caller was wired. With RAII
-    /// `OnboardHandle::drop -> release_action` (the action analogue of
-    /// `release_search`), dropping each terminal handle prunes BOTH maps.
-    ///
-    /// This proves the fix **without calling `poll_action`**: `finish_load_action`
-    /// never removes from `actions`, so `actions.len() == 0` can only be reached by
-    /// the handle Drop -> `release_action` path. If these assertions held only
-    /// after a `poll_action` self-prune, the RAII fix would be wrong.
+    /// Each terminal onboard stays indexed while its handle is live.
+    /// Handle drop calls `release_action`, which clears both indexes.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn failed_then_dropped_onboards_retain_no_strong_cell() -> Result<()> {
         let leader = Arc::new(build_test_leader().await?);
@@ -2816,7 +2851,7 @@ mod tests {
                     buffer: Vec::new(),
                 },
             );
-            let onboard = engine.clone().local_onboard(search_id, &[10]).unwrap();
+            let onboard = engine.clone().local_onboard(search_id, &[10], BS).unwrap();
             wait_complete(&onboard).await;
             assert_eq!(
                 onboard.outcome(),
@@ -2825,14 +2860,11 @@ mod tests {
                 })
             );
 
-            // Drop the terminal handle. Its RAII `Drop -> release_action` is the
-            // ONLY pruner exercised here — no `poll_action` call anywhere.
+            // Drop the terminal handle. This test does not call `poll_action`.
             drop(onboard);
         }
 
-        // Teeth (no `poll_action` involved): handle Drop alone kept both maps
-        // bounded. `actions` can only reach 0 via `release_action`, since
-        // `finish_load_action` never removes from it — so this isolates the RAII fix.
+        // Handle drop alone keeps both maps bounded in this live-handle path.
         assert_eq!(
             engine.actions.len(),
             0,
@@ -2934,9 +2966,10 @@ mod tests {
         let req: RequestId = "rq".into();
         let a1 = ActionId::new();
         let cell = Arc::new(Mutex::new(ActionStatus::Pending));
-        engine
-            .actions
-            .insert(a1, ActionRecord::new(req.clone(), Arc::downgrade(&cell)));
+        engine.actions.insert(
+            a1,
+            ActionRecord::new_save(req.clone(), Arc::downgrade(&cell)),
+        );
         engine.by_request.insert(req.clone(), vec![a1]);
 
         let fence = engine.evict(&req).fence;
@@ -3148,7 +3181,10 @@ mod tests {
             },
         );
         assert_eq!(
-            engine.clone().local_onboard(search_id, &[10]).unwrap_err(),
+            engine
+                .clone()
+                .local_onboard(search_id, &[10], BS)
+                .unwrap_err(),
             LeaderEngineError::SearchNotMatched
         );
         Ok(())
@@ -3239,7 +3275,7 @@ mod tests {
                 buffer: vec![h(7)],
             },
         );
-        let onboard = engine.clone().local_onboard(search_id, &[10]).unwrap();
+        let onboard = engine.clone().local_onboard(search_id, &[10], BS).unwrap();
         // Record-at-mint: the synchronous mint recorded the hit window.
         {
             let g = engine.inflight.lock().unwrap();
@@ -3301,7 +3337,7 @@ mod tests {
                 buffer: vec![h(3)],
             },
         );
-        let onboard = engine.clone().local_onboard(search_id, &[10]).unwrap();
+        let onboard = engine.clone().local_onboard(search_id, &[10], BS).unwrap();
         wait_complete(&onboard).await;
         assert_eq!(
             onboard.outcome(),
@@ -3351,7 +3387,7 @@ mod tests {
             },
         );
         let req: RequestId = "rq".into();
-        let onboard = engine.clone().local_onboard(search_id, &[10]).unwrap();
+        let onboard = engine.clone().local_onboard(search_id, &[10], BS).unwrap();
         assert!(engine.inflight.lock().unwrap().overlaps(&[h(5)]));
 
         // Evict arms the fence over the in-flight onboard but must NOT clear
@@ -3409,7 +3445,10 @@ mod tests {
                     buffer: window,
                 },
             );
-            let onboard = engine.clone().local_onboard(search_id, &[10, 11]).unwrap();
+            let onboard = engine
+                .clone()
+                .local_onboard(search_id, &[10, 11], 2 * BS)
+                .unwrap();
             // The onboard stays parked (as the connector parks it); the explicit
             // release_search below models the connector's eventual handle drop.
             (search_id, onboard, tx)
@@ -3751,12 +3790,14 @@ mod tests {
         let (a1, a2) = (ActionId::new(), ActionId::new());
         let cell1 = Arc::new(Mutex::new(ActionStatus::Pending));
         let cell2 = Arc::new(Mutex::new(ActionStatus::Pending));
-        engine
-            .actions
-            .insert(a1, ActionRecord::new(req.clone(), Arc::downgrade(&cell1)));
-        engine
-            .actions
-            .insert(a2, ActionRecord::new(req.clone(), Arc::downgrade(&cell2)));
+        engine.actions.insert(
+            a1,
+            ActionRecord::new_save(req.clone(), Arc::downgrade(&cell1)),
+        );
+        engine.actions.insert(
+            a2,
+            ActionRecord::new_save(req.clone(), Arc::downgrade(&cell2)),
+        );
         engine.by_request.insert(req.clone(), vec![a1, a2]);
         engine.offload_drains.insert(req.clone(), ());
 
@@ -3851,9 +3892,10 @@ mod tests {
         let req: RequestId = "rq".into();
         let a1 = ActionId::new();
         let cell1 = Arc::new(Mutex::new(ActionStatus::Pending));
-        engine
-            .actions
-            .insert(a1, ActionRecord::new(req.clone(), Arc::downgrade(&cell1)));
+        engine.actions.insert(
+            a1,
+            ActionRecord::new_save(req.clone(), Arc::downgrade(&cell1)),
+        );
         engine.by_request.insert(req.clone(), vec![a1]);
         engine.offload_drains.insert(req.clone(), ());
 
@@ -3942,10 +3984,8 @@ mod tests {
         Ok(())
     }
 
-    /// RAII: dropping each terminal offload handle prunes BOTH the `actions` map
-    /// and the `by_request` index (the action analogue of the onboard RAII test;
-    /// `finish_save_action` never removes from `actions`, so reaching 0 isolates
-    /// the handle-Drop → `release_action` path).
+    /// Each terminal offload stays indexed while its handle is live.
+    /// Handle drop calls `release_action`, which clears both indexes.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn offload_handle_drop_prunes_actions_and_by_request() -> Result<()> {
         let leader = Arc::new(build_test_leader().await?);
@@ -3970,7 +4010,7 @@ mod tests {
             engine.finish_forward_pass(i);
             wait_offload_complete(&handle).await;
             assert_eq!(handle.outcome(), Some(SaveOutcome::Done));
-            // RAII Drop -> release_action is the ONLY pruner exercised here.
+            // This live-handle path releases through `release_action`.
             drop(handle);
         }
 
@@ -4061,6 +4101,8 @@ mod tests {
     // ========================================================================
 
     mod cd_tests {
+        #[path = "accepted_transfer.rs"]
+        mod accepted_transfer;
         use super::*;
 
         use futures::FutureExt;
@@ -5506,12 +5548,14 @@ mod tests {
         /// dest split. Every other transfer/object surface is inert.
         struct RecordingWorkers {
             transfers: StdMutex<Vec<Vec<BlockId>>>,
+            sources: StdMutex<Vec<Vec<BlockId>>>,
             fail_local: std::sync::atomic::AtomicBool,
         }
         impl RecordingWorkers {
             fn new() -> Arc<Self> {
                 Arc::new(Self {
                     transfers: StdMutex::new(Vec::new()),
+                    sources: StdMutex::new(Vec::new()),
                     fail_local: std::sync::atomic::AtomicBool::new(false),
                 })
             }
@@ -5529,11 +5573,12 @@ mod tests {
                 &self,
                 _src: LogicalLayoutHandle,
                 _dst: LogicalLayoutHandle,
-                _src_block_ids: Arc<[BlockId]>,
+                src_block_ids: Arc<[BlockId]>,
                 dst_block_ids: Arc<[BlockId]>,
                 _options: TransferOptions,
             ) -> Result<TransferCompleteNotification> {
                 self.transfers.lock().unwrap().push(dst_block_ids.to_vec());
+                self.sources.lock().unwrap().push(src_block_ids.to_vec());
                 if self.fail_local.load(Ordering::SeqCst) {
                     anyhow::bail!("recording stub: injected local-transfer failure");
                 }
@@ -5797,7 +5842,7 @@ mod tests {
             assert_eq!(cdr.budget.available(), 256 - 3 * BS, "reserved the window");
 
             let dest = vec![50usize, 51, 52];
-            let onboard = engine.clone().local_onboard(handle, &dest).unwrap();
+            let onboard = engine.clone().local_onboard(handle, &dest, 3 * BS).unwrap();
 
             // Drive the puller side: the prefill peer commits + makes available
             // the 2 remote hashes; resolve the single pull.
@@ -5922,16 +5967,16 @@ mod tests {
             assert_eq!(cd_block_hashes(&_res2), h2[..1].to_vec());
 
             // Both lifecycles latch over the seam; both reserve their window.
-            let r1_handle = expect_resolved(
+            let (r1_matched, r1_handle, _) = expect_resolved(
                 Arc::clone(&engine).find_blocks(&fb("r1", h1.clone(), 3 * BS + 1), None)?,
-            )
-            .1
-            .expect("r1 latched");
-            let r2_handle = expect_resolved(
+            );
+            assert_eq!(r1_matched, 3 * BS);
+            let r1_handle = r1_handle.expect("r1 latched");
+            let (r2_matched, r2_handle, _) = expect_resolved(
                 Arc::clone(&engine).find_blocks(&fb("r2", h2.clone(), 3 * BS + 1), None)?,
-            )
-            .1
-            .expect("r2 latched");
+            );
+            assert_eq!(r2_matched, 3 * BS);
+            let r2_handle = r2_handle.expect("r2 latched");
             // r2's session opened at its commit; grab it before r1's async
             // failure handling can churn the factory.
             let r2_session = factory.last_opened().expect("r2 session opened at commit");
@@ -5963,7 +6008,7 @@ mod tests {
             // r1 terminal over the seam: onboard_blocks replays the stash →
             // FailedPartial (no pull, no transfer).
             let r1_onboard =
-                Arc::clone(&engine).onboard_blocks(&r1_handle, &[60usize, 61, 62], 2 * BS)?;
+                Arc::clone(&engine).onboard_blocks(&r1_handle, &[60usize, 61, 62], r1_matched)?;
             wait_for(|| r1_onboard.is_complete()).await;
             assert!(
                 matches!(
@@ -5988,7 +6033,7 @@ mod tests {
 
             // r2 proceeds normally over the seam to a Done terminal.
             let r2_onboard =
-                Arc::clone(&engine).onboard_blocks(&r2_handle, &[50usize, 51, 52], 2 * BS)?;
+                Arc::clone(&engine).onboard_blocks(&r2_handle, &[50usize, 51, 52], r2_matched)?;
             r2_session.inject_peer_commit(vec![h2[1], h2[2]]);
             r2_session.inject_peer_available(vec![
                 CommittedBlock {
@@ -6076,11 +6121,11 @@ mod tests {
             let _resident = cd_immutables(engine.leader.g2_manager(), 1, 100);
             assert_eq!(cd_block_hashes(&_resident), plhs[..1].to_vec());
 
-            let handle = expect_resolved(
+            let (matched, handle, _) = expect_resolved(
                 Arc::clone(&engine).find_blocks(&fb("rq", plhs.clone(), 6 * BS + 1), None)?,
-            )
-            .1
-            .expect("latched");
+            );
+            assert_eq!(matched, 6 * BS);
+            let handle = handle.expect("latched");
             wait_for(|| plane.count() >= 1).await;
             let session = factory.last_opened().expect("session opened at commit");
 
@@ -6088,7 +6133,7 @@ mod tests {
             let onboard = Arc::clone(&engine).onboard_blocks(
                 &handle,
                 &[50usize, 51, 52, 53, 54, 55],
-                5 * BS,
+                matched,
             )?;
 
             // Commit the whole remote slice so the commit barrier clears and the
@@ -6188,7 +6233,7 @@ mod tests {
             wait_for(|| plane.count() >= 1).await;
 
             let dest = vec![50usize, 51, 52];
-            let onboard = engine.clone().local_onboard(handle, &dest).unwrap();
+            let onboard = engine.clone().local_onboard(handle, &dest, 3 * BS).unwrap();
 
             // Record-at-mint: the local kick lands then the driver parks on the
             // (uninjected) remote pull, so the unified window is observable here.
@@ -6258,7 +6303,7 @@ mod tests {
 
             // A trailing "new" dest block proves the external slice excludes it.
             let dest = vec![50usize, 51, 52, 53];
-            let onboard = engine.clone().local_onboard(handle, &dest).unwrap();
+            let onboard = engine.clone().local_onboard(handle, &dest, 3 * BS).unwrap();
             wait_for(|| onboard.is_complete()).await;
             assert_eq!(
                 onboard.outcome(),
@@ -6300,7 +6345,7 @@ mod tests {
 
             let onboard = engine
                 .clone()
-                .local_onboard(handle, &[50usize, 51, 52])
+                .local_onboard(handle, &[50usize, 51, 52], 3 * BS)
                 .unwrap();
             // Commit only 1 of the 2 expected remote hashes, then close short.
             session.inject_peer_commit(vec![plhs[1]]);
@@ -6345,7 +6390,7 @@ mod tests {
 
             let onboard = engine
                 .clone()
-                .local_onboard(handle, &[50usize, 51, 52])
+                .local_onboard(handle, &[50usize, 51, 52], 3 * BS)
                 .unwrap();
             // Commit the full remote slice so the pipeline reaches availability…
             session.inject_peer_commit(vec![plhs[1], plhs[2]]);
@@ -6400,7 +6445,7 @@ mod tests {
             // drain observes Closed and the driver bails.
             let onboard = engine
                 .clone()
-                .local_onboard(handle, &[50usize, 51, 52])
+                .local_onboard(handle, &[50usize, 51, 52], 3 * BS)
                 .unwrap();
             let fence = engine.evict(&"rq".into()).fence;
             assert!(
@@ -6448,7 +6493,7 @@ mod tests {
 
             let onboard = engine
                 .clone()
-                .local_onboard(handle, &[50usize, 51, 52])
+                .local_onboard(handle, &[50usize, 51, 52], 3 * BS)
                 .unwrap();
             session.inject_peer_commit(vec![plhs[0], plhs[1], plhs[2]]);
             session.inject_peer_available(vec![
@@ -6517,7 +6562,7 @@ mod tests {
 
             // dest = [computed | external]: id 40 is vLLM's computed block.
             let dest = vec![40usize, 50, 51, 52];
-            let onboard = engine.clone().local_onboard(handle, &dest).unwrap();
+            let onboard = engine.clone().local_onboard(handle, &dest, 3 * BS).unwrap();
 
             session.inject_peer_commit(vec![plhs[1], plhs[2]]);
             session.inject_peer_available(vec![
@@ -6577,7 +6622,7 @@ mod tests {
             // computed(1) + unified(3) needs 4 dest ids; 3 silently clamp the
             // external slice to [50, 51] — the count guard must fail the load.
             let dest = vec![40usize, 50, 51];
-            let onboard = engine.clone().local_onboard(handle, &dest).unwrap();
+            let onboard = engine.clone().local_onboard(handle, &dest, 3 * BS).unwrap();
             wait_for(|| onboard.is_complete()).await;
             assert_eq!(
                 onboard.outcome(),
@@ -6619,7 +6664,7 @@ mod tests {
 
             let onboard = engine
                 .clone()
-                .local_onboard(handle, &[50usize, 51, 52])
+                .local_onboard(handle, &[50usize, 51, 52], 3 * BS)
                 .unwrap();
 
             // Commit + make available the 2 remote hashes so the driver completes
@@ -8775,7 +8820,7 @@ mod tests {
 
             let onboard = engine
                 .clone()
-                .local_onboard(handle, &[50usize, 51, 52])
+                .local_onboard(handle, &[50usize, 51, 52], 3 * BS)
                 .unwrap();
 
             // Superset commit batch: one expected hash + the recompute-tail
@@ -8962,7 +9007,7 @@ mod tests {
             // 5. Decode onboards its unified hit: local span + remote slice.
             let decode_onboard = decode_engine
                 .clone()
-                .local_onboard(search_handle, &[50usize, 51, 52])
+                .local_onboard(search_handle, &[50usize, 51, 52], 3 * BS)
                 .unwrap();
 
             // 6. The prefill computes the rest: its output blocks (the full
@@ -9121,7 +9166,7 @@ mod tests {
             // 4. Decode onboards behind its computed dest block.
             let decode_onboard = decode_engine
                 .clone()
-                .local_onboard(search_handle, &[40usize, 50, 51, 52])
+                .local_onboard(search_handle, &[40usize, 50, 51, 52], 3 * BS)
                 .unwrap();
 
             // 5. The prefill's computed output (c2..c4 — a superset of the
@@ -9183,7 +9228,7 @@ mod tests {
 
             let onboard = engine
                 .clone()
-                .local_onboard(handle, &[50usize, 51, 52])
+                .local_onboard(handle, &[50usize, 51, 52], 3 * BS)
                 .unwrap();
 
             session.inject_peer_commit(vec![plhs[1], plhs[2]]);
@@ -9721,7 +9766,7 @@ mod tests {
             );
             // A's onboard records window [plhs[0]] into the in-flight guard under
             // sid_a; this also removes A from `engine.searches`.
-            let _onboard_a = engine.clone().local_onboard(sid_a, &[10]).unwrap();
+            let _onboard_a = engine.clone().local_onboard(sid_a, &[10], BS).unwrap();
 
             // B's fresh poll over BOTH resident hashes overlaps A's recorded
             // window at plhs[0] → Deferred, minting/latching nothing.
@@ -9976,7 +10021,7 @@ mod tests {
                 },
             );
             let req_id: RequestId = "rq".into();
-            let onboard = engine.clone().local_onboard(search_id, &[10]).unwrap();
+            let onboard = engine.clone().local_onboard(search_id, &[10], BS).unwrap();
 
             let fence = engine.evict(&req_id).fence;
             assert!(!fence.per_worker.is_empty(), "the live onboard is fenced");

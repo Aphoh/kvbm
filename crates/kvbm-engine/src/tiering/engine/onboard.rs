@@ -25,6 +25,7 @@ use kvbm_protocols::connector::{BlockId, SequenceHash};
 
 use super::reconcile::OnboardingState;
 use crate::G2;
+use crate::g2_capacity::reserve_required_staging;
 use crate::leader::InstanceLeader;
 use crate::p2p::session::{AvailabilityDelta, CommitDelta, Session};
 
@@ -55,22 +56,21 @@ pub(super) fn select_onboard_block_ids(
     dest[start..end].to_vec()
 }
 
-/// Collect the G2 blocks destined for onboarding from every shard, honoring the
-/// `[effective_start .. final_end)` span (first-hole contiguous match).
-///
-/// Mirrors the legacy `collect_g2_blocks_from_shards`: walk shards in order
-/// taking their G2 blocks, drop the leading `effective_start -
-/// shards[0].start_block` mask, then truncate to `final_end - effective_start`.
+/// Collect the accepted prefix of the contiguous matched G2 span.
+/// A hybrid checkpoint can end before the available block history ends.
 fn collect_g2_blocks(
     state: &mut OnboardingState,
     block_size: usize,
+    desired_blocks: usize,
 ) -> Result<Vec<ImmutableBlock<G2>>> {
     debug_assert!(!state.shards.is_empty());
     debug_assert!(state.all_shards_terminal());
 
     let (effective_start, final_end) = state.matched_span(block_size);
     debug_assert!(effective_start <= final_end);
-    let desired_blocks = final_end - effective_start;
+    if desired_blocks > final_end - effective_start {
+        bail!("accepted onboard span exceeds the matched G2 prefix");
+    }
     let leading_skip = effective_start - state.shards[0].start_block;
 
     let mut collected: Vec<ImmutableBlock<G2>> = Vec::new();
@@ -123,7 +123,16 @@ pub(super) async fn run_onboard(
     g1_block_ids: Vec<BlockId>,
     staging_futs: Vec<StagingCompletion>,
     block_size: usize,
+    accepted_blocks: usize,
 ) -> ActionStatus {
+    if g1_block_ids.len() != accepted_blocks {
+        tracing::error!(
+            accepted = accepted_blocks,
+            destinations = g1_block_ids.len(),
+            "onboard allocation does not cover the accepted prefix"
+        );
+        return ActionStatus::Failed(ActionFailure::AllBlocks);
+    }
     // Nothing external to move (e.g. a `Matched { hit_blocks: 0 }` onboard):
     // immediately terminal, no transfer issued.
     if g1_block_ids.is_empty() {
@@ -139,7 +148,7 @@ pub(super) async fn run_onboard(
     }
 
     // Pull the matched G2 sources (held alive until the transfer completes).
-    let g2_blocks = match collect_g2_blocks(onboarding, block_size) {
+    let g2_blocks = match collect_g2_blocks(onboarding, block_size, accepted_blocks) {
         Ok(blocks) => blocks,
         Err(e) => {
             tracing::error!(error = %e, "onboard G2 collect failed");
@@ -387,11 +396,13 @@ pub(super) async fn pull_run_into_g2(
     block_size: usize,
 ) -> Result<Vec<ImmutableBlock<G2>>> {
     let run_len = hashes.len();
-    let dst = leader
-        .g2_manager()
-        .allocate_blocks(run_len)
-        .ok_or_else(|| anyhow!("cd session pull: failed to allocate {run_len} G2 mutables"))?;
-    let pulled = session.pull(hashes.clone(), dst).await?;
+    let capacity = Arc::clone(leader.g2_capacity());
+    let dst = reserve_required_staging(Arc::clone(&capacity), run_len).map_err(|error| {
+        anyhow!("cd session pull: failed to reserve {run_len} G2 mutables: {error}")
+    })?;
+    let pulled = dst
+        .transfer_with(|mutables| session.pull(hashes.clone(), mutables))
+        .await?;
     if pulled.len() != run_len {
         bail!(
             "cd session pull: session.pull returned {} blocks, expected {}",
@@ -400,18 +411,13 @@ pub(super) async fn pull_run_into_g2(
         );
     }
 
-    let mut completes = Vec::with_capacity(run_len);
-    for (mutable, hash) in pulled.into_iter().zip(hashes.iter()) {
-        completes.push(
-            mutable
-                .stage(*hash, block_size)
-                .map_err(|e| anyhow!("cd session pull: stage pulled block: {e:#}"))?,
-        );
-    }
-    let registered = leader.g2_manager().register_blocks(completes);
+    let registered = pulled
+        .stage_all(&hashes, block_size)
+        .map_err(|e| anyhow!("cd session pull: stage pulled block: {e:#}"))?
+        .publish()?;
     if registered.len() != run_len {
         bail!(
-            "cd session pull: register_blocks returned {} blocks, expected {}",
+            "cd session pull: registration returned {} blocks, expected {}",
             registered.len(),
             run_len
         );
@@ -447,4 +453,221 @@ async fn pull_register_onboard_run(
         )?
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    use super::*;
+    use crate::g2_capacity::test_support::RecordingG2Capacity;
+    use crate::g2_capacity::{
+        G2AllocationKind, G2Capacity, G2CapacityDecision, G2CapacityError, G2CapacityRequest,
+        G2CapacityRequirement, G2ExactAllocation, G2ExactRegistrationOwner, G2StagedAllocation,
+    };
+    use crate::p2p::session::{MockSessionFactory, SessionFactory};
+    use crate::testing::{create_messenger_tcp, managers::TestManagerBuilder};
+    use kvbm_logical::blocks::{BlockRegistry, CompleteBlock};
+
+    struct ExactOnboardCapacity {
+        manager: Arc<kvbm_logical::BlockManager<G2>>,
+        requests: Mutex<Vec<G2CapacityRequest>>,
+    }
+
+    struct ExactOnboardRegistration {
+        manager: Arc<kvbm_logical::BlockManager<G2>>,
+    }
+
+    impl G2ExactRegistrationOwner for ExactOnboardRegistration {
+        fn register_blocks(
+            &mut self,
+            blocks: Vec<CompleteBlock<G2>>,
+        ) -> Result<Vec<ImmutableBlock<G2>>, G2CapacityError> {
+            Ok(self.manager.register_blocks(blocks))
+        }
+
+        fn rollback_required_staging(&mut self, blocks: Vec<ImmutableBlock<G2>>) {
+            self.manager.release_blocks(blocks, Some(true));
+        }
+
+        fn retain_cache_extension(self: Box<Self>) {}
+    }
+
+    impl G2Capacity for ExactOnboardCapacity {
+        fn reserve(
+            &self,
+            request: G2CapacityRequest,
+        ) -> Result<G2CapacityDecision, G2CapacityError> {
+            self.requests.lock().expect("requests lock").push(request);
+            if request.requirement() != G2CapacityRequirement::ExactReclaim {
+                return Err(G2CapacityError::RequirementMismatch {
+                    expected: G2CapacityRequirement::ExactReclaim,
+                    actual: request.requirement(),
+                });
+            }
+            let blocks = self
+                .manager
+                .allocate_blocks_from_reset(request.count())
+                .ok_or(G2CapacityError::Unavailable(request))?;
+            G2ExactAllocation::new(
+                request,
+                blocks,
+                Box::new(ExactOnboardRegistration {
+                    manager: Arc::clone(&self.manager),
+                }),
+            )
+            .map(G2CapacityDecision::ExactGranted)
+        }
+
+        fn block_size(&self) -> usize {
+            self.manager.block_size()
+        }
+
+        fn manager_id(&self) -> kvbm_logical::ManagerId {
+            self.manager.id()
+        }
+
+        fn register_compatibility(
+            &self,
+            _allocation: G2StagedAllocation,
+        ) -> Result<Vec<ImmutableBlock<G2>>, G2CapacityError> {
+            Err(G2CapacityError::RequirementMismatch {
+                expected: G2CapacityRequirement::ExactReclaim,
+                actual: G2CapacityRequirement::Compatibility,
+            })
+        }
+
+        fn match_blocks(&self, hashes: &[SequenceHash]) -> Vec<ImmutableBlock<G2>> {
+            self.manager.match_blocks(hashes)
+        }
+
+        fn match_inactive_blocks(&self, hashes: &[SequenceHash]) -> Vec<ImmutableBlock<G2>> {
+            self.manager.match_inactive_blocks(hashes)
+        }
+
+        fn has_any_registered_hashes(&self, hashes: &[SequenceHash]) -> bool {
+            self.manager.has_any_registered_hashes(hashes)
+        }
+
+        fn scan_matches(
+            &self,
+            hashes: &[SequenceHash],
+            touch: bool,
+        ) -> HashMap<SequenceHash, ImmutableBlock<G2>> {
+            self.manager.scan_matches(hashes, touch)
+        }
+    }
+
+    #[tokio::test]
+    async fn conditional_disagg_pull_uses_the_leader_capacity() {
+        let registry = BlockRegistry::builder().build();
+        let manager = Arc::new(
+            TestManagerBuilder::<G2>::new()
+                .block_count(1)
+                .block_size(4)
+                .registry(registry.clone())
+                .build(),
+        );
+        let capacity = Arc::new(RecordingG2Capacity::new(Arc::clone(&manager)));
+        let leader = Arc::new(
+            InstanceLeader::builder()
+                .messenger(create_messenger_tcp().await.expect("test messenger"))
+                .registry(registry)
+                .g2_manager(manager)
+                .g2_capacity(capacity.clone())
+                .build()
+                .expect("test leader"),
+        );
+        let hash = SequenceHash::new(11, None, 0);
+        let factory = MockSessionFactory::new();
+        factory
+            .open(uuid::Uuid::new_v4())
+            .expect("test session open");
+        let session = factory.last_opened().expect("opened test session");
+        session.inject_peer_available(vec![crate::p2p::session::CommittedBlock {
+            hash,
+            peer_block_id: 0,
+        }]);
+
+        let task = tokio::spawn({
+            let leader = Arc::clone(&leader);
+            let session: Arc<dyn Session> = session.clone();
+            async move { pull_run_into_g2(&leader, &session, vec![hash], 4).await }
+        });
+        session.wait_pull_count(1).await;
+        session.resolve_pull(0, Ok(()));
+
+        let registered = task
+            .await
+            .expect("conditional-disagg task")
+            .expect("conditional-disagg pull");
+
+        assert_eq!(registered.len(), 1);
+        assert_eq!(
+            capacity.allocation_kinds(),
+            vec![G2AllocationKind::RequiredStaging]
+        );
+        assert_eq!(capacity.registration_count(), 1);
+        assert_eq!(capacity.registrations_with_live_lease(), 1);
+        assert_eq!(capacity.lease_drop_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn conditional_disagg_pull_accepts_exact_required_staging_capacity() {
+        let registry = BlockRegistry::builder().build();
+        let manager = Arc::new(
+            TestManagerBuilder::<G2>::new()
+                .block_count(1)
+                .block_size(4)
+                .registry(registry.clone())
+                .build(),
+        );
+        let capacity = Arc::new(ExactOnboardCapacity {
+            manager: Arc::clone(&manager),
+            requests: Mutex::new(Vec::new()),
+        });
+        let leader = Arc::new(
+            InstanceLeader::builder()
+                .messenger(create_messenger_tcp().await.expect("test messenger"))
+                .registry(registry)
+                .g2_manager(manager)
+                .g2_capacity(capacity.clone())
+                .build()
+                .expect("test leader"),
+        );
+        let hash = SequenceHash::new(12, None, 0);
+        let factory = MockSessionFactory::new();
+        factory
+            .open(uuid::Uuid::new_v4())
+            .expect("test session open");
+        let session = factory.last_opened().expect("opened test session");
+        session.inject_peer_available(vec![crate::p2p::session::CommittedBlock {
+            hash,
+            peer_block_id: 0,
+        }]);
+
+        let task = tokio::spawn({
+            let leader = Arc::clone(&leader);
+            let session: Arc<dyn Session> = session.clone();
+            async move { pull_run_into_g2(&leader, &session, vec![hash], 4).await }
+        });
+        session.wait_pull_count(1).await;
+        session.resolve_pull(0, Ok(()));
+
+        let registered = task
+            .await
+            .expect("conditional-disagg task")
+            .expect("conditional-disagg exact pull");
+
+        assert_eq!(registered.len(), 1);
+        assert_eq!(
+            *capacity.requests.lock().expect("requests lock"),
+            vec![G2CapacityRequest::exact_reclaim(
+                G2AllocationKind::RequiredStaging,
+                1,
+            )]
+        );
+    }
 }

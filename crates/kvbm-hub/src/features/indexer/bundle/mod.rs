@@ -347,6 +347,26 @@ impl BundleDirectory {
         Ok(())
     }
 
+    /// Authenticate `credential` against `owner` and return the registration
+    /// epoch it authorizes.
+    ///
+    /// The tier-placement snapshot endpoint authorizes through this rather than
+    /// keeping its own owner→credential map: forking that map would fork the
+    /// staging and fail-closed semantics with it, and an owner mid-registration
+    /// must be closed to a snapshot install for exactly the reason it is closed
+    /// to a bundle publish.
+    pub(super) fn authorize_owner_epoch(
+        &self,
+        owner: InstanceId,
+        credential: &MutationCredential,
+    ) -> Result<RegistrationEpoch, BundleDirectoryError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| BundleDirectoryError::Unavailable)?;
+        authorize_owner(&state, owner, credential)
+    }
+
     pub fn remove_owner(&self, owner: InstanceId) {
         if let Ok(mut state) = self.state.write() {
             let now_unix_ms = (self.clock)();
@@ -386,6 +406,23 @@ impl BundleDirectory {
             &advertisement.requirements,
             &advertisement.lineages,
         )?;
+        // `requirements` defines the bundle's resource set, so a placement for a
+        // resource outside it is a claim about something this advertisement does
+        // not describe — and it feeds `ready_tier()`, which a CT-2a consumer
+        // reads as a stage-cost hint. Rejecting keeps the cost signal derived
+        // only from resources the record actually owns. Additive-safe: a
+        // publisher that predates R7b sends no placements at all.
+        if let Some(placement) = advertisement.placements.iter().find(|placement| {
+            !advertisement
+                .requirements
+                .iter()
+                .any(|requirement| requirement.resource() == placement.resource)
+        }) {
+            return Err(BundleDirectoryError::UnrequiredPlacement {
+                owner: advertisement.owner,
+                resource: placement.resource,
+            });
+        }
         let key = advertisement.key;
         let owner = advertisement.owner;
         let generation = advertisement.generation;
@@ -402,6 +439,11 @@ impl BundleDirectory {
         advertisement.expires_at_unix_ms = advertisement
             .expires_at_unix_ms
             .min(now_unix_ms.saturating_add(self.advertisement_ttl_ms));
+        // Hub-stamped, overwriting whatever the publisher sent: this is the
+        // freshness signal query rows report, so a publisher-supplied value
+        // would be both spoofable and clock-skewed. `expires_at_unix_ms` cannot
+        // stand in — it is clamped above and says nothing about arrival.
+        advertisement.advertised_at_unix_ms = Some(now_unix_ms);
         #[cfg(test)]
         if let Some(hook) = &self.publish_after_owner_check {
             hook();
@@ -528,6 +570,10 @@ impl BundleDirectory {
                 continue;
             };
             return BundleQueryOutcome::Hit(BundleQueryHit {
+                // Both R7b §5 row fields are echoed from the winning record, so
+                // a row can never disagree with the advertisement it came from.
+                ready_tier: entry.ready_tier(),
+                advertised_at_unix_ms: entry.advertised_at_unix_ms,
                 advertisement: entry.clone(),
                 lease_id: uuid::Uuid::new_v4(),
                 lease_expires_at_unix_ms: entry
@@ -753,7 +799,9 @@ fn map_retirement_capacity(capacity: RetiredGenerationCapacity) -> BundleDirecto
     }
 }
 
-fn unix_time_ms() -> u64 {
+/// Wall-clock milliseconds. Shared with the tier-placement projection so both
+/// halves of the indexer feature stamp advisory freshness from one clock.
+pub(crate) fn unix_time_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
@@ -770,6 +818,13 @@ pub enum BundleDirectoryError {
     UnauthorizedOwner { owner: InstanceId },
     #[error("bundle advertisement does not match owner {owner}'s registration epoch")]
     RegistrationEpochMismatch { owner: InstanceId },
+    #[error(
+        "bundle advertisement from owner {owner} claims a placement for unrequired resource {resource:?}"
+    )]
+    UnrequiredPlacement {
+        owner: InstanceId,
+        resource: kvbm_common::LogicalResourceId,
+    },
     #[error("bundle owner {owner} registration transaction changed")]
     StaleOwnerTransaction { owner: InstanceId },
     #[error("bundle owner {owner} already has a registration transaction in progress")]

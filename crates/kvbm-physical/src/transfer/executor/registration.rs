@@ -58,7 +58,7 @@ fn acquire(
         .checked_add(bytes)
         .ok_or_else(|| anyhow::anyhow!("transfer range overflow"))?;
     let Some(provider) = layout.registration_provider() else {
-        return Ok(vec![address..end]);
+        return Ok(std::iter::once(address..end).collect());
     };
     let lease = provider.acquire(address, bytes)?;
     validate_ranges(&lease.ranges, address, end)?;
@@ -138,8 +138,8 @@ mod tests {
     fn registration_coverage_rejects_holes_overlap_and_short_ranges() {
         assert!(validate_ranges(&[10..14, 15..20], 10, 20).is_err());
         assert!(validate_ranges(&[10..15, 14..20], 10, 20).is_err());
-        assert!(validate_ranges(&[10..19], 10, 20).is_err());
-        assert!(validate_ranges(&[10..21], 10, 20).is_err());
+        assert!(validate_ranges(std::slice::from_ref(&(10..19)), 10, 20).is_err());
+        assert!(validate_ranges(std::slice::from_ref(&(10..21)), 10, 20).is_err());
         assert!(validate_ranges(&[10..10, 10..20], 10, 20).is_err());
         assert!(validate_ranges(&[10..14, 14..20], 10, 20).is_ok());
     }
