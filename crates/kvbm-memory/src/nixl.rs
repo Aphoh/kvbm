@@ -15,10 +15,33 @@ pub use agent::{NIXL_CAPI_LIB_ENV, NixlAgent};
 pub use config::NixlBackendConfig;
 
 pub use nixl_sys::{
-    Agent, MemType, NotificationMap, OptArgs, RegistrationHandle, XferDescList, XferOp,
-    XferRequest, is_stub,
+    Agent, MemType, NotificationMap, OptArgs, RegDescList, RegistrationHandle, XferDescList,
+    XferOp, XferRequest, is_stub,
 };
 pub use serde::{Deserialize, Serialize};
+
+/// Agent metadata that names host registrations only.
+///
+/// NIXL keeps one memory section for each agent, so a full-agent export names
+/// every registration that any owner made on that agent. A worker that shares
+/// one agent between its GPU pool and its host mirror therefore hands a peer
+/// the GPU mappings as well. This type carries the host half only.
+///
+/// The pair exists because NIXL splits the two facts across two calls. A
+/// partial export with a non-empty descriptor list carries the memory section
+/// and no backend connection info, and NIXL rejects such a blob with
+/// `NIXL_ERR_NOT_FOUND`. A partial export with an empty descriptor list
+/// carries the connection info and an empty memory section. The peer loads
+/// both, in order.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostAgentMetadata {
+    /// Backend connection info for the agent. This blob names no memory.
+    pub connections: Vec<u8>,
+    /// Memory section that names the host registrations only.
+    ///
+    /// Empty when the agent exports no host registration.
+    pub host_registrations: Vec<u8>,
+}
 
 /// Owns registration and mapped memory until a transfer completes.
 pub trait MappedRegistrationGuard: Send + Sync + fmt::Debug {}
